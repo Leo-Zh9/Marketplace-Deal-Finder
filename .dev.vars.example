@@ -1,3 +1,11 @@
 # Wrangler loads .dev.vars for local-only values. Phase 2's local loopback
 # identity does not require credentials, so this file is intentionally empty.
 # Never place Google OAuth or future Facebook/Discord secrets in a VITE_* value.
+
+# Local development does not need an allowlist: `npm run dev:full` runs with
+# APP_ENV=local on a loopback host and never verifies a Firebase token. The real
+# value belongs in `wrangler secret put APPROVED_EMAILS`, never in a committed
+# file. The line below is commented out on purpose, so copying this file to
+# .dev.vars changes no behaviour. The addresses are dummies.
+#
+# APPROVED_EMAILS=["owner@example.com","tester@example.com"]

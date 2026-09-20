@@ -16,6 +16,7 @@
     "check": "npm run lint && npm run test && npm run build && npm run typecheck:worker"
   },
   "dependencies": {
+    "firebase": "^12.19.0",
     "jose": "^6.2.12",
     "react": "^19.3.0",
     "react-dom": "^19.3.0"

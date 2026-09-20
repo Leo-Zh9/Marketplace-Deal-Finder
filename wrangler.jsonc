@@ -4,9 +4,10 @@
   "main": "worker/index.ts",
   "compatibility_date": "2026-09-11",
   "compatibility_flags": ["nodejs_compat"],
+  // APPROVED_EMAILS is a Worker secret and must never appear here.
   "vars": {
     "APP_ENV": "production",
-    "CLOUDFLARE_ACCESS_TEAM_DOMAIN": "https://REPLACE_WITH_TEAM_NAME.cloudflareaccess.com",
-    "CLOUDFLARE_ACCESS_AUD": "REPLACE_WITH_ACCESS_APPLICATION_AUD"
+    "FIREBASE_PROJECT_ID": "REPLACE_WITH_FIREBASE_PROJECT_ID",
+    "ALLOWED_ORIGINS": "REPLACE_WITH_ALLOWED_ORIGINS_JSON_ARRAY"
   }
 }
