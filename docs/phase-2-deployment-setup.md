@@ -71,8 +71,18 @@ the value for #10 and #13.
 > and never performs the CSP substitution in step 6. It would ship a policy
 > still containing `REPLACE_WITH_WORKER_ORIGIN`, which blocks every API call
 > from the browser. **Direct upload (`wrangler pages deploy dist`) is the only
-> supported deploy method** until substitution moves into the build — which
-> requires `@types/node`, a dependency this phase may not add.
+> supported deploy method** until substitution moves into the build.
+>
+> Why it has not moved there yet: substitution in `vite.config.ts` needs
+> `node:fs`, and `tsconfig.node.json` typechecks that file with no `types`
+> array. Node's types do resolve today, but only because `@types/node` is
+> installed as an **undeclared transitive dependency** — nothing in
+> `package.json` asks for it, so a lockfile refresh upstream can remove it and
+> break `npm run build` with no change to this repo. A security policy's
+> correctness should not rest on that, and declaring `@types/node` is a second
+> dependency addition, which this phase's scope does not allow. Recorded as debt
+> for whoever is permitted to add it; spec 2.6.2 explicitly permits documented
+> pre-deploy substitution in the meantime.
 
 ### 4. Record the Pages and Worker origins
 

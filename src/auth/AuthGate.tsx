@@ -197,7 +197,13 @@ export const AuthGate = ({
 
   const signOut = useCallback(() => {
     generationRef.current += 1;
-    uidRef.current = null;
+    // `undefined` means "no event seen", not "signed out". Firebase's signOut()
+    // notifies id-token listeners with null; parking on `null` here would make
+    // that notification look like a routine token refresh, firing a tokenless
+    // session request whose 401 would replace this clean panel with an expiry
+    // warning. The same reasoning is why the ref starts `undefined` on a cold
+    // load, where the first event is also `null`.
+    uidRef.current = undefined;
     resetMarketplaceState();
     setState({ status: "signed-out", message: null });
     void adapter?.signOut();

@@ -36,10 +36,14 @@ interface FakeAdapter extends AuthAdapter {
   emit(user: AuthUser | null): void;
 }
 
+// Models the Firebase contract, not the gate's assumptions: signOut() notifies
+// id-token listeners with null, and getToken() resolves null once there is no
+// current user.
 const createFakeAdapter = (
   overrides: Partial<AuthAdapter> = {},
 ): FakeAdapter => {
   let listener: ((user: AuthUser | null) => void) | null = null;
+  let currentUser: AuthUser | null = null;
 
   return {
     subscribe: (next) => {
@@ -49,9 +53,14 @@ const createFakeAdapter = (
       };
     },
     signIn: () => Promise.resolve(),
-    signOut: () => Promise.resolve(),
-    getToken: () => Promise.resolve("id-token"),
+    signOut: () => {
+      currentUser = null;
+      listener?.(null);
+      return Promise.resolve();
+    },
+    getToken: () => Promise.resolve(currentUser === null ? null : "id-token"),
     emit: (user) => {
+      currentUser = user;
       listener?.(user);
     },
     ...overrides,
@@ -250,6 +259,49 @@ describe("authentication gate", () => {
     expect(
       screen.getByRole("button", { name: "Sign in with Google" }),
     ).toBeInTheDocument();
+  });
+
+  it("returns to a clean sign-in panel after a deliberate sign-out", async () => {
+    const user = userEvent.setup();
+    const adapter = createFakeAdapter();
+    // The Worker's contract: no token means 401, not a session.
+    const requestSession = vi.fn(
+      async (getToken: (forceRefresh: boolean) => Promise<string | null>) => {
+        if ((await getToken(false)) === null) {
+          throw new ApiRequestError("missing", "unauthenticated", 401, "AUTH_TOKEN_MISSING");
+        }
+        return { identity: firebaseIdentity };
+      },
+    );
+
+    renderGate({
+      mode: "firebase",
+      createAdapter: () => adapter,
+      requestSession,
+      children: (_identity, onSignOut) => (
+        <div>
+          <span>dashboard</span>
+          <button type="button" onClick={onSignOut}>
+            Sign out
+          </button>
+        </div>
+      ),
+    });
+
+    await emit(adapter, { uid: "a", email: "owner@example.com" });
+    expect(await screen.findByText("dashboard")).toBeInTheDocument();
+    const callsWhileSignedIn = requestSession.mock.calls.length;
+
+    await user.click(screen.getByRole("button", { name: "Sign out" }));
+
+    expect(
+      await screen.findByRole("button", { name: "Sign in with Google" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("dashboard")).not.toBeInTheDocument();
+    // A deliberate sign-out is not an expiry: no warning, and no tokenless
+    // round trip to the Worker.
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(requestSession).toHaveBeenCalledTimes(callsWhileSignedIn);
   });
 
   it("resets prototype state on an account switch and shows only the new identity", async () => {

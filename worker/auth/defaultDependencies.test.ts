@@ -36,6 +36,38 @@ describe("default authentication dependencies", () => {
     ).resolves.toEqual({ ok: false, status: 503, code: "AUTH_KEYS_UNAVAILABLE" });
   });
 
+  it("keeps one certificate cache across requests in the isolate", async () => {
+    // Runs while the singleton's cache is still empty (case 1 caches nothing on
+    // failure). The memoized store is the only reason the cache, the shared
+    // in-flight fetch and the cooldown mean anything between requests: a store
+    // built per call would make Google a per-request dependency.
+    const fetchImplementation = vi.fn(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({ [googleCertificateFixture.kid]: googleCertificateFixture.pem }),
+          { headers: { "Cache-Control": "public, max-age=300" } },
+        ),
+      ),
+    );
+    vi.stubGlobal("fetch", fetchImplementation);
+
+    const factory = await createTokenFactory(projectId);
+    const token = await factory.sign({
+      now: Math.floor(Date.now() / 1_000),
+      kid: googleCertificateFixture.kid,
+    });
+    const authenticate = () =>
+      authenticateRequest(
+        new Request(apiUrl, { headers: { Authorization: `Bearer ${token}` } }),
+        productionEnvironment,
+      );
+
+    await authenticate();
+    await authenticate();
+
+    expect(fetchImplementation).toHaveBeenCalledTimes(1);
+  });
+
   it("imports the real certificate and answers 401 for a foreign signature", async () => {
     vi.stubGlobal("fetch", () =>
       Promise.resolve(
