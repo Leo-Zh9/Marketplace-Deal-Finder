@@ -3,15 +3,31 @@
 Firebase Google sign-in in front of a Cloudflare Worker API, with an email
 allowlist held as a Worker secret.
 
-Status: **ready for deployed verification.** Every step below is written to be
-executed by a human with console access. Nothing in this runbook has been run
-yet — see "Remaining deployed checks".
+Status: **ready for deployed verification.** This runbook was executed end to end against real
+Firebase and real Cloudflare on 2026-09-20; what was observed is recorded in "Deployed
+acceptance checks". The phase is **not** complete — token refresh, a controlled expiry or
+refresh failure, a page refresh while signed in, and `/api/status` reporting `firebase-google`
+on the deployed Worker have not been observed.
 
 No Cloudflare Zero Trust organization, Cloudflare Access policy, service-account
 private key, custom domain, credit card, or paid upgrade is required.
 
 Local development needs none of this: `npm run dev:full` runs with no Firebase
 project and no secrets, using the Worker's `local-development` identity.
+
+## Deployed instance (2026-09-20)
+
+- App origin: `https://marketplace-deal-finder.leozhang07.workers.dev`
+- Worker/API origin: `https://marketplace-deal-finder-api.leozhang07.workers.dev`
+- Firebase project id: `marketplace-deal-finder` (auth domain
+  `marketplace-deal-finder.firebaseapp.com`)
+- Allowlist: one address, held as the Worker secret `APPROVED_EMAILS`. It is not in this
+  repository and must never be.
+
+**Cloudflare has folded Pages into Workers.** `wrangler pages deploy` no longer produces a
+`*.pages.dev` origin; on this deployment it produced
+`https://<project-name>.<account-subdomain>.workers.dev`. `_headers` is still honoured — gate
+2 read the deployed CSP back off the live site. Nothing else below is changed by this.
 
 ---
 
@@ -20,21 +36,21 @@ project and no secrets, using the Worker's `local-development` identity.
 | # | Value or action | Name | Where it is set |
 |---|---|---|---|
 | 1 | Firebase project on the **Spark** (free) plan with a registered **Web app** | — | Firebase console |
-| 2 | Web app `apiKey` | `VITE_FIREBASE_API_KEY` | Pages build environment variable |
-| 3 | Web app `authDomain` (usually `<projectId>.firebaseapp.com`) | `VITE_FIREBASE_AUTH_DOMAIN` | Pages build environment variable |
-| 4 | Web app `projectId` — must equal #6 exactly | `VITE_FIREBASE_PROJECT_ID` | Pages build environment variable |
-| 5 | Web app `appId` | `VITE_FIREBASE_APP_ID` | Pages build environment variable |
+| 2 | Web app `apiKey` | `VITE_FIREBASE_API_KEY` | Build environment, exported locally before npm run build (step 6) |
+| 3 | Web app `authDomain` (usually `<projectId>.firebaseapp.com`) | `VITE_FIREBASE_AUTH_DOMAIN` | Build environment, exported locally before npm run build (step 6) |
+| 4 | Web app `projectId` — must equal #6 exactly | `VITE_FIREBASE_PROJECT_ID` | Build environment, exported locally before npm run build (step 6) |
+| 5 | Web app `appId` | `VITE_FIREBASE_APP_ID` | Build environment, exported locally before npm run build (step 6) |
 | 6 | The same project ID, server side | `FIREBASE_PROJECT_ID` | `wrangler.jsonc` var (committed) |
-| 7 | Deployed Worker origin | `VITE_API_BASE_URL` | Pages build environment variable |
-| 8 | The same Worker origin again | CSP token `REPLACE_WITH_WORKER_ORIGIN` | substituted into `dist/_headers` |
+| 7 | Deployed Worker origin | `VITE_API_BASE_URL` | Build environment, exported locally before npm run build (step 6) |
+| 8 | The same Worker origin again, as a **host** (no scheme) | CSP token `REPLACE_WITH_WORKER_ORIGIN` | substituted into `dist/_headers` |
 | 9 | The Firebase auth domain again, without the scheme | CSP token `REPLACE_WITH_FIREBASE_AUTH_DOMAIN` | substituted into `dist/_headers` |
-| 10 | Exact production Pages origin — no path, no trailing slash, no wildcard, no preview hostname | `ALLOWED_ORIGINS` (a JSON array string) | `wrangler.jsonc` var (committed) |
+| 10 | Exact production app origin — no path, no trailing slash, no wildcard, no preview hostname | `ALLOWED_ORIGINS` (a JSON array string) | `wrangler.jsonc` var (committed) |
 | 11 | Approved Google account emails, as a JSON array of strings | `APPROVED_EMAILS` | **Worker secret only** |
 | 12 | Google provider enabled in Firebase Authentication, with a support email | — | Firebase console |
-| 13 | Production Pages hostname added to Firebase **Authorized domains** | — | Firebase console |
+| 13 | Production app hostname added to Firebase **Authorized domains** | — | Firebase console |
 | 14 | A Google account **outside** the allowlist you can sign in with | — | human login during acceptance |
 | 15 | An authenticated `wrangler login` session (plus the account ID if the login has more than one account) | — | local shell |
-| 16 | Preferred Cloudflare Pages project name | — | Cloudflare dashboard / `wrangler pages deploy` |
+| 16 | Preferred Cloudflare Pages project name (must not collide with an existing Worker name — see step 3) | — | Cloudflare dashboard, or wrangler pages project create from the clean directory (step 8) |
 
 `messagingSenderId` and `storageBucket` from the Firebase config snippet are
 **not** read by this implementation. Do not set them.
@@ -63,8 +79,13 @@ until this is done.
 
 ### 3. Create or select the Cloudflare Pages project
 
-Pick the project name now (#16). The `*.pages.dev` origin it is assigned becomes
-the value for #10 and #13.
+Pick the project name now (#16). On this deployment the assigned origin was
+`https://<project-name>.<account-subdomain>.workers.dev`; that origin is the value for #10 and
+#13. If your account still serves this project on a `*.pages.dev` origin, use that origin
+everywhere this runbook says the app origin. The values change; the procedure does not.
+
+The name must not be one an existing Worker already uses — under the Workers platform the two
+collide (see the warning below).
 
 > **Do not connect the Pages project to a Git repository this phase.**
 > `dist/` is gitignored, so a Git-connected build runs on Cloudflare's runners
@@ -84,23 +105,67 @@ the value for #10 and #13.
 > for whoever is permitted to add it; spec 2.6.2 explicitly permits documented
 > pre-deploy substitution in the meantime.
 
-### 4. Record the Pages and Worker origins
+> **Never run a `wrangler pages` command from the repository root.** Run from a directory
+> containing `wrangler.jsonc`, `wrangler pages project create <name>` read that config and
+> deployed a **second copy of the API Worker** under the name `<name>`. It did not create a Pages
+> project: `wrangler pages project list` stayed empty while the duplicate Worker was live, and
+> the duplicate had taken the name the app needed, so it had to be deleted first. Nothing in the
+> command output said any of this.
+>
+> Every `wrangler pages` command in this runbook is therefore run from a throwaway directory
+> containing only `dist/`. The commands are in step 8.
 
-- Pages origin, e.g. `https://marketplace-deal-finder.pages.dev`
+### 4. Record the app and Worker origins
+
+- App origin, e.g. `https://marketplace-deal-finder.<account-subdomain>.workers.dev`
 - Worker origin, e.g. `https://marketplace-deal-finder-api.<account-subdomain>.workers.dev`
 
 Both are exact origins: scheme + host (+ port if non-default), no path and no
 trailing slash.
 
+`<account-subdomain>` is your account's `workers.dev` subdomain. It is shown in the Cloudflare
+dashboard under **Workers & Pages**, and it is in the URL that `npx wrangler deploy` prints.
+
+**Order of operations.** Two values are only knowable after a deploy: your `workers.dev`
+subdomain, and the app origin built from it. This is the order this deployment used, and the
+only one that cannot strand you:
+
+1. **Deploy the Worker first** (step 5) with `FIREBASE_PROJECT_ID` set to your project. Leave
+   the committed `ALLOWED_ORIGINS` in place for now — you fill it in at item 5.
+   `npx wrangler deploy` prints `https://<worker-name>.<account-subdomain>.workers.dev`: that
+   is #7, its **host** (the same thing without the `https://`) is #8, and it is where your
+   `<account-subdomain>` comes from. Until `ALLOWED_ORIGINS` holds *your* app origin nobody
+   gets in from your app: a 5xx while the value is unset, empty or a `REPLACE_WITH_`
+   placeholder, and `403 CORS_ORIGIN_DENIED` while it holds another deployment's origin. Both
+   fail closed.
+2. **Set `APPROVED_EMAILS`** (step 5), then run step 5's check in its **form A** (no `Origin`
+   header). That is the only thing that catches an empty secret upload, and it is runnable
+   before your app origin exists.
+3. **Build the frontend and substitute the CSP** (step 6), using the Worker origin from 1.
+   Gate 1.
+4. **Deploy the app** (step 8). It prints the app origin,
+   `https://<project-name>.<account-subdomain>.workers.dev`. That is #10 and #13. Gate 2.
+5. **Now put that app origin into `ALLOWED_ORIGINS`** in `wrangler.jsonc` and run
+   `npx wrangler deploy` a second time. Until you do, every browser call from your app is
+   answered `403 CORS_ORIGIN_DENIED` — including when `wrangler.jsonc` still holds the
+   committed values, which are another deployment's origin. Then run step 5's check in its
+   **form B** (with the `Origin` header): it must return `401` **and** an
+   `Access-Control-Allow-Origin` naming your app origin.
+6. **Authorize the app hostname in Firebase** (step 7), then run the acceptance checks
+   (step 9).
+
 ### 5. Install Worker configuration, then deploy the Worker
 
-Edit `wrangler.jsonc` and replace both placeholders:
+`wrangler.jsonc` is committed with the values this deployment runs (shown below). **If you are
+deploying your own copy, replace both with yours** — `FIREBASE_PROJECT_ID` now, and
+`ALLOWED_ORIGINS` once you know your app origin (see the order note in step 4). A stale
+`ALLOWED_ORIGINS` denies every browser call from your app with `403 CORS_ORIGIN_DENIED`.
 
 ```jsonc
 "vars": {
   "APP_ENV": "production",
-  "FIREBASE_PROJECT_ID": "<your-firebase-project-id>",
-  "ALLOWED_ORIGINS": "[\"https://marketplace-deal-finder.pages.dev\"]"
+  "FIREBASE_PROJECT_ID": "marketplace-deal-finder",
+  "ALLOWED_ORIGINS": "[\"https://marketplace-deal-finder.leozhang07.workers.dev\"]"
 }
 ```
 
@@ -114,10 +179,57 @@ Then:
 ```sh
 npx wrangler login
 npx wrangler deploy
-npx wrangler secret put APPROVED_EMAILS
-# paste, on one line, e.g.:
-# ["owner@example.com","tester@example.com"]
 ```
+
+> **`wrangler secret put` silently uploads an empty secret when stdin is not a terminal.** Run
+> from a script, a CI step or an agent shell, `npx wrangler secret put APPROVED_EMAILS` read an
+> empty value, printed `✨ Success! Uploaded secret APPROVED_EMAILS`, listed the secret under
+> `wrangler secret list` and deployed a new Worker version. The Worker then answered `503
+> AUTH_CONFIG_MISSING` — the same answer it gives when the secret was never set at all. Every
+> surface said it had worked.
+>
+> Set it from a file instead, and delete the file in the same shell session. Write the file
+> outside the repository so it cannot be committed:
+>
+> ```sh
+> printf '%s' '["owner@example.com"]' > "${TMPDIR:-/tmp}/approved-emails.json"
+> npx wrangler secret put APPROVED_EMAILS < "${TMPDIR:-/tmp}/approved-emails.json"
+> rm -f "${TMPDIR:-/tmp}/approved-emails.json"
+> ```
+
+**Form A — before the app is deployed** (order-note items 1–2, and after every `secret put`).
+Send no `Origin` header and no `Authorization` header:
+
+```sh
+curl -si https://<worker-origin>/api/status
+```
+
+Read the status line and `error.code` in the body. A `503` is the empty-secret signature — see
+the table. A `401 AUTH_TOKEN_MISSING` means `FIREBASE_PROJECT_ID`, `ALLOWED_ORIGINS` and
+`APPROVED_EMAILS` all load. It says nothing about whether `ALLOWED_ORIGINS` is *yours*; only
+form B can tell you that.
+
+**Form B — after order-note item 5**, once `ALLOWED_ORIGINS` holds your app origin, and after
+every later `npx wrangler deploy`:
+
+```sh
+curl -si -H 'Origin: https://<your-app-origin>' https://<worker-origin>/api/status
+```
+
+Send no `Authorization` header. Read three things: the status line, the
+`Access-Control-Allow-Origin` response header, and `error.code` in the body.
+
+| What you see | What it means |
+|---|---|
+| **(B only)** `401`, `AUTH_TOKEN_MISSING`, and `Access-Control-Allow-Origin: https://<your-app-origin>` | Correct. You sent no token, and your app's origin is allowed. |
+| **(B only)** `403`, `CORS_ORIGIN_DENIED`, and **no** `Access-Control-Allow-Origin` | `ALLOWED_ORIGINS` does not contain your app origin — most likely it still holds the committed value, which is another deployment's origin. Fix `wrangler.jsonc` and deploy again. |
+| **(A or B)** `503`, `AUTH_CONFIG_MISSING` | `FIREBASE_PROJECT_ID`, `ALLOWED_ORIGINS` or `APPROVED_EMAILS` is unset, empty, or still a `REPLACE_WITH_` placeholder. The Worker does not say which, by design. **This is what an empty secret upload looks like.** |
+| **(A or B)** `503`, `AUTH_CONFIG_INVALID` | One of them is set but unusable: `APPROVED_EMAILS` is `[]` or not a JSON array of strings, or an `ALLOWED_ORIGINS` entry has a path, a trailing slash, a wildcard or a non-`http(s)` scheme. `[]` is also the deliberate emergency stop — see "Allowlist add and remove". |
+
+**A `401` with no `Access-Control-Allow-Origin` means you sent no `Origin` header** — form A,
+or you forgot the `-H`. The Worker's configuration still loads; that is all form A proves.
+With an `Origin` header present, a mismatch is always `403 CORS_ORIGIN_DENIED`, never a
+silent 401.
 
 `APPROVED_EMAILS` is a **secret**. It must never appear in `wrangler.jsonc`, in
 any `VITE_*` value, in the browser bundle, or in any committed file.
@@ -127,8 +239,9 @@ separately and deliberately.
 
 ### 6. Build the frontend and substitute the CSP placeholders
 
-Set the Pages build environment variables (#2–#5, #7) in the Cloudflare
-dashboard, or export them locally before building:
+Export the build environment variables (#2–#5, #7) before building. Do **not** set them as
+Pages build variables in the Cloudflare dashboard: this project deploys by direct upload, so
+Cloudflare runs no build and those values are never read.
 
 ```sh
 VITE_FIREBASE_API_KEY=... \
@@ -175,12 +288,14 @@ grep -c "REPLACE_WITH" dist/_headers
 
 Do not deploy while it prints anything else.
 
-### 7. Authorize the Pages hostname in Firebase
+### 7. Authorize the app hostname in Firebase
+
+You need the app hostname from step 8 first — see the order note in step 4.
 
 Firebase console → **Authentication** → **Settings** → **Authorized domains** →
-add the production Pages hostname (host only, e.g.
-`marketplace-deal-finder.pages.dev`). Keep Firebase's generated auth domain.
-Register only the production hostname you need.
+add the production app hostname (host only, e.g.
+`marketplace-deal-finder.<account-subdomain>.workers.dev`). Keep Firebase's
+generated auth domain. Register only the production hostname you need.
 
 `localhost` is **not** needed: local development bypasses Firebase entirely. See
 "Optional: real Firebase against a local frontend" below if you want to test the
@@ -188,14 +303,48 @@ real popup locally.
 
 ### 8. Deploy the frontend
 
+Deploy from a throwaway directory containing only `dist/` — never from the repository root
+(see the warning in step 3):
+
 ```sh
-npx wrangler pages deploy dist --project-name <your-pages-project>
+# from the repository root, after step 6 and gate 1:
+REPO="$PWD"
+UPLOAD="$(mktemp -d)"
+cp -R dist "$UPLOAD/dist"
+cd "$UPLOAD"
+
+# first time only — creates the project:
+"$REPO/node_modules/.bin/wrangler" pages project create <your-project-name> \
+  --production-branch master
+
+# publishes a build:
+"$REPO/node_modules/.bin/wrangler" pages deploy dist --project-name <your-project-name>
+
+cd "$REPO" && rm -rf "$UPLOAD"
 ```
+
+Three things about this block are load-bearing:
+
+- **`mktemp -d`, every time.** Copying `dist` into a directory that already holds one nests it
+  (`.../dist/dist`) and leaves the previous run's bytes at the upload root, so you silently
+  publish the **previous** build. Gate 2 cannot catch that: the stale CSP was already
+  substituted, so it passes.
+- **The wrangler binary is invoked by path.** `npx wrangler` outside the repository would fetch
+  a different wrangler instead of the pinned one.
+- **`--production-branch master` on `project create`.** Without it the command prompts for a
+  branch and will hang or fail in a non-interactive shell. On this deployment
+  `project create` uploaded `dist/` itself and printed the live URL; the `pages deploy` line
+  above is how you publish each later build. `project create` is not a deploy command — do not
+  use it as one.
+
+Record the app origin it prints: that is #10 and #13. Now complete step 4's order note —
+put that origin into `ALLOWED_ORIGINS` and run `npx wrangler deploy` again, then re-run step
+5's `curl` check in **form B**.
 
 **Gate 2 — after deploying.** The served policy must contain no placeholder:
 
 ```sh
-curl -sI https://<pages-origin>/ | grep -i content-security-policy
+curl -sI https://<app-origin>/ | grep -i content-security-policy
 ```
 
 The output must contain no `REPLACE_WITH`. This gate catches the mistake from
@@ -204,7 +353,7 @@ gate 1.
 
 ### 9. Run the acceptance checklist
 
-See "Remaining deployed checks".
+See "Deployed acceptance checks".
 
 ---
 
@@ -247,6 +396,12 @@ npx wrangler secret list
 npx wrangler secret delete APPROVED_EMAILS
 ```
 
+Both `secret put` calls above are subject to the non-TTY footgun in step 5 — use the
+file-redirect form. After either, re-run step 5's check in **form B**: a replaced list must
+return `401` again, with the `Access-Control-Allow-Origin` header, and the emergency stop
+(`[]`) must return `503 AUTH_CONFIG_INVALID`. A `503 AUTH_CONFIG_MISSING` there means the
+upload was empty, not that `[]` took effect.
+
 The allowlist is re-read from the secret on **every** request. Removing an entry
 denies that account's **next** request, even while it still holds an unexpired
 Firebase ID token. Matching is exact after trimming and lowercasing: no
@@ -282,39 +437,59 @@ table — redact email local parts if you prefer (`o…r@example.com`).
 
 | URL | Deployment version | Date | Desktop browser | Mobile browser | Outcome |
 |---|---|---|---|---|---|
-| _(Pages origin)_ | | | | | not yet run |
-| _(Worker origin)_ | | | | | not yet run |
+| App — `https://marketplace-deal-finder.leozhang07.workers.dev` | not recorded | 2026-09-20 | not recorded | not observed | passed the checks ticked below |
+| Worker — `https://marketplace-deal-finder-api.leozhang07.workers.dev` | not recorded | 2026-09-20 | not recorded | not observed | passed the checks ticked below |
 
-## Remaining deployed checks
+`not recorded`: it happened and was not logged. `not observed`: it did not happen.
 
-None of the following has been executed. Each requires provisioned Cloudflare
-and Firebase resources plus a human Google sign-in, which were unavailable when
-this phase was implemented. They are pending, not observed.
+## Deployed acceptance checks
 
-- [ ] A signed-out visit shows Google sign-in, not the dashboard.
-- [ ] The owner signs in, opens the sample UI, refreshes the page, calls both
-      `/api/auth/session` and `/api/status`, and signs out back to sign-in.
-- [ ] An account outside the allowlist signs into Firebase but receives Worker
-      `403 AUTH_FORBIDDEN` and access-denied copy, with the dashboard never
-      rendered.
-- [ ] A test account is added and then removed. Once the removal is active, its
-      still-valid ID token receives 403 on the next request.
-- [ ] Direct calls with a missing token, a malformed token, and a
-      `Cf-Access-Jwt-Assertion` header alone all fail. A successful preflight
-      does not authorize the subsequent GET.
-- [ ] Browser checks confirm exact-origin CORS and the security headers on both
-      successes and failures. An unrelated origin receives no readable
-      protected response.
-- [ ] Real public-key verification succeeds in the deployed Worker, a token
-      refresh works, and a controlled expiry or refresh failure returns to
-      sign-in without a retry loop.
-- [ ] Neither the public Worker nor the production bundle uses the local
-      identity (`/api/status` reports `firebase-google`).
-- [ ] Authentication and network errors stay distinct from the sample provider
-      states. No Facebook requests, D1 writes, Cron jobs or Discord messages
-      exist.
-- [ ] Gate 1 (`grep -c "REPLACE_WITH" dist/_headers` prints `0`) and gate 2
-      (`curl -sI` shows no `REPLACE_WITH`) both pass.
+Run against the deployment above on 2026-09-20. A ticked box was observed on the live
+deployment. **An unticked box has not been observed and is what remains.** No email address,
+token or allowlist entry is recorded here.
+
+- [x] Fail-closed before configuration: with no `APPROVED_EMAILS` set, every `/api/*`
+      request returned `503 AUTH_CONFIG_MISSING`, leaking nothing about what was missing.
+- [x] A signed-out visit shows Google sign-in, not the dashboard.
+- [x] The allowlisted account signs in through the Google popup and reaches the dashboard.
+      The deployed CSP therefore permits the real popup flow, and the gate renders the
+      dashboard only after `GET /api/auth/session` succeeds against the deployed Worker.
+- [ ] A page refresh while signed in keeps the session, and a deliberate sign-out returns
+      to the sign-in screen.
+- [x] An account outside the allowlist signed into Firebase and received the access-denied
+      screen; the dashboard never rendered. (That screen is reachable only from a Worker 403.)
+- [x] Revocation: with the allowlist replaced by an address that is not the signed-in user,
+      that user's still-valid, unexpired ID token was denied on the very next request.
+      Restoring the allowlist restored access.
+- [x] Direct calls: a missing token returned `401 AUTH_TOKEN_MISSING`, a malformed token
+      `401 AUTH_TOKEN_INVALID`, and a `Cf-Access-Jwt-Assertion` header alone
+      `401 AUTH_TOKEN_MISSING` — the superseded Access credential is ignored, not accepted
+      as a fallback. A successful preflight did not authorize the following GET: the
+      preflight returned 204 and the subsequent unauthenticated GET still returned 401.
+- [x] Exact-origin CORS: a preflight from the app origin returned 204 with an exact
+      `Access-Control-Allow-Origin`, `Vary: Origin`,
+      `Access-Control-Allow-Methods: GET, OPTIONS`,
+      `Access-Control-Allow-Headers: Authorization, Accept`,
+      `Access-Control-Max-Age: 600`, and no `Access-Control-Allow-Credentials`.
+      An unrelated origin (`https://evil.example`) received `403 CORS_ORIGIN_DENIED` with
+      zero `Access-Control-Allow-Origin` headers.
+- [x] The served site carries `Content-Security-Policy`, `Referrer-Policy: no-referrer`,
+      `X-Content-Type-Options: nosniff` and `X-Frame-Options: DENY`.
+- [ ] The Worker's own responses carry `Cache-Control: no-store`, `Permissions-Policy`,
+      `Referrer-Policy`, `X-Content-Type-Options` and `X-Frame-Options` on both successes
+      and failures.
+- [x] Real public-key verification succeeds in the deployed Worker: a live Google ID token
+      was accepted, so `importX509` ran against Google's live certificate payload.
+- [ ] A token refresh works across the ~1 hour ID-token lifetime.
+- [ ] A controlled expiry or refresh failure returns to sign-in without a retry loop.
+- [ ] Neither the public Worker nor the production bundle uses the local identity
+      (`/api/status` reports `firebase-google`). Requires a signed-in browser session;
+      never captured.
+- [ ] Authentication and network errors stay distinct from the sample provider states.
+- [x] No Facebook requests, D1 writes, Cron jobs or Discord messages exist.
+- [x] Gate 1 (`grep -c "REPLACE_WITH" dist/_headers`) printed `0`. Gate 2 (`curl -sI` on the
+      served origin) showed a CSP with no `REPLACE_WITH`, carrying the Worker origin, the
+      Firebase endpoints and `https://apis.google.com`.
 
 ## Verified locally
 

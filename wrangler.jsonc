@@ -5,9 +5,11 @@
   "compatibility_date": "2026-09-11",
   "compatibility_flags": ["nodejs_compat"],
   // APPROVED_EMAILS is a Worker secret and must never appear here.
+  // These are the live deployment's values. Deploying your own copy? Replace both —
+  // see docs/phase-2-deployment-setup.md.
   "vars": {
     "APP_ENV": "production",
-    "FIREBASE_PROJECT_ID": "REPLACE_WITH_FIREBASE_PROJECT_ID",
-    "ALLOWED_ORIGINS": "REPLACE_WITH_ALLOWED_ORIGINS_JSON_ARRAY"
+    "FIREBASE_PROJECT_ID": "marketplace-deal-finder",
+    "ALLOWED_ORIGINS": "[\"https://marketplace-deal-finder.leozhang07.workers.dev\"]"
   }
 }
