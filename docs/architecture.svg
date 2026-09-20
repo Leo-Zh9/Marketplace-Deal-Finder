@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1000" viewBox="0 0 1920 1000" role="img" aria-labelledby="diagram-title diagram-description" style="max-width:100%;height:auto;display:block">
+<title id="diagram-title">Marketplace Deal Finder system architecture</title>
+<desc id="diagram-description">Proposed hybrid deployment: a React frontend and Cloudflare API with D1 control data, an existing always-on Node.js runner with SQLite market observations, permitted marketplace adapters, and private Discord notifications. Source access and runner hosting require confirmation.</desc>
+<defs><marker id="arrow-gray" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M 1 1 L 8 5 L 1 9" fill="none" stroke="#5a6875" stroke-width="2"/></marker><marker id="arrow-rose" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M 1 1 L 8 5 L 1 9" fill="none" stroke="#a2516b" stroke-width="2"/></marker></defs>
+<rect width="1920" height="1000" fill="#ffffff"/>
+<rect id="cloud-boundary" x="440" y="158" width="400" height="638" fill="#f8fbff" stroke="#b5cce1" stroke-width="1" stroke-dasharray="7 6"/>
+<rect id="runner-boundary" x="948" y="158" width="504" height="638" fill="#f6fbf8" stroke="#b7d7c4" stroke-width="1" stroke-dasharray="7 6"/>
+<text id="title" x="40" y="70" font-family="Arial, Helvetica, sans-serif" font-size="38" fill="#17232d"><tspan x="40" y="70">Marketplace Deal Finder</tspan></text>
+<text id="subtitle" x="40" y="113" font-family="Arial, Helvetica, sans-serif" font-size="21" fill="#596672"><tspan x="40" y="113">Proposed architecture | 1-5 private users | 10-minute checks | $0 recurring-service target</tspan></text>
+<text id="users-heading" x="40" y="204" font-family="Arial, Helvetica, sans-serif" font-size="22" fill="#344655"><tspan x="40" y="204">Users | 1-5 accounts</tspan></text>
+<text id="users-note" x="40" y="235" font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#596672"><tspan x="40" y="235">The browser can be closed.</tspan></text>
+<text id="cloud-heading" x="462" y="204" font-family="Arial, Helvetica, sans-serif" font-size="22" fill="#20537a" data-parent="cloud-boundary"><tspan x="462" y="204">Cloudflare | free tier</tspan></text>
+<text id="runner-heading" x="970" y="204" font-family="Arial, Helvetica, sans-serif" font-size="22" fill="#256b4d" data-parent="runner-boundary"><tspan x="970" y="204">Existing always-on computer</tspan></text>
+<text id="sources-heading" x="1592" y="204" font-family="Arial, Helvetica, sans-serif" font-size="22" fill="#805622"><tspan x="1592" y="204">External platforms</tspan></text>
+<polyline id="web-api" points="336,375 464,375" fill="none" stroke="#5a6875" stroke-width="2" stroke-linejoin="round" marker-end="url(#arrow-gray)" marker-start="url(#arrow-gray)"/>
+<polyline id="api-runner" points="816,375 972,375" fill="none" stroke="#5a6875" stroke-width="2" stroke-linejoin="round" marker-end="url(#arrow-gray)" marker-start="url(#arrow-gray)"/>
+<polyline id="runner-sources" points="1428,375 1584,375" fill="none" stroke="#5a6875" stroke-width="2" stroke-linejoin="round" marker-end="url(#arrow-gray)" marker-start="url(#arrow-gray)"/>
+<polyline id="api-d1" points="640,492 640,594" fill="none" stroke="#5a6875" stroke-width="2" stroke-linejoin="round" marker-end="url(#arrow-gray)" marker-start="url(#arrow-gray)"/>
+<polyline id="runner-sqlite" points="1200,510 1200,594" fill="none" stroke="#5a6875" stroke-width="2" stroke-linejoin="round" marker-end="url(#arrow-gray)" marker-start="url(#arrow-gray)"/>
+<polyline id="api-discord" points="464,445 399,445 399,690 336,690" fill="none" stroke="#a2516b" stroke-width="2" stroke-linejoin="round" marker-end="url(#arrow-rose)"/>
+<rect id="web" x="40" y="278" width="288" height="206" fill="#f3f6f9" stroke="#8295a7" stroke-width="1.5"/>
+<rect id="api" x="472" y="278" width="336" height="206" fill="#eaf3fc" stroke="#5890b8" stroke-width="1.5"/>
+<rect id="runner" x="980" y="260" width="440" height="242" fill="#e7f4ec" stroke="#589d75" stroke-width="1.5"/>
+<rect id="sources" x="1592" y="278" width="288" height="242" fill="#fff5e6" stroke="#c19a5b" stroke-width="1.5"/>
+<rect id="discord" x="40" y="602" width="288" height="174" fill="#fff0f4" stroke="#bd7890" stroke-width="1.5"/>
+<rect id="d1" x="472" y="602" width="336" height="174" fill="#ffffff" stroke="#5890b8" stroke-width="1.5"/>
+<rect id="sqlite" x="980" y="602" width="440" height="174" fill="#ffffff" stroke="#589d75" stroke-width="1.5"/>
+<text id="web-title" x="60" y="325" font-family="Arial, Helvetica, sans-serif" font-size="25" fill="#283f53" data-parent="web"><tspan x="60" y="325">Web control panel</tspan></text>
+<text id="web-body" x="60" y="364" font-family="Arial, Helvetica, sans-serif" font-size="19" fill="#334756" data-parent="web"><tspan x="60" y="364">React + TypeScript</tspan><tspan x="60" y="392.12">Searches / preview / history</tspan><tspan x="60" y="420.24">Discord sign-in via API</tspan></text>
+<text id="api-title" x="492" y="325" font-family="Arial, Helvetica, sans-serif" font-size="25" fill="#20537a" data-parent="api"><tspan x="492" y="325">Backend API</tspan></text>
+<text id="api-body" x="492" y="364" font-family="Arial, Helvetica, sans-serif" font-size="19" fill="#2d4f68" data-parent="api"><tspan x="492" y="364">Cloudflare Worker + Hono</tspan><tspan x="492" y="392.12">Auth / settings / jobs</tspan><tspan x="492" y="420.24">Results + alert dispatch</tspan><tspan x="492" y="448.36">Serves the static frontend</tspan></text>
+<text id="runner-title" x="1000" y="307" font-family="Arial, Helvetica, sans-serif" font-size="25" fill="#256b4d" data-parent="runner"><tspan x="1000" y="307">Background runner</tspan></text>
+<text id="runner-body" x="1000" y="349" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#355b47" data-parent="runner"><tspan x="1000" y="349">One Node.js process</tspan><tspan x="1000" y="384">Scheduler: every 10 min</tspan><tspan x="1000" y="419">Adapters -&gt; normalize -&gt; pricing</tspan><tspan x="1000" y="454">Shared catalog + exact deal rules</tspan></text>
+<text id="sources-title" x="1612" y="325" font-family="Arial, Helvetica, sans-serif" font-size="25" fill="#805622" data-parent="sources"><tspan x="1612" y="325">Marketplace sources</tspan></text>
+<text id="sources-body" x="1612" y="364" font-family="Arial, Helvetica, sans-serif" font-size="19" fill="#755c39" data-parent="sources"><tspan x="1612" y="364">eBay: API candidate</tspan><tspan x="1612" y="392.12">Facebook Marketplace</tspan><tspan x="1612" y="420.24">Kijiji / Karrot</tspan><tspan x="1612" y="448.36">Access must be validated</tspan></text>
+<text id="discord-title" x="60" y="649" font-family="Arial, Helvetica, sans-serif" font-size="25" fill="#8d3e5a" data-parent="discord"><tspan x="60" y="649">Discord</tspan></text>
+<text id="discord-body" x="60" y="683" font-family="Arial, Helvetica, sans-serif" font-size="19" fill="#74475a" data-parent="discord"><tspan x="60" y="683">Private-channel webhook</tspan><tspan x="60" y="710.55">Mentions the intended user</tspan><tspan x="60" y="738.1">One ping per listing ID</tspan></text>
+<text id="d1-title" x="492" y="649" font-family="Arial, Helvetica, sans-serif" font-size="25" fill="#20537a" data-parent="d1"><tspan x="492" y="649">D1 | control data</tspan></text>
+<text id="d1-body" x="492" y="683" font-family="Arial, Helvetica, sans-serif" font-size="19" fill="#2d4f68" data-parent="d1"><tspan x="492" y="683">Users / searches / job state</tspan><tspan x="492" y="710.55">Evaluated IDs + deal evidence</tspan><tspan x="492" y="738.1">Notification IDs + delivery state</tspan></text>
+<text id="sqlite-title" x="1000" y="649" font-family="Arial, Helvetica, sans-serif" font-size="25" fill="#256b4d" data-parent="sqlite"><tspan x="1000" y="649">SQLite | market data</tspan></text>
+<text id="sqlite-body" x="1000" y="684" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#355b47" data-parent="sqlite"><tspan x="1000" y="684">Latest price per platform + listing ID</tspan><tspan x="1000" y="711.6">Actual observations within 7 days</tspan><tspan x="1000" y="739.2">Source cursors + collection checkpoints</tspan></text>
+<text id="web-api-label" x="347" y="340" font-family="Arial, Helvetica, sans-serif" font-size="16" fill="#596672"><tspan x="347" y="340">Same-origin</tspan><tspan x="347" y="360.8">HTTPS API</tspan></text>
+<text id="api-runner-label" x="846" y="340" font-family="Arial, Helvetica, sans-serif" font-size="16" fill="#596672"><tspan x="846" y="340">Jobs / results</tspan><tspan x="846" y="360.8">Poll: 30s</tspan></text>
+<text id="outbound-label" x="859" y="412" font-family="Arial, Helvetica, sans-serif" font-size="15" fill="#596672"><tspan x="859" y="412">Outbound</tspan><tspan x="859" y="431.5">HTTPS</tspan></text>
+<text id="sources-edge-label" x="1458" y="341" font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#596672"><tspan x="1458" y="341">Allowed API</tspan><tspan x="1458" y="363.1">or feed</tspan></text>
+<text id="sources-edge-note" x="1459" y="412" font-family="Arial, Helvetica, sans-serif" font-size="15" fill="#596672"><tspan x="1459" y="412">Listings / refresh</tspan></text>
+<text id="d1-edge-label" x="661" y="548" font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#596672"><tspan x="661" y="548">Persist</tspan><tspan x="661" y="570.1">state</tspan></text>
+<text id="sqlite-edge-label" x="1221" y="562" font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#596672"><tspan x="1221" y="562">Read / update</tspan></text>
+<text id="discord-edge-label" x="331" y="553" font-family="Arial, Helvetica, sans-serif" font-size="15" fill="#92526a"><tspan x="331" y="553">Webhook</tspan><tspan x="331" y="572.5">wait=true</tspan></text>
+<text id="sources-note" x="1592" y="593" font-family="Arial, Helvetica, sans-serif" font-size="19" fill="#755c39"><tspan x="1592" y="593">Only verified adapters run.</tspan><tspan x="1592" y="623.4">Expose coverage + freshness.</tspan><tspan x="1592" y="653.8">Source failures stay visible.</tspan></text>
+<polyline id="footer-divider" points="40,836 1880,836" fill="none" stroke="#ccd5dc" stroke-width="2" stroke-linejoin="round"/>
+<text id="footer-data-heading" x="40" y="879" font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#596672"><tspan x="40" y="879">WHY TWO DATABASES?</tspan></text>
+<text id="footer-data-body" x="40" y="920" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#344655"><tspan x="40" y="920">Cloud: settings and durable alert history.</tspan><tspan x="40" y="950">Local: frequent listing-price observations.</tspan></text>
+<text id="footer-host-heading" x="700" y="879" font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#596672"><tspan x="700" y="879">HOSTING ASSUMPTION</tspan></text>
+<text id="footer-host-body" x="700" y="920" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#344655"><tspan x="700" y="920">PC off: website works, monitoring pauses.</tspan><tspan x="700" y="950">Runner connects outward; no inbound port.</tspan></text>
+<text id="footer-access-heading" x="1350" y="879" font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#596672"><tspan x="1350" y="879">SOURCE ACCESS IS A GATE</tspan></text>
+<text id="footer-access-body" x="1350" y="920" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#344655"><tspan x="1350" y="920">Enable verified, permitted sources only.</tspan><tspan x="1350" y="950">New repost IDs can trigger new alerts.</tspan></text>
+</svg>
