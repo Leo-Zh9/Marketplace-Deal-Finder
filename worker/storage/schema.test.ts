@@ -4,6 +4,43 @@ import { createTestDatabase, splitSqlStatements, type TestDatabase } from "../te
 import schemaSql from "../../migrations/0001_initial_storage.sql?raw";
 import evaluationSql from "../../migrations/0002_evaluation_tasks.sql?raw";
 
+/**
+ * Every CHECK in `sql`, innermost text only, whitespace normalised.
+ *
+ * DELIBERATELY NOT A REGEX, and the reason is the point of the test that uses it. A regex has
+ * to bound how deeply it will count parentheses, and whatever bound it picks, a constraint
+ * nested one level deeper is INVISIBLE to it -- so a test named "and no others" passes while
+ * an unplanned, applied constraint sits in the file. Two bounded patterns were tried and both
+ * failed that way: a line-anchored one missed the two-line CHECKs `0003` already writes, and a
+ * one-level-nesting one missed `CHECK ((a) OR ((b)))`. A balanced scan has no bound and no
+ * such case.
+ *
+ * `splitSqlStatements` has already stripped `--` comments, so a CHECK written inside a comment
+ * cannot reach this. Whitespace is collapsed so that reformatting a constraint across lines
+ * does not read as a deletion.
+ */
+const extractChecks = (sql: string): string[] => {
+  const checks: string[] = [];
+  const opener = /\bCHECK\s*\(/g;
+  let match = opener.exec(sql);
+  while (match !== null) {
+    const start = match.index + match[0].length;
+    let cursor = start;
+    let depth = 1;
+    while (cursor < sql.length && depth > 0) {
+      if (sql[cursor] === "(") depth += 1;
+      else if (sql[cursor] === ")") depth -= 1;
+      cursor += 1;
+    }
+    // `depth > 0` here would mean unbalanced SQL, which cannot be applied at all; the slice
+    // then runs to end-of-input and the assertion fails loudly, which is the right outcome.
+    checks.push(sql.slice(start, cursor - 1).replace(/\s+/g, " ").trim());
+    opener.lastIndex = cursor;
+    match = opener.exec(sql);
+  }
+  return checks;
+};
+
 let database!: TestDatabase;
 
 beforeAll(async () => {
@@ -86,6 +123,30 @@ describe("0001_initial_storage.sql", () => {
         .all<{ name: string; notnull: number }>();
       expect(results).toEqual([{ name: "variant_key", notnull: 1 }]);
     }
+  });
+
+  // Test S2b. THE CHECKS, EXHAUSTIVELY -- and this is a PRESENCE pin, not a behavioural one.
+  // It says the lines are still in the file wrangler applies; it does NOT say any live path
+  // reaches them. Measured, at master AND with this PR applied: deleting
+  // `CHECK (total_price_cents >= 0)` or `CHECK (count > 0 OR total_price_cents = 0)` from 0001
+  // leaves the ENTIRE suite green -- two of the three model_stats CHECKs are pinned by nothing
+  // at all. They are the difference between a broken subtract/add pairing throwing and drifting
+  // silently, SQLite cannot add or drop a CHECK in place, and 0001 is merged and about to be
+  // applied: this is the last moment a deletion could be caught.
+  //
+  // "AND NO OTHERS" IS MEANT LITERALLY, which is why `extractChecks` is a balanced scan rather
+  // than a pattern -- see its docstring. An unplanned constraint added to 0001 shows up here
+  // whatever its nesting or line breaks, and a deletion shows up as a missing entry.
+  it("declares exactly these five CHECK constraints, and no others", () => {
+    const checks = extractChecks(splitSqlStatements(schemaSql).join("\n"));
+
+    expect(checks).toEqual([
+      "price_cents IS NULL OR price_cents >= 0",
+      "price_cents >= 0",
+      "count >= 0",
+      "total_price_cents >= 0",
+      "count > 0 OR total_price_cents = 0",
+    ]);
   });
 
   it("splits the migration into four CREATE TABLEs and one CREATE INDEX", () => {

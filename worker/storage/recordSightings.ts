@@ -268,12 +268,27 @@ export const recordSightings = async (
       });
 
       // What this sighting WOULD write, or null if it must not contribute.
+      //
+      // `> 0`, NOT `>= 0`. PLAN.md:59 -- "Only positive reference prices enter the average" --
+      // and PLAN.md:52 prices an explicitly free item at 0. A free listing is still STORED and
+      // still EVALUATED: evaluateBatch reads the asking price from `listings`, and the ABSENCE
+      // of a price_observations row is exactly how it knows nothing must be subtracted from the
+      // benchmark. It simply is not a price reference.
+      //
+      // THIS IS NOT THE SAME QUESTION AS dealRules' `isSafeCents`, which stays `>= 0` a hundred
+      // lines away and MUST: this asks "may other listings be judged against this price", that
+      // asks "can this price be judged at all". Tightening that one to match this one turns
+      // every free listing into NEEDS_REVIEW / no-price. See R15b.
+      //
+      // Admitting zero incremented the divisor without moving the dividend, so one free listing
+      // beside one 30,000c listing HALVED the benchmark -- and the benchmark is what "deal" is
+      // defined against. `>= 0` was not a typo, but it was wrong.
       const contributes =
         validity === "VALID" &&
         listing.modelKey !== null &&
         listing.priceCents !== null &&
         Number.isSafeInteger(listing.priceCents) &&
-        listing.priceCents >= 0;
+        listing.priceCents > 0;
 
       const desired: Contribution | null = contributes
         ? {

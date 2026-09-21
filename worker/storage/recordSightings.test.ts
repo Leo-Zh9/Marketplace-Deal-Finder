@@ -177,7 +177,7 @@ const p2Violations = async (now: number, staleAfterSeconds = STALE_AFTER_SECONDS
  WHERE l.validity = 'VALID'
    AND l.model_key IS NOT NULL
    AND l.price_cents IS NOT NULL
-   AND l.price_cents >= 0
+   AND l.price_cents > 0
    AND l.price_cents = CAST(l.price_cents AS INTEGER)
    AND l.last_seen_at >= ?1 - ?2
    AND NOT EXISTS (SELECT 1 FROM price_observations p
@@ -472,31 +472,216 @@ describe("transaction failure", () => {
     });
     expect(observations.find((row) => row.listing_id === "l2")!.price_cents).toBe(240);
   });
+});
 
-  it("CHECK (count >= 0) alone catches a corrupt aggregate on a free listing", async () => {
-    // A zero-priced listing is ordinary on a marketplace, and it is the one case where the
-    // OTHER two model_stats CHECKs cannot stand in: with old = new = 0 the subtract leaves
-    // (-1, 0) and the add restores (0, 0), and BOTH of those states satisfy
-    // `total_price_cents >= 0` and `count > 0 OR total_price_cents = 0`. So this scenario --
-    // and, as far as the arithmetic allows, only this scenario -- pins the count CHECK by
-    // itself. A cosmetic change is used rather than a price change precisely because the
-    // price must stay 0 on both sides.
-    await sight([valid({ listingId: "free", priceCents: 0, title: "free gpu" })], T0);
-    expect((await allStats())[0]).toMatchObject({ count: 1, total_price_cents: 0 });
+// ---------------------------------------------------------------------------
+// The count CHECK. Kept here rather than in cleanupStaleObservations.test.ts because the
+// seeding, p1Violations, allObservations and allStats all live in this file and that one has
+// neither p1Violations nor allObservations -- the pin would cost more machinery than it is
+// worth to move. The CHECK it defends guards the aggregate arithmetic BOTH writers share.
+// ---------------------------------------------------------------------------
+describe("the count CHECK", () => {
+  it("CHECK (count >= 0) alone catches a corrupt aggregate when a whole group expires", async () => {
+    // WHEN IS THIS CHECK THE ONLY ONE THAT FIRES? Any decrement leaves (c - d, T - S), where d
+    // is the number of contributions removed and S is their total. For `count >= 0` to be the
+    // one violated you need c - d < 0, T - S >= 0, and -- since c - d is not > 0 --
+    // `count > 0 OR total = 0` forces T - S = 0. So the condition is exactly S = T and d > c:
+    // the subtraction takes the whole stored total while removing more contributions than the
+    // stored count admits.
+    //
+    // TWO statements decrement. SUBTRACT_OLD has d = 1, which forces c = 0, hence T = 0, hence
+    // a single stored price of 0 -- a row no live path can write any more now that only
+    // positive prices contribute. CLEAN_A has d = N over a whole expired group, and S = T holds
+    // for free whenever that group expires entirely WITH ITS STORED TOTAL INTACT -- which is why
+    // only the count is corrupted below, and why the closing assertion pins the total at 51,000.
+    // So ANY understated count isolates the CHECK with no zero anywhere. This test uses that
+    // family: it needs one corrupt column and no planted price, and it survives a future
+    // `CHECK (price_cents > 0)` on price_observations that the SUBTRACT_OLD route would not.
+    //
+    // "WITH ITS STORED TOTAL INTACT" is load-bearing, and the `rejects.toThrow` below cannot
+    // see it: corrupt the total as well -- say (1, 40_000) against observations summing 51,000
+    // -- and CLEAN_A leaves (-1, -11_000), which violates `total_price_cents >= 0` TOO and
+    // isolates nothing, yet SQLite reports the byte-identical message because it names the
+    // FIRST-DECLARED CHECK. The word "alone" in this test's name is therefore carried by the
+    // mutation that deletes `CHECK (count >= 0)` from 0001, and the total is held honest by the
+    // closing assertion, not by the error string.
+    //
+    // Unreachable either way, and by the same fence: d > c means the aggregate's count
+    // understates the observations in its own group, which is precisely what p1Violations
+    // reports. The corruption below is asserted to be a P1 violation so that stays visible.
+    await sight(
+      [
+        valid({ listingId: "c1", modelKey: "RTX_5080", priceCents: 31_000 }),
+        valid({ listingId: "c2", modelKey: "RTX_5080", priceCents: 20_000 }),
+      ],
+      T0,
+    );
+    // ONE column, and the corrupt row is still legal on its own: (1, 51_000) satisfies all
+    // three CHECKs, so nothing rejects the setup and the failure below is the arithmetic's.
+    await db.prepare("UPDATE model_stats SET count = 1").run();
+    expect(await p1Violations()).not.toEqual([]);
 
-    await db.prepare("UPDATE model_stats SET count = 0, total_price_cents = 0").run();
-
-    const report = await sight(
-      [valid({ listingId: "free", priceCents: 0, title: "free gpu - still available" })],
-      T0 + 60,
+    // CLEAN_A: count = 1 - 2 = -1, total = 51_000 - 51_000 = 0. (-1, 0) passes
+    // `total_price_cents >= 0` and passes `count > 0 OR total_price_cents = 0`.
+    await expect(cleanupStaleObservations(db, { now: T0 + 8 * DAY })).rejects.toThrow(
+      /CHECK constraint failed: count >= 0/,
     );
 
-    const failed = report.results[0];
-    expect(failed.outcome).toBe("FAILED");
-    expect(failed.error).toMatch(/CHECK constraint failed: count >= 0/);
-    // Rolled back across tables: the cosmetic edit never landed either.
-    expect((await allListings())[0]).toMatchObject({ title: "free gpu" });
-    expect((await allObservations())[0]).toMatchObject({ listing_id: "free", price_cents: 0 });
+    // CLEAN_A and CLEAN_B are one batch, so the rollback keeps BOTH observations -- and the
+    // unconditional CLEAN_SWEEP after the loop never runs, so the corrupt row is untouched too.
+    expect((await allObservations()).map((row) => row.listing_id)).toEqual(["c1", "c2"]);
+    expect(await allStats()).toEqual([
+      {
+        market_key: "43.4643,-80.5204|25km",
+        model_key: "RTX_5080",
+        variant_key: "",
+        count: 1,
+        total_price_cents: 51_000,
+      },
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// An explicitly free listing. PLAN.md:52 prices it at 0; PLAN.md:59 admits only POSITIVE
+// reference prices to the average. Stored and evaluated, but never in the benchmark.
+// ---------------------------------------------------------------------------
+describe("an explicitly free listing", () => {
+  it("is stored and queued for evaluation but never enters the benchmark", async () => {
+    // ALL THREE listings sit in the SAME group on purpose. An assertion that the aggregate
+    // agrees with the observations is satisfied by BOTH SIDES BEING EMPTY, so the priced
+    // listings are the named survivors: the aggregate has to be exactly their row, at exactly
+    // their total.
+    //
+    // `penny` AT 1 CENT IS THE BOUNDARY, and it is the whole reason this test is three
+    // listings rather than two. The gate is `> 0`; with only a 0 and a 30,000 in the fixture,
+    // `> 0`, `> 1` and `>= 100` are indistinguishable to the entire suite, so the exact
+    // boundary of the one production line this PR changes would be pinned by nothing. 1 cent
+    // is a real reference price -- excluding it would shrink reference_count and push groups
+    // under MINIMUM_REFERENCE_COUNT into insufficient-evidence, which is this PR's own
+    // rationale pointed the wrong way. ONLY zero is excluded.
+    const report = await sight(
+      [
+        valid({
+          listingId: "paid",
+          modelKey: "RX_7900_XTX",
+          priceCents: 30_000,
+          title: "rx 7900 xtx, boxed",
+        }),
+        valid({
+          listingId: "free",
+          modelKey: "RX_7900_XTX",
+          priceCents: 0,
+          title: "rx 7900 xtx, dead fan, free to a good home",
+        }),
+        valid({
+          listingId: "penny",
+          modelKey: "RX_7900_XTX",
+          priceCents: 1,
+          title: "rx 7900 xtx, no fans, spares or repair",
+        }),
+      ],
+      T0,
+    );
+
+    // THE AGGREGATE IS ASSERTED BEFORE THE REPORT LABELS, and that order is deliberate:
+    // assertions are sequential, so whichever comes first is the one a mutation actually dies
+    // on. Reverting the gate to `>= 0` must be caught by the ARITHMETIC, not by a string.
+    //
+    // (2, 30_001), not (3, 30_001). The free listing is out and the 1c listing is IN: the
+    // count drops by exactly one against three sighted listings, and the total carries the
+    // penny. Loosen the gate to `>= 0` and this reads (3, 30_001); tighten it to `> 1` and it
+    // reads (1, 30_000). Either way the arithmetic here is what dies, not a label.
+    expect(await allStats()).toEqual([
+      {
+        market_key: "43.4643,-80.5204|25km",
+        model_key: "RX_7900_XTX",
+        variant_key: "",
+        count: 2,
+        total_price_cents: 30_001,
+      },
+    ]);
+    expect((await allObservations()).map((row) => row.listing_id)).toEqual(["paid", "penny"]);
+
+    expect(report.results).toEqual([
+      { listingId: "paid", outcome: "NEW", contribution: "recorded" },
+      { listingId: "free", outcome: "NEW", contribution: "skipped-no-price" },
+      { listingId: "penny", outcome: "NEW", contribution: "recorded" },
+    ]);
+
+    // STORED and EVALUATED. Only the contribution changes -- a free listing stays visible.
+    expect((await allListings()).map((row) => row.listing_id)).toEqual([
+      "free",
+      "paid",
+      "penny",
+    ]);
+    expect((await allListings())[0]).toMatchObject({
+      listing_id: "free",
+      price_cents: 0,
+      validity: "VALID",
+      model_key: "RX_7900_XTX",
+    });
+    expect((await allTasks()).map((row) => row.listing_id)).toEqual(["free", "paid", "penny"]);
+
+    expect(await p1Violations()).toEqual([]);
+    expect(await p2Violations(T0)).toEqual([]);
+  });
+
+  it("removes the contribution when a price drops to free, settles, and restores above zero", async () => {
+    // The zero boundary is exactly the shape of the oscillation the de-duplication comment
+    // describes, so each state is replayed rather than merely reached.
+    await sight(
+      [
+        valid({ listingId: "drops", modelKey: "RX_7900_XTX", priceCents: 31_000 }),
+        valid({ listingId: "anchor", modelKey: "RX_7900_XTX", priceCents: 20_000 }),
+      ],
+      T0,
+    );
+    expect((await allStats())[0]).toMatchObject({ count: 2, total_price_cents: 51_000 });
+
+    const dropped = await sight(
+      [valid({ listingId: "drops", modelKey: "RX_7900_XTX", priceCents: 0 })],
+      T0 + 60,
+    );
+    expect(dropped.results).toEqual([
+      { listingId: "drops", outcome: "CHANGED", contribution: "removed" },
+    ]);
+    // The anchor survives at its own price: this is not "the group emptied".
+    expect((await allStats())[0]).toMatchObject({ count: 1, total_price_cents: 20_000 });
+    expect((await allObservations()).map((row) => row.listing_id)).toEqual(["anchor"]);
+
+    // Free is a FIXED POINT, not a flip-flop: replaying it is UNCHANGED and writes zero rows.
+    for (let scan = 0; scan < 3; scan += 1) {
+      const replay = await sight(
+        [
+          seenAgain(
+            valid({ listingId: "drops", modelKey: "RX_7900_XTX", priceCents: 0 }),
+            `2026-09-2${scan + 1}T00:00:00Z`,
+          ),
+        ],
+        T0 + 120 + scan * 60,
+      );
+      expect(replay.results, `replay ${scan}`).toEqual([
+        { listingId: "drops", outcome: "UNCHANGED", contribution: "none" },
+      ]);
+      expect(replay.usage.rowsWritten, `replay ${scan}`).toBe(0);
+      expect((await allStats())[0], `replay ${scan}`).toMatchObject({
+        count: 1,
+        total_price_cents: 20_000,
+      });
+    }
+
+    // And back across the boundary: the contribution returns at the new price.
+    const repriced = await sight(
+      [valid({ listingId: "drops", modelKey: "RX_7900_XTX", priceCents: 25_000 })],
+      T0 + 400,
+    );
+    expect(repriced.results).toEqual([
+      { listingId: "drops", outcome: "CHANGED", contribution: "restored" },
+    ]);
+    expect((await allStats())[0]).toMatchObject({ count: 2, total_price_cents: 45_000 });
+    expect(await p1Violations()).toEqual([]);
+    expect(await p2Violations(T0 + 400)).toEqual([]);
   });
 });
 
