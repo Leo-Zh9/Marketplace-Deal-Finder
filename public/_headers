@@ -1,5 +1,5 @@
 /*
-  Content-Security-Policy: default-src 'self'; base-uri 'self'; connect-src 'self'; font-src 'self'; form-action 'self'; frame-ancestors 'none'; img-src 'self' data:; object-src 'none'; script-src 'self'; style-src 'self'
+  Content-Security-Policy: default-src 'self'; base-uri 'self'; connect-src 'self' https://REPLACE_WITH_WORKER_ORIGIN https://identitytoolkit.googleapis.com https://securetoken.googleapis.com; font-src 'self'; form-action 'self'; frame-ancestors 'none'; frame-src https://REPLACE_WITH_FIREBASE_AUTH_DOMAIN https://apis.google.com; img-src 'self' data:; object-src 'none'; script-src 'self' https://apis.google.com; style-src 'self'
   Permissions-Policy: camera=(), microphone=(), geolocation=(self), payment=(), usb=()
   Referrer-Policy: no-referrer
   X-Content-Type-Options: nosniff

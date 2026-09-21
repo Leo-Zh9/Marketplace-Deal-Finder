@@ -6,6 +6,7 @@ import { ListingCard } from "./components/ListingCard";
 import { LocationSelector } from "./components/LocationSelector";
 import { ModelSelector } from "./components/ModelSelector";
 import { StatusPanel } from "./components/StatusPanel";
+import type { AuthenticatedIdentity } from "./auth/authTypes";
 import { componentById } from "./data/catalog";
 import { requestErrorMessage } from "./services/apiClient";
 import { marketplaceClient } from "./services/marketplaceClient";
@@ -46,7 +47,12 @@ const hasErrors = (errors: ValidationErrors) =>
 
 type PendingAction = "preview" | "start" | "stop" | null;
 
-function App() {
+interface AppProps {
+  identity?: AuthenticatedIdentity | null;
+  onSignOut?: () => void;
+}
+
+function App({ identity, onSignOut }: AppProps = {}) {
   const [settings, setSettings] = useState<SearchSettings>(initialSettings);
   const [radiusMode, setRadiusMode] = useState<"2" | "5" | "10" | "25" | "custom">("25");
   const [errors, setErrors] = useState<ValidationErrors>({});
@@ -216,6 +222,20 @@ function App() {
             <span aria-hidden="true" />
             Facebook Marketplace
           </div>
+          {identity && (
+            <div className="account-block">
+              <span className="account-email">{identity.email}</span>
+              {onSignOut && (
+                <button
+                  type="button"
+                  className="secondary-button account-signout"
+                  onClick={onSignOut}
+                >
+                  Sign out
+                </button>
+              )}
+            </div>
+          )}
         </div>
       </header>
 

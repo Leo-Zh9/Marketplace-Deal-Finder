@@ -1383,3 +1383,50 @@ input[aria-invalid="true"] {
     border-radius: 7px;
   }
 }
+
+/* Phase 2: account bar and the pre-dashboard authentication gate. */
+.account-block {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.account-email {
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.account-signout {
+  min-height: 34px;
+  padding: 6px 12px;
+  font-size: 0.78rem;
+}
+
+.auth-gate {
+  width: min(440px, calc(100% - 32px));
+  margin: 0 auto;
+  padding: 48px 0;
+  display: grid;
+  gap: 14px;
+  justify-items: center;
+  text-align: center;
+}
+
+.auth-gate h1 {
+  margin: 0;
+  font-size: 1.15rem;
+}
+
+.auth-gate p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.55;
+}
+
+.auth-gate .error-banner {
+  width: 100%;
+  margin-top: 0;
+}

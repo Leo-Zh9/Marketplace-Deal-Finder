@@ -1,6 +1,7 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App from "./App";
+import type { AuthenticatedIdentity } from "./auth/authTypes";
 
 describe("Marketplace Deal Finder", () => {
   it("shows required-field errors when preview is submitted empty", async () => {
@@ -93,5 +94,31 @@ describe("Marketplace Deal Finder", () => {
         name: "200 University Avenue W, Waterloo, ON N2L 3G1",
       }),
     ).toBeInTheDocument();
+  });
+
+  it("shows the account bar only when an identity is supplied", async () => {
+    const user = userEvent.setup();
+    const identity: AuthenticatedIdentity = {
+      email: "owner@example.com",
+      subject: "firebase-uid-1",
+      expiresAt: 1_800_003_600,
+      authenticationMethod: "firebase-google",
+    };
+    const onSignOut = vi.fn();
+
+    const anonymous = render(<App />);
+    expect(screen.queryByText("owner@example.com")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Sign out" })).not.toBeInTheDocument();
+    anonymous.unmount();
+
+    const local = render(<App identity={identity} />);
+    expect(screen.getByText("owner@example.com")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Sign out" })).not.toBeInTheDocument();
+    local.unmount();
+
+    render(<App identity={identity} onSignOut={onSignOut} />);
+    expect(screen.getByText("owner@example.com")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Sign out" }));
+    expect(onSignOut).toHaveBeenCalledTimes(1);
   });
 });

@@ -22,11 +22,20 @@ const getMockScenario = () =>
 const dateInMinutes = (minutes: number) =>
   new Date(Date.now() + minutes * 60_000).toISOString();
 
-let monitoringStatus: MonitoringStatus = {
+const stoppedStatus = (): MonitoringStatus => ({
   state: "STOPPED",
   provider: "AVAILABLE",
   lastSuccessfulScanAt: null,
   nextScanAt: null,
+});
+
+let monitoringStatus: MonitoringStatus = stoppedStatus();
+let stateGeneration = 0;
+
+/** Clears prototype state when the signed-in identity changes. */
+export const resetMarketplaceState = () => {
+  stateGeneration += 1;
+  monitoringStatus = stoppedStatus();
 };
 
 const matchesModelSelection = (
@@ -82,7 +91,9 @@ export const marketplaceClient: MarketplaceClient = {
   },
 
   async startMonitoring() {
+    const generation = stateGeneration;
     await wait();
+    if (generation !== stateGeneration) return monitoringStatus;
     monitoringStatus = {
       state: "ACTIVE",
       provider: "AVAILABLE",
@@ -93,7 +104,9 @@ export const marketplaceClient: MarketplaceClient = {
   },
 
   async stopMonitoring() {
+    const generation = stateGeneration;
     await wait(250);
+    if (generation !== stateGeneration) return monitoringStatus;
     monitoringStatus = {
       ...monitoringStatus,
       state: "STOPPED",
