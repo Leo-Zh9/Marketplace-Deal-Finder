@@ -21,8 +21,12 @@ export type EvaluationReason =
   | "above-maximum-price"
   | "insufficient-evidence"
   /**
-   * The aggregate itself is corrupt: a `total_price_cents` that is not a safe integer, or one
-   * below zero.
+   * The aggregate itself is corrupt, in whichever column it is corrupt: a `count` or a
+   * `total_price_cents` that is not a safe integer, or that is below zero.
+   *
+   * NAMED FOR THE AGGREGATE, not for one column, and that is load-bearing. It covered only the
+   * total for one review round while also being the answer for a corrupt count, which is exactly
+   * the kind of identifier whose meaning drifts from its name and then outlives everyone who knew.
    *
    * NOT REACHABLE FROM 3C AS WRITTEN, and the comment says so on purpose. `recordSightings` gates
    * every contribution on `Number.isSafeInteger(priceCents)`, so a non-integer price reaches
@@ -31,13 +35,16 @@ export type EvaluationReason =
    * the drift 3C's own doc anticipates between the observation ledger and the aggregate, not a
    * live hazard. The column's INTEGER affinity would permit it; the only writer does not.
    *
-   * It is separate from `insufficient-evidence` because the two need different responses -- more
-   * observations cure thin evidence, nothing cures a corrupt aggregate on its own -- and every
-   * candidate in that model parks at NEEDS_REVIEW and rotates in tier 3 until it is repaired.
+   * It is separate from `insufficient-evidence` because the two need different RESPONSES, and the
+   * predicate they trip is not what separates them. `count = 4` and `count = -1` both fail
+   * `count < MINIMUM_REFERENCE_COUNT`; waiting repairs the first and NEVER repairs the second.
+   * Reporting them alike is precisely the misreading this reason exists to stop -- an operator
+   * looking for more observations, when observations were never the problem. Every candidate in
+   * that model parks at NEEDS_REVIEW and rotates in tier 3 until the aggregate is repaired.
    * Note the signal lives in the returned `EvaluationReport` only: 3D persists `verdict`, not
    * `reason`, so a stuck model is visible to the caller of the batch, not in `evaluation_tasks`.
    */
-  | "invalid-reference-total"
+  | "invalid-reference-aggregate"
   | "no-price"
   | "validity-needs-review"
   | "invalid-reference"

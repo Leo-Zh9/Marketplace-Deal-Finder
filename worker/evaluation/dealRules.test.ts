@@ -134,17 +134,34 @@ describe("dealRules -- the evidence gate", () => {
     });
   });
 
-  // R12. A drifted aggregate. C = -1 satisfies the raw comparison (1 * -1 * 10000 = -10000 <=
-  // 1000 * 8000), so it is the EVIDENCE GATE, not the arithmetic, that stops it becoming a DEAL.
-  //
-  // A negative COUNT stays `insufficient-evidence` while a negative TOTAL does not (R23), and the
-  // asymmetry is deliberate: for `count`, "corrupt" and "too few" are the same predicate with the
-  // same answer -- wait -- and `count < MINIMUM_REFERENCE_COUNT` is already that test. A corrupt
-  // total is not "too small"; it is unusable, and waiting need never repair it.
-  it("R12: a negative reference count is insufficient evidence, never a deal", () => {
+  /**
+   * R12. THE TEST THAT KEEPS THE TWO PARKED REASONS APART, asserted side by side because that is
+   * the only way the distinction is visible in the suite rather than only in the code.
+   *
+   * `count = 4` and `count = -1` trip the SAME predicate, `count < MINIMUM_REFERENCE_COUNT`. They
+   * are not the same situation: waiting repairs 4 and waiting NEVER repairs -1. Reporting them
+   * alike sends an operator looking for observations that were never the problem.
+   *
+   * C = -1 also satisfies the raw comparison (1 * -1 * 10000 = -10000 <= 1000 * 8000), so it is a
+   * gate, not the arithmetic, that stops it becoming a DEAL.
+   */
+  it("R12: distinguishes a corrupt reference count from a merely thin one", () => {
+    // Corrupt: waiting cannot fix this, and saying so is the point.
     expect(
       decide(
         candidate({ referenceCount: -1, referenceTotalCents: 1000, candidatePriceCents: 1 }),
+        DISCOUNT_20,
+      ),
+    ).toEqual({
+      verdict: "NEEDS_REVIEW",
+      status: "NEEDS_REVIEW",
+      reason: "invalid-reference-aggregate",
+    });
+
+    // Thin: a young market, and waiting is exactly the right answer.
+    expect(
+      decide(
+        candidate({ referenceCount: 4, referenceTotalCents: 92_000, candidatePriceCents: 1 }),
         DISCOUNT_20,
       ),
     ).toEqual({
@@ -160,7 +177,7 @@ describe("dealRules -- a malformed aggregate is not thin evidence", () => {
   // non-integer price can. Every candidate in that model then parks at NEEDS_REVIEW and rotates in
   // tier 3 until the aggregate is repaired -- correct, but it must be DIAGNOSABLE. Reported as
   // `insufficient-evidence` it is indistinguishable from a young market that is merely waiting.
-  it("R22: reports a non-integer reference total under its own reason", () => {
+  it("R22: reports a non-integer reference total as a corrupt aggregate", () => {
     expect(
       decide(
         candidate({
@@ -173,16 +190,15 @@ describe("dealRules -- a malformed aggregate is not thin evidence", () => {
     ).toEqual({
       verdict: "NEEDS_REVIEW",
       status: "NEEDS_REVIEW",
-      reason: "invalid-reference-total",
+      reason: "invalid-reference-aggregate",
     });
   });
 
   // R23. A negative total cannot produce a false DEAL -- the right-hand side goes negative while
   // the left stays non-negative -- but without this branch it produces NOT_DEAL / COMPLETE, which
   // marks a listing "not a deal" forever on the strength of a drifted aggregate and never looks
-  // again. It reports the SAME reason as R22: both are a corrupt total, and R22's whole argument
-  // is that a corrupt aggregate must not be reported as thin evidence. Splitting them would apply
-  // that argument to one column value and not the other.
+  // again. Same reason as R12 and R22: the rule is uniform, a malformed aggregate is reported as
+  // malformed in whichever column it is malformed.
   it("R23: reports a negative reference total as a corrupt total, not as thin evidence", () => {
     expect(
       decide(
@@ -192,7 +208,7 @@ describe("dealRules -- a malformed aggregate is not thin evidence", () => {
     ).toEqual({
       verdict: "NEEDS_REVIEW",
       status: "NEEDS_REVIEW",
-      reason: "invalid-reference-total",
+      reason: "invalid-reference-aggregate",
     });
   });
 });

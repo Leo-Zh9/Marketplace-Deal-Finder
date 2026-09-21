@@ -176,25 +176,32 @@ Exactly two reasons qualify, and they are deliberately distinct:
 
 - **`insufficient-evidence`** — the market is young. Fewer than five comparables, or no
   `model_stats` row at all. More observations cure it, and they arrive on their own.
-- **`invalid-reference-total`** — the aggregate itself is corrupt: a `total_price_cents` that is
-  not a safe integer, or one below zero. Nothing cures that on its own.
+- **`invalid-reference-aggregate`** — the aggregate itself is corrupt, in whichever column: a
+  `count` or a `total_price_cents` that is not a safe integer, or that is below zero. Nothing
+  cures that on its own.
+
+**The two are not separated by which predicate a value trips — they are separated by whether
+waiting is the answer.** `count = 4` and `count = −1` both fail `count < 5`. Waiting repairs the
+first and never repairs the second, and reporting them alike sends an operator looking for more
+observations when observations were never the problem. That is the entire reason the second
+category exists, so it applies to every column the aggregate has. Test R12 asserts both cases side
+by side, because a distinction that lives only in the code is one nothing protects.
 
 Both rotate in tier 3, so both self-heal if the aggregate is ever repaired — a `model_stats` change
 never requeues a listing, so tier 3 is the only way back. Only the second one tells you a model is
 **stuck** rather than merely waiting, which is the whole reason it is not folded into the first.
 The signal lives in the returned `EvaluationReport`: 3D persists `verdict`, not `reason`.
 
-**`invalid-reference-total` is not reachable from 3C as written.** `recordSightings` gates every
+**`invalid-reference-aggregate` is not reachable from 3C as written.** `recordSightings` gates every
 contribution on `Number.isSafeInteger(priceCents)`, so a non-integer price reaches `listings` but
 never `price_observations` or `model_stats` — the canonical `19.99 * 100` artifact is stored as a
 listing and simply never contributes. The column's INTEGER *affinity* would permit a bad total; the
 only writer does not. This is defence in depth against the ledger drift 3C's own doc anticipates,
 not a live hazard.
 
-A negative `reference_count` is the one case that stays with `insufficient-evidence`, and the
-asymmetry is deliberate: for `count`, "corrupt" and "too few" are the same predicate with the same
-answer — wait — and `count < 5` is already that test. A corrupt total is not "too small"; it is
-unusable.
+Past both gates, `count` and `total_price_cents` are safe integers at or above zero and `count` is
+at least five, so every `BigInt()` in the comparison is total — the gates are what make the
+arithmetic safe, not an assumption about the data.
 
 A `validity='NEEDS_REVIEW'` or `invalid-reference` task re-opens when **3B re-classifies the listing
 on a later sighting** — that works only because `validity` is inside `contentHash`. A direct

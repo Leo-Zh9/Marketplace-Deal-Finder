@@ -163,36 +163,32 @@ export const decide = (
     const count = reference.referenceCount;
     const total = reference.referenceTotalCents;
 
-    // A CORRUPT TOTAL, in either direction, gets its own reason. Not "insufficient evidence":
-    // more observations cure thin evidence, and nothing cures a corrupt aggregate on its own, so
-    // reporting the two the same way makes a permanently stuck model indistinguishable from a
-    // young market that is merely waiting. Both park the task at NEEDS_REVIEW so it self-heals if
-    // the aggregate is ever repaired -- a model_stats change never requeues a listing, so tier 3
-    // is the only way back -- but only this reason says which one you are looking at.
+    // A CORRUPT AGGREGATE, in whichever column it is corrupt, and BEFORE the thin-evidence gate.
     //
-    // A negative total also cannot produce a false DEAL (the right-hand side goes negative while
-    // the left stays non-negative), but without this branch it yields NOT_DEAL / COMPLETE, which
-    // marks a listing "not a deal" forever on the strength of drifted data and never looks again.
-    if (total !== null && (!Number.isSafeInteger(total) || total < 0)) {
+    // The two gates below are not separated by which predicate a value trips -- `count = 4` and
+    // `count = -1` both fail `count < MINIMUM_REFERENCE_COUNT` -- but by whether WAITING IS THE
+    // ANSWER. Waiting repairs 4. Waiting never repairs -1, a non-integer, or a negative total.
+    // Reporting them alike sends an operator looking for more observations when observations were
+    // never the problem, which is the whole reason this reason exists.
+    //
+    // A corrupt aggregate also cannot produce a false DEAL -- a negative count is below the
+    // minimum, and a negative total makes the right-hand side negative while the left stays
+    // non-negative -- but without this branch a negative total yields NOT_DEAL / COMPLETE, which
+    // marks a listing "not a deal" forever on drifted data and never looks again.
+    const corrupt = (value: number | null): boolean =>
+      value !== null && (!Number.isSafeInteger(value) || value < 0);
+    if (corrupt(count) || corrupt(total)) {
       return {
         verdict: "NEEDS_REVIEW",
         status: "NEEDS_REVIEW",
-        reason: "invalid-reference-total",
+        reason: "invalid-reference-aggregate",
       };
     }
 
-    // A negative COUNT deliberately stays here rather than joining the branch above, and the
-    // asymmetry is real rather than an oversight: for `count`, "corrupt" and "too few" are the
-    // same predicate with the same answer -- wait for more observations -- and
-    // `count < MINIMUM_REFERENCE_COUNT` is already that test, which -1 trips exactly as 0 and 4
-    // do. For `total` they are not the same: a corrupt total is not "too small", it is unusable,
-    // and no number of further observations is guaranteed to repair it.
-    if (
-      count === null ||
-      total === null ||
-      !Number.isSafeInteger(count) ||
-      count < MINIMUM_REFERENCE_COUNT
-    ) {
+    // Genuinely thin or absent evidence: a young market, which more observations cure on their
+    // own. Past both gates `count` and `total` are safe integers >= 0 and `count >= 5`, so every
+    // BigInt() below is total.
+    if (count === null || total === null || count < MINIMUM_REFERENCE_COUNT) {
       return { verdict: "NEEDS_REVIEW", status: "NEEDS_REVIEW", reason: "insufficient-evidence" };
     }
     // P <= (total/count) * (1 - bp/10000), multiplied through by count*10000. Both factors are
