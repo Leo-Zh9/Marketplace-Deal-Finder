@@ -16,9 +16,12 @@ afterAll(async () => {
 
 // Test 14 -- schema / migration.
 describe("0001_initial_storage.sql", () => {
-  // Test S1. createTestDatabase applies 0001 AND 0002, so this also asserts that 0002 is
-  // purely additive: it creates no table of its own.
-  it("creates exactly the four tables 3C exercises", async () => {
+  // Test S1. createTestDatabase applies 0001, 0002 AND 0003, so this asserts what the three
+  // migrations together create and NOTHING ELSE: 0002 is purely additive and creates no
+  // table of its own, and 0003 adds exactly the two 3E-a tables. A table nobody planned --
+  // monitor_lock above all, which belongs to 3E-b and whose only reader is 3E-b's run lock
+  // -- shows up here and nowhere else.
+  it("creates exactly the six tables 0001, 0002 and 0003 define", async () => {
     // The filter is required: after the migration sqlite_master also holds D1's internal
     // _cf_METADATA and four sqlite_autoindex_* entries for the composite primary keys.
     const { results } = await database.db
@@ -32,6 +35,8 @@ describe("0001_initial_storage.sql", () => {
       "listings",
       "model_stats",
       "price_observations",
+      "search_revisions",
+      "search_settings",
     ]);
   });
 
