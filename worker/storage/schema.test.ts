@@ -88,6 +88,38 @@ describe("0001_initial_storage.sql", () => {
     }
   });
 
+  // Test S2b. THE CHECKS, EXHAUSTIVELY -- and this is a PRESENCE pin, not a behavioural one.
+  // It says the lines are still in the file wrangler applies; it does NOT say any live path
+  // reaches them. Measured, at master AND with this PR applied: deleting
+  // `CHECK (total_price_cents >= 0)` or `CHECK (count > 0 OR total_price_cents = 0)` from 0001
+  // leaves the ENTIRE suite green -- two of the three model_stats CHECKs are pinned by nothing
+  // at all. They are the difference between a broken subtract/add pairing throwing and drifting
+  // silently, SQLite cannot add or drop a CHECK in place, and 0001 is merged and about to be
+  // applied: this is the last moment a deletion could be caught.
+  //
+  // Read from splitSqlStatements, not from the raw file, so a `CHECK (...)` written inside a
+  // `--` comment cannot satisfy it.
+  it("declares exactly these five CHECK constraints, and no others", () => {
+    // Matched across the whole statement text, not line by line: 0003 already writes long
+    // CHECKs over two lines, and a line-anchored pattern is BLIND to those -- a sixth CHECK
+    // in that style would satisfy "and no others" while never being seen. The inner
+    // alternation allows one level of nested parens, which is every CHECK in 0001 and 0003,
+    // and the whitespace is normalised so a reformat does not read as a deletion.
+    const checks = [
+      ...splitSqlStatements(schemaSql)
+        .join("\n")
+        .matchAll(/\bCHECK\s*\(((?:[^()]|\([^()]*\))*)\)/g),
+    ].map((match) => match[1].replace(/\s+/g, " ").trim());
+
+    expect(checks).toEqual([
+      "price_cents IS NULL OR price_cents >= 0",
+      "price_cents >= 0",
+      "count >= 0",
+      "total_price_cents >= 0",
+      "count > 0 OR total_price_cents = 0",
+    ]);
+  });
+
   it("splits the migration into four CREATE TABLEs and one CREATE INDEX", () => {
     const statements = splitSqlStatements(schemaSql);
     expect(statements).toHaveLength(5);

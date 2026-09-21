@@ -358,6 +358,23 @@ describe("dealRules -- malformed inputs are first-class cases", () => {
     }
   });
 
+  // R15b. ZERO IS A PRICE, NOT A MISSING ONE. PLAN.md:52 prices an explicitly free item at
+  // P = 0, and a free item must still be JUDGED -- it is `isSafeCents`' `>= 0` that keeps it
+  // out of the no-price branch above. That `>= 0` sits a hundred lines from the storage gate
+  // this repo deliberately holds at `> 0` (only POSITIVE reference prices enter the average,
+  // PLAN.md:59), and the two are NOT the same question: one asks "is this a price we can
+  // judge", the other "is this a price other listings may be judged against". Tightening this
+  // one to match the other silently turns every free listing into NEEDS_REVIEW / no-price and
+  // never notifies on the best deal on the board. R15 covers -1 and NaN on purpose; 0 is the
+  // value that must NOT join them.
+  it("R15b: an explicitly free candidate is still judged, and P = 0 clears every discount", () => {
+    expect(decide(candidate({ candidatePriceCents: 0 }), DISCOUNT_20)).toEqual({
+      verdict: "DEAL",
+      status: "COMPLETE",
+      reason: "within-discount",
+    });
+  });
+
   // R16. A claimed task with no `listings` row. Retrying cannot create one, so it is COMPLETE.
   it("R16: a missing listing row is listing-missing and COMPLETE, and never throws", () => {
     expect(decide(undefined, DISCOUNT_20)).toEqual({

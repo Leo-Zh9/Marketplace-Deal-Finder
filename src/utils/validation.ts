@@ -21,8 +21,13 @@ export const validateSearchSettings = (
     errors.location = "Choose a location.";
   }
 
-  if (settings.radiusKm < 0.1 || settings.radiusKm > 49.9) {
-    errors.radius = "Radius must be between 0.1 and 49.9 km.";
+  // The floor is 1, not 0.1, because `worker/storage/marketKey.ts` buckets the radius with
+  // Math.round and THROWS below 1 km -- and it is called once per page, outside every
+  // per-listing guard, so a 0.3 km radius does not skip a listing, it kills the whole scan.
+  // Nothing is lost: marketKey already collapses 0.4 km and 1.4 km to the same market key,
+  // so sub-kilometre precision has never reached anything downstream.
+  if (settings.radiusKm < 1 || settings.radiusKm > 49.9) {
+    errors.radius = "Radius must be between 1 and 49.9 km.";
   }
 
   if (
