@@ -5,9 +5,11 @@ allowlist held as a Worker secret.
 
 Status: **ready for deployed verification.** This runbook was executed end to end against real
 Firebase and real Cloudflare on 2026-09-20; what was observed is recorded in "Deployed
-acceptance checks". The phase is **not** complete — token refresh, a controlled expiry or
-refresh failure, a page refresh while signed in, and `/api/status` reporting `firebase-google`
-on the deployed Worker have not been observed.
+acceptance checks". The phase is **not** complete: six of the seventeen checks there are
+unticked — token refresh, a controlled expiry or refresh failure, a page refresh while signed
+in, `/api/status` reporting `firebase-google` on the deployed Worker, the Worker's own
+security headers on its own responses, and authentication and network errors staying distinct
+from the sample provider states. None of the six has been observed.
 
 No Cloudflare Zero Trust organization, Cloudflare Access policy, service-account
 private key, custom domain, credit card, or paid upgrade is required.
@@ -24,10 +26,15 @@ project and no secrets, using the Worker's `local-development` identity.
 - Allowlist: one address, held as the Worker secret `APPROVED_EMAILS`. It is not in this
   repository and must never be.
 
-**Cloudflare has folded Pages into Workers.** `wrangler pages deploy` no longer produces a
-`*.pages.dev` origin; on this deployment it produced
-`https://<project-name>.<account-subdomain>.workers.dev`. `_headers` is still honoured — gate
-2 read the deployed CSP back off the live site. Nothing else below is changed by this.
+**This deployment is on `*.workers.dev`, and that is not the default.** wrangler 4.x (this
+repo pins `^4.131.0`) redirects `wrangler pages deploy` and `wrangler pages project create`
+into an ordinary Workers deploy when it detects an AI-agent environment and the target Pages
+project does not yet exist. An agent ran these commands, so this project is a Workers assets
+project on `https://<project-name>.<account-subdomain>.workers.dev`. Classic Pages has not
+gone away: the same commands in an ordinary terminal create a Pages project on a
+`*.pages.dev` origin. The warning in step 3 has the mechanism and the opt-out. `_headers` is
+honoured either way — gate 2 read the deployed CSP back off the live site. Nothing else below
+is changed by this.
 
 ---
 
@@ -79,13 +86,16 @@ until this is done.
 
 ### 3. Create or select the Cloudflare Pages project
 
-Pick the project name now (#16). On this deployment the assigned origin was
-`https://<project-name>.<account-subdomain>.workers.dev`; that origin is the value for #10 and
-#13. If your account still serves this project on a `*.pages.dev` origin, use that origin
-everywhere this runbook says the app origin. The values change; the procedure does not.
+Pick the project name now (#16). Whichever origin your first deploy prints is the value for
+#10 and #13. From an ordinary terminal that is `https://<project-name>.pages.dev`. If an agent
+runs the command, it is delegated to Workers instead and the origin is
+`https://<project-name>.<account-subdomain>.workers.dev` — that is what this deployment has;
+see the warning below. Use whichever origin you actually get everywhere this runbook says the
+app origin. The values change; the procedure does not.
 
-The name must not be one an existing Worker already uses — under the Workers platform the two
-collide (see the warning below).
+The name must not be one an existing Worker already uses: a delegated command runs as
+`wrangler deploy --name <project-name>`, so it collides with a Worker of that name (see the
+warning below).
 
 > **Do not connect the Pages project to a Git repository this phase.**
 > `dist/` is gitignored, so a Git-connected build runs on Cloudflare's runners
@@ -105,19 +115,39 @@ collide (see the warning below).
 > for whoever is permitted to add it; spec 2.6.2 explicitly permits documented
 > pre-deploy substitution in the meantime.
 
-> **Never run a `wrangler pages` command from the repository root.** Run from a directory
-> containing `wrangler.jsonc`, `wrangler pages project create <name>` read that config and
-> deployed a **second copy of the API Worker** under the name `<name>`. It did not create a Pages
-> project: `wrangler pages project list` stayed empty while the duplicate Worker was live, and
-> the duplicate had taken the name the app needed, so it had to be deleted first. Nothing in the
+> **A `wrangler pages` command run by an agent is redirected to a Workers deploy.** In
+> wrangler 4.131.0, `maybeDelegatePagesToWorkers()` returns immediately unless `detectAgent()`
+> reports an agent environment — it matches `CLAUDECODE`, `OPENCODE` and the marker variables
+> of other agent CLIs, and only table entries typed `agent` count. When it does report one, and the target Pages project does not
+> already exist, `pages project create` and `pages deploy` both run as `wrangler deploy`
+> instead, and the only thing printed is `Delegating to the latest version of Cloudflare
+> Pages, now part of Cloudflare Workers`. That notice describes a delegation, not a platform
+> change: a human in an ordinary terminal never triggers it and gets classic Pages.
+>
+> **Delegation never looks at your wrangler config**, so no directory layout prevents it. What
+> the directory controls is what the resulting `wrangler deploy` then reads. When
+> `wrangler pages project create <name>` was run here from the repository root, the delegated
+> deploy read `wrangler.jsonc` (`main: worker/index.ts`) and published **a second copy of the
+> API Worker** under the name `<name>`. It created no Pages project:
+> `wrangler pages project list` stayed empty while the duplicate Worker was live, and the
+> duplicate had taken the name the app needed, so it had to be deleted first. Nothing in the
 > command output said any of this.
 >
-> Every `wrangler pages` command in this runbook is therefore run from a throwaway directory
-> containing only `dist/`. The commands are in step 8.
+> Two separate precautions follow, and they do different jobs:
+>
+> - **To opt out of delegation, pass `--force`** — `wrangler pages project create <name>
+>   --force`. wrangler's own notice says you need it once: once the Pages project exists,
+>   later commands are not delegated.
+> - **To keep a delegated deploy from publishing the Worker instead of the site, run every
+>   `wrangler pages` command from a throwaway directory containing only `dist/`**, never from
+>   the repository root. That is what this runbook does, and it is why `project create` here
+>   uploaded `dist/` and printed a live URL. The commands are in step 8.
 
 ### 4. Record the app and Worker origins
 
-- App origin, e.g. `https://marketplace-deal-finder.<account-subdomain>.workers.dev`
+- App origin, e.g. `https://<project-name>.pages.dev` — or
+  `https://<project-name>.<account-subdomain>.workers.dev` from a delegated command (step 3),
+  which is the form this deployment has
 - Worker origin, e.g. `https://marketplace-deal-finder-api.<account-subdomain>.workers.dev`
 
 Both are exact origins: scheme + host (+ port if non-default), no path and no
@@ -143,8 +173,9 @@ only one that cannot strand you:
    before your app origin exists.
 3. **Build the frontend and substitute the CSP** (step 6), using the Worker origin from 1.
    Gate 1.
-4. **Deploy the app** (step 8). It prints the app origin,
-   `https://<project-name>.<account-subdomain>.workers.dev`. That is #10 and #13. Gate 2.
+4. **Deploy the app** (step 8). It prints the app origin — `https://<project-name>.pages.dev`,
+   or `https://<project-name>.<account-subdomain>.workers.dev` if the command was delegated
+   (step 3). That is #10 and #13. Gate 2.
 5. **Now put that app origin into `ALLOWED_ORIGINS`** in `wrangler.jsonc` and run
    `npx wrangler deploy` a second time. Until you do, every browser call from your app is
    answered `403 CORS_ORIGIN_DENIED` — including when `wrangler.jsonc` still holds the
@@ -180,6 +211,11 @@ Then:
 npx wrangler login
 npx wrangler deploy
 ```
+
+Then set the allowlist secret (#11) with `npx wrangler secret put APPROVED_EMAILS`. This step
+is **required**: until that secret holds a non-empty JSON array of addresses, the Worker
+answers `503 AUTH_CONFIG_MISSING` to every `/api/*` request. Read the warning below before you
+run it.
 
 > **`wrangler secret put` silently uploads an empty secret when stdin is not a terminal.** Run
 > from a script, a CI step or an agent shell, `npx wrangler secret put APPROVED_EMAILS` read an
@@ -280,13 +316,20 @@ sed -i '' \
   dist/_headers
 ```
 
-**Gate 1 — before deploying.** This must print `0`:
+**Gate 1 — before deploying.** Both of these must print `0`:
 
 ```sh
 grep -c "REPLACE_WITH" dist/_headers
+grep -c '[<>]' dist/_headers
 ```
 
-Do not deploy while it prints anything else.
+Do not deploy while either prints anything else.
+
+The second line catches the other way this goes wrong: an example pasted from above with its
+own placeholder still in it — `<account-subdomain>`, or `<projectId>`. The `REPLACE_WITH`
+check does not catch those and neither does gate 2: a CSP carrying a literal `<…>` blocks
+every API call exactly as a leftover `REPLACE_WITH` would. The committed `public/_headers` contains no angle bracket, so a
+correctly substituted `dist/_headers` prints `0`.
 
 ### 7. Authorize the app hostname in Firebase
 
@@ -332,24 +375,37 @@ Three things about this block are load-bearing:
 - **The wrangler binary is invoked by path.** `npx wrangler` outside the repository would fetch
   a different wrangler instead of the pinned one.
 - **`--production-branch master` on `project create`.** Without it the command prompts for a
-  branch and will hang or fail in a non-interactive shell. On this deployment
-  `project create` uploaded `dist/` itself and printed the live URL; the `pages deploy` line
+  branch and will hang or fail in a non-interactive shell. On this deployment `project create`
+  was delegated to a Workers deploy (step 3), so it uploaded `dist/` itself and printed the
+  live URL — that is delegation's behaviour, not `project create`'s. The `pages deploy` line
   above is how you publish each later build. `project create` is not a deploy command — do not
   use it as one.
 
-Record the app origin it prints: that is #10 and #13. Now complete step 4's order note —
-put that origin into `ALLOWED_ORIGINS` and run `npx wrangler deploy` again, then re-run step
-5's `curl` check in **form B**.
-
-**Gate 2 — after deploying.** The served policy must contain no placeholder:
+**Gate 2 — after deploying.** The served policy must be present and must contain no
+placeholder:
 
 ```sh
 curl -sI https://<app-origin>/ | grep -i content-security-policy
 ```
 
-The output must contain no `REPLACE_WITH`. This gate catches the mistake from
+It must print exactly one line, and that line must contain no `REPLACE_WITH`. **Empty output
+is a failure, not a pass.** It means the site served no `Content-Security-Policy` header at
+all — `_headers` was not honoured on this deploy path and you have shipped a site with no
+policy. `grep` prints nothing and exits non-zero in that case, which reads exactly like a
+clean result. As one command:
+
+```sh
+csp="$(curl -sI https://<app-origin>/ | grep -i content-security-policy)"
+[ -n "$csp" ] && ! printf '%s' "$csp" | grep -q "REPLACE_WITH" && echo "gate 2 OK"
+```
+
+This gate catches the mistake from
 outside, on any deploy path, including a Git-connected project that skipped
 gate 1.
+
+Record the app origin the deploy printed: that is #10 and #13. Now complete step 4's order
+note — put that origin into `ALLOWED_ORIGINS` and run `npx wrangler deploy` again, then
+re-run step 5's `curl` check in **form B**.
 
 ### 9. Run the acceptance checklist
 
