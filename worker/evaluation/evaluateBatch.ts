@@ -28,12 +28,15 @@ import type { D1Usage } from "../storage/types";
 /**
  * THE FOUR CLAIM TIERS. DO NOT SIMPLIFY into a single statement with a CASE in the ORDER BY.
  *
- * That form was built and measured. It works, and it costs rows_read ~ 2 * |eligible| because
+ * That form was built and measured. It works, and its cost GROWS WITH THE ELIGIBLE SET because
  * an ORDER BY cannot ride a MULTI-INDEX OR: EXPLAIN reports USE TEMP B-TREE FOR ORDER BY, so
  * the ENTIRE eligible set is materialised and sorted to pick 15. Immediately after a revision
  * bump -- the spec's required mechanism and this design's own recovery path -- every task is
- * eligible, and draining a 20,000-task backlog costs ~53,000,000 rows read. The tiered form
- * costs ~132,000 (measured: 99 rows per claim, flat at 200 / 5,000 / 20,000 eligible).
+ * eligible, so that is the whole table, every call, until the backlog drains.
+ *
+ * Measured on this repository (test C2) at 200 eligible: the single-statement form reads 521 rows
+ * for one call against the tiered form's 141, and the gap widens with the eligible set. The tiered
+ * form is FLAT: 141 rows at 200, 5,000 and 20,000 eligible alike.
  *
  * The tiers are STATUS-DISJOINT, so the split costs nothing in correctness: no row is claimable
  * by two tiers and no eligible row is unreachable (verified exhaustively over all 48
@@ -58,17 +61,28 @@ RETURNING listing_id`;
 /**
  * Tier 4 -- evaluated under a different revision. ?5 current searchRevision. RUNS THIRD.
  *
- * Three range terms, NOT `evaluated_revision IS NOT ?5`. They select a provably identical set
- * (verified by set equality), but `IS NOT` is not indexable: measured 8,042 rows read versus 43.
+ * Three range terms, NOT `evaluated_revision IS NOT ?5`, and `source=?1` REPEATED INSIDE EVERY OR
+ * TERM. Both look like noise and both are load-bearing. All three forms select a provably
+ * identical set (verified by set equality); only these three ranges can SEEK to it.
+ *
+ * WHERE THE DIFFERENCE HIDES, which is the part worth knowing: when every task is eligible the
+ * three forms are indistinguishable -- the first 15 index entries touched all match, so all three
+ * read 90 rows. The cost only appears when the eligible rows sit BEHIND a block of ineligible ones
+ * in index order. Measured on test C2b's fixture (15 eligible rows at a higher revision behind
+ * 20,000 at the current one), select-only rows read for a 15-row claim:
+ *
+ *   these three ranges          MULTI-INDEX OR over three covering ranges         16
+ *   evaluated_revision IS NOT ?5  SEARCH ... (source=? AND status=?)           20,015
+ *   source factored out of the OR  SEARCH ... (source=?)                       20,015
+ *
+ * Note what the factored form actually degrades to: still a COVERING INDEX on
+ * evaluation_tasks_revision, but seeking on `source` alone and then walking. It is not a fallback
+ * to the primary-key autoindex, and EXPLAIN says so.
+ *
  * `IS NULL` is a separate term because `NULL < ?` and `NULL > ?` are NULL, not true -- and the
  * IS NULL rows are exactly the tasks a database that already ran 3C holds.
  * `>` is not redundant with `<`: revisions are monotone in normal operation, but a restore from
  * backup lowers the current revision and `>` is what re-opens those tasks.
- *
- * `source=?1` IS REPEATED INSIDE EVERY OR TERM AND MUST STAY THERE. Factored out as
- * `WHERE source=?1 AND (... OR ... OR ...)`, SQLite abandons the MULTI-INDEX OR and falls back
- * to the primary-key autoindex: 8,041 rows read for a 15-row claim, versus 43 (measured on two
- * independently built fixtures; without the 3D index the same query reads 48,146).
  *
  * No ORDER BY: there is no fairness ordering among "re-check under new settings", and adding one
  * reintroduces the TEMP B-TREE. Tests assert count and set membership, never order.

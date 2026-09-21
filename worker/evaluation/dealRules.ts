@@ -17,8 +17,9 @@
  * spare. It is that NOTHING IN THE SCHEMA BOUNDS THE INPUTS: `listings`' only price CHECK is
  * `price_cents IS NULL OR price_cents >= 0` and `model_stats`' only count CHECK is
  * `count >= 0`. "It fits in a double" would be an assumption about data, not a property of
- * the system. Measured cost of not needing it: 0.0008 ms versus 0.0003 ms p95 over 15 rows,
- * against an 8 ms budget.
+ * the system. Measured on this repository over 30,000 batches after a warm-up: BigInt and
+ * Number are BOTH 0.00004 ms p95 per 15-row batch -- indistinguishable at timer resolution,
+ * against an 8 ms budget. The safety is free.
  */
 
 import {
@@ -148,12 +149,30 @@ export const decide = (
   if (settings.mode !== "MAXIMUM_PRICE") {
     const count = reference.referenceCount;
     const total = reference.referenceTotalCents;
+
+    // A malformed aggregate gets its OWN reason. It is not "insufficient evidence": more
+    // observations cure thin evidence, and nothing cures a corrupt total on its own. Both park
+    // the task at NEEDS_REVIEW so it self-heals if the aggregate is ever repaired -- a
+    // model_stats change never requeues a listing, so tier 3 is the only way back -- but a model
+    // parked on a corrupt total would otherwise rotate forever with no signal at all.
+    if (total !== null && !Number.isSafeInteger(total)) {
+      return {
+        verdict: "NEEDS_REVIEW",
+        status: "NEEDS_REVIEW",
+        reason: "invalid-reference-total",
+      };
+    }
+
+    // `total < 0` mirrors the `count < MINIMUM_REFERENCE_COUNT` term. Both are only reachable if
+    // the 3C ledger has drifted, and neither can produce a false DEAL -- but without this term a
+    // negative total yields NOT_DEAL / COMPLETE, which permanently marks a listing "not a deal"
+    // on the strength of corrupt data and never re-examines it. Parking it is the honest answer.
     if (
       count === null ||
       total === null ||
       !Number.isSafeInteger(count) ||
-      !Number.isSafeInteger(total) ||
-      count < MINIMUM_REFERENCE_COUNT
+      count < MINIMUM_REFERENCE_COUNT ||
+      total < 0
     ) {
       return { verdict: "NEEDS_REVIEW", status: "NEEDS_REVIEW", reason: "insufficient-evidence" };
     }

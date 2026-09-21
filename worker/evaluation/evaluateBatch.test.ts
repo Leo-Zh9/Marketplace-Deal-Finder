@@ -950,6 +950,55 @@ describe("evaluateBatch -- retries cannot duplicate results", () => {
     expect(await taskRow("raced")).toMatchObject({ verdict: "NOT_DEAL" });
   });
 
+  // E15c. THE `discarded` PATH, DRIVEN FROM A REAL evaluateBatch CALL.
+  //
+  // `discarded` exists so a caller cannot act on a rejected verdict by forgetting to filter, and
+  // nothing else in this file ever sees it non-empty -- which means the split could be deleted and
+  // the suite would stay green while Phase 4 notified on verdicts computed from state that no
+  // longer holds.
+  //
+  // It does not take two claimants. It takes THE ROW CHANGING UNDER ONE CALL, in the production
+  // window between the candidate read and the completion batch. The database below delegates every
+  // statement to the real one and interposes exactly one recordSightings requeue at that point --
+  // the same stub shape evaluationCpu.test.ts uses, and the requeue is real 3C code, not a
+  // hand-written UPDATE.
+  it("E15c: a verdict the fence rejects lands in `discarded`, never in `outcomes`", async () => {
+    await sight(
+      [0, 1, 2].map((index) => valid({ listingId: `gap-${index}`, priceCents: 20_000 + index * 100 })),
+      T0,
+    );
+
+    let interposed = false;
+    const racing = {
+      prepare: (sql: string) => db.prepare(sql),
+      batch: async (statements: D1PreparedStatement[]) => {
+        if (!interposed) {
+          interposed = true;
+          // gap-1's price changes after its verdict was computed: QUEUE_TASK resets the task to
+          // PENDING, so the completion's `status='PROCESSING'` fence rejects it.
+          await sight([valid({ listingId: "gap-1", priceCents: 90_000 })], T0);
+        }
+        return db.batch(statements);
+      },
+    } as unknown as D1Database;
+
+    const report = await evaluateBatch(racing, {
+      source: SOURCE,
+      settings: maximum(30_000, 1),
+      now: T0,
+      leaseToken: "token-e15c",
+    });
+
+    expect(report.claimed).toBe(3);
+    expect(report.outcomes.map((outcome) => outcome.listingId).sort()).toEqual(["gap-0", "gap-2"]);
+    expect(report.discarded).toEqual([
+      { source: SOURCE, listingId: "gap-1", verdict: "DEAL", reason: "within-maximum" },
+    ]);
+    // And the rejected verdict was NOT committed: the row is back at PENDING with no verdict on
+    // it, waiting to be re-evaluated at its new price.
+    expect(await taskRow("gap-1")).toMatchObject({ status: "PENDING", verdict: null });
+  });
+
   // E16. Replaying a completion is a no-op. The statement is built by the PRODUCTION builder, so
   // a mutation applied to COMPLETE_TASK is carried into the test rather than hand-copied around.
   it("E16: re-issuing a completion that already applied changes nothing", async () => {

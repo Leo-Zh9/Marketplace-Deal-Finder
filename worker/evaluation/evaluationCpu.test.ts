@@ -205,6 +205,50 @@ describe("evaluation CPU -- rows read per call", () => {
     expect(report.claimed).toBe(15);
     console.log(`C1 steady state: whole-call rowsRead=${report.usage.rowsRead} over 20,000 tasks`);
     expect(report.usage.rowsRead).toBeLessThan(ROWS_READ_CEILING);
+    // EXACT, not just under the ceiling, and this is the only place the whole call is pinned to a
+    // number. Every ceiling in this file is only as honest as the accounting behind it: drop one
+    // `usage.rowsRead +=` and every ceiling still passes while measuring less than it claims.
+    // 165 = 90 (tier 1 claim) + 60 (candidate read) + 15 (completion batch). Dropping the
+    // completion loop's accounting measures 150 -- which is exactly the figure the plan carried
+    // for this scenario, and exactly what it would omit.
+    expect(report.usage.rowsRead).toBe(165);
+  });
+
+  /**
+   * C1b. TIERS 1 AND 2 AT SCALE -- the hot path, and the shape a first full scan actually has:
+   * every listing queued PENDING by one scan, so they all share ONE `created_at`.
+   *
+   * C1 above cannot see this. Its eligible set is 15 PENDING among 19,985 ineligible rows, so the
+   * sort a narrower index would force is a sort over 15 rows and costs nothing. Here the tie group
+   * IS the corpus, which is why `listing_id` is the fourth column of evaluation_tasks_queue.
+   *
+   * Measured: 90 rows for the four-tier claim (15 for the select, COVERING INDEX, no TEMP B-TREE).
+   * With `created_at, listing_id` dropped from the index the same claim reads 40,075 and EXPLAIN
+   * reports USE TEMP B-TREE FOR ORDER BY -- draining a 20,000-task backlog at 15 a call would cost
+   * ~53M rows instead of ~120K.
+   */
+  it("C1b: claims 15 of 20,000 PENDING sharing one created_at", async () => {
+    await bulkTasks({
+      prefix: "pend-",
+      count: 20_000,
+      status: "PENDING",
+      createdAt: T0,
+      evaluatedRevision: null,
+      evaluatedAt: null,
+    });
+
+    const claim = await claimEvaluationTasks(db, {
+      source: SOURCE,
+      batchSize: 15,
+      now: T0 + 1000,
+      leaseSeconds: 300,
+      leaseToken: "token-c1b",
+      searchRevision: CURRENT_REVISION,
+    });
+
+    expect(claim.tasks).toHaveLength(15);
+    console.log(`C1b tier-1 claim over 20,000 PENDING: rowsRead=${claim.usage.rowsRead}`);
+    expect(claim.usage.rowsRead).toBeLessThanOrEqual(150);
   });
 
   // C2. POST-BUMP, AND THE ONE TEST THAT CANNOT BE FAKED. Every task is eligible, which is the

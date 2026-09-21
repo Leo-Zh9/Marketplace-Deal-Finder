@@ -60,12 +60,13 @@ Measured on this repository at batch size 15, printed on every test run:
 
 | | value |
 |---|---|
-| p50 | 0.0065 ms |
-| p95 | **0.0091 ms** |
-| p99 | 0.0107 ms |
-| max | 1.63 ms |
+| p50 | 0.0074 ms |
+| p95 | **0.0134 ms** |
+| p99 | 0.0175 ms |
+| max | 1.83 ms |
 
-That is roughly **880× under the 8 ms budget**. Batch size stays at `EVALUATION_BATCH_SIZE = 15`;
+That is roughly **600× under the 8 ms budget**. The figures move by a few microseconds run to run;
+the test prints them and asserts only `p95 < 8`. Batch size stays at `EVALUATION_BATCH_SIZE = 15`;
 no degradation to 10 / 5 / 1 was needed.
 
 **Honest limitation.** The stub does not pay the real D1 binding's `prepare`/`bind` cost or the
@@ -77,12 +78,22 @@ this headroom the conclusion survives them.
 CPU is only half of it: the claim must not read a number of rows that grows with the corpus. Every
 figure below is measured by a test in `evaluationCpu.test.ts`, not asserted from a plan.
 
-| scenario | rows read (whole call) |
+| scenario | rows read |
 |---|---|
-| C1 — steady state: 15 `PENDING` inside 20,000 tasks | 165 |
-| C2 — post-bump: 200 / 5,000 / 20,000 tasks all eligible | 141 / 141 / 141 |
-| C2b — 15 stale tasks behind 20,000 settled ones | 142 |
+| C1 — whole call, steady state: 15 `PENDING` inside 20,000 tasks | 165 |
+| C1b — claim only, 20,000 `PENDING` sharing one `created_at` | 90 |
+| C2 — whole call, post-bump: 200 / 5,000 / 20,000 tasks all eligible | 141 / 141 / 141 |
+| C2b — whole call, 15 stale tasks behind 20,000 settled ones | 142 |
 | C3 — claim only, 20,000 `NEEDS_REVIEW` sharing one `evaluated_at` | 101 |
+
+C1's 165 decomposes as 90 (tier 1 claim) + 60 (candidate read) + 15 (completion batch), and C1
+asserts it exactly rather than only under a ceiling: every other figure here is a ceiling, and a
+ceiling is only as honest as the `usage` accounting behind it.
+
+Each claim-only figure is **identical at 200, 5,000 and 20,000 rows** — that flatness, not the
+constant, is the property. The constants are this miniflare build's accounting, which charges an
+`UPDATE … RETURNING` for the index maintenance of its own write (90 rows for a 15-row claim whose
+select reads 15).
 
 The post-bump figure is flat at 100× the eligible-set size. That is the property the design is
 built around, because a revision bump is the documented recovery path for a bad verdict and it
@@ -104,8 +115,17 @@ both read 90 rows, because the first 15 index entries touched all match. Put the
 
 **`source` factored out of tier 4's `OR` group.** Written as `WHERE source=?1 AND (… OR … OR …)`,
 SQLite abandons the `MULTI-INDEX OR` — `EXPLAIN` degrades from three covering ranges to
-`SEARCH … (source=?)`. Same fixture: **20,015 rows against 16**. `source=?1` is repeated inside
-every `OR` term for this reason and must stay there.
+`SEARCH … USING COVERING INDEX evaluation_tasks_revision (source=?)`, still covering but seeking on
+`source` alone and then walking. Same fixture: **20,015 rows against 16**. `source=?1` is repeated
+inside every `OR` term for this reason and must stay there.
+
+**A narrower `evaluation_tasks_queue`.** Dropping `created_at, listing_id` — or the whole index —
+is invisible in the steady state, because 15 `PENDING` rows sort for free, and invisible to a
+missing-index check, because `evaluation_tasks_attempt` and `evaluation_tasks_revision` both begin
+`(source, status)` and serve the seek. It shows up on the shape a first full scan actually has:
+20,000 tasks queued by one scan, all sharing one `created_at`. Then the tie group is the corpus —
+**40,075 rows against 90**, with `EXPLAIN` reporting `USE TEMP B-TREE FOR ORDER BY`. That is C1b,
+and it is why `listing_id` is the fourth column of the index.
 
 ## The parts most likely to be "simplified" back into a defect
 
@@ -135,6 +155,16 @@ Every other outcome, *including the verdict* `NEEDS_REVIEW`, is `COMPLETE`, beca
 change can move it and every input change already re-opens the task: a listing change through
 `recordSightings`' `QUEUE_TASK`, a settings change through tier 4.
 
+Two reasons park a task at `NEEDS_REVIEW` rather than completing it, and they are deliberately
+distinct. `insufficient-evidence` means the market is young and more observations will cure it.
+`invalid-reference-total` means the aggregate itself is malformed — a `total_price_cents` that is
+not a safe integer, which `model_stats`' INTEGER *affinity* permits — and nothing cures that on its
+own. Both rotate in tier 3, so both self-heal if the aggregate is ever repaired (a `model_stats`
+change never requeues a listing, so tier 3 is the only way back), but only the second one tells you
+a model is stuck rather than merely waiting. A negative `reference_total_cents` parks the same way
+rather than producing `NOT_DEAL`: it cannot yield a false `DEAL`, but ruling on it would mark a
+listing "not a deal" forever on the strength of a drifted aggregate.
+
 A `validity='NEEDS_REVIEW'` or `invalid-reference` task re-opens when **3B re-classifies the listing
 on a later sighting** — that works only because `validity` is inside `contentHash`. A direct
 database edit of `listings.validity` does **not** re-open it: the stored `content_hash` is
@@ -151,6 +181,12 @@ destructive write, no lost verdict history and no re-notification of anything Ph
 recorded.
 
 `verdict` and `evaluated_at` are on the row, so "what did we decide, and when" is one query.
+
+A verdict the fence rejects is never committed and never reported as an outcome: `evaluateBatch`
+returns `outcomes` and `discarded` as **separate arrays**, so a caller cannot act on a rejected
+verdict by forgetting to filter. `discarded` is populated whenever the task changed between the
+candidate read and the completion — a price change requeueing the row mid-call is the ordinary
+cause — and test E15c drives exactly that window.
 
 **The honest caveat.** A recompute is faithful only against the aggregate as it stands. `model_stats`
 is a running aggregate over a 7-day window, so a recompute a week later gives a *different* answer,

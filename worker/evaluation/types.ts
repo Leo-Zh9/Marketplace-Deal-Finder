@@ -20,6 +20,14 @@ export type EvaluationReason =
   | "above-discount-threshold"
   | "above-maximum-price"
   | "insufficient-evidence"
+  /**
+   * The aggregate itself is malformed: a `total_price_cents` that is not a safe integer. Its own
+   * reason, not `insufficient-evidence`, because the two need different responses -- more
+   * observations fix thin evidence, and nothing fixes a corrupt total on its own. Every candidate
+   * in that model parks at NEEDS_REVIEW and rotates in tier 3 until the aggregate is repaired, so
+   * this reason is the only signal that a model is stuck rather than merely young.
+   */
+  | "invalid-reference-total"
   | "no-price"
   | "validity-needs-review"
   | "invalid-reference"

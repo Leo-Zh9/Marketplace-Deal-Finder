@@ -150,6 +150,47 @@ describe("dealRules -- the evidence gate", () => {
   });
 });
 
+describe("dealRules -- a malformed aggregate is not thin evidence", () => {
+  // R22. `total_price_cents` is INTEGER *affinity*, so a non-integer can be stored the same way a
+  // non-integer price can. Every candidate in that model then parks at NEEDS_REVIEW and rotates in
+  // tier 3 until the aggregate is repaired -- correct, but it must be DIAGNOSABLE. Reported as
+  // `insufficient-evidence` it is indistinguishable from a young market that is merely waiting.
+  it("R22: reports a non-integer reference total under its own reason", () => {
+    expect(
+      decide(
+        candidate({
+          referenceCount: 5,
+          referenceTotalCents: 1_801_999.5,
+          candidatePriceCents: 1,
+        }),
+        DISCOUNT_20,
+      ),
+    ).toEqual({
+      verdict: "NEEDS_REVIEW",
+      status: "NEEDS_REVIEW",
+      reason: "invalid-reference-total",
+    });
+  });
+
+  // R23. The mirror of R12. A negative total cannot produce a false DEAL -- the right-hand side
+  // goes negative while the left stays non-negative -- but WITHOUT this term it produces
+  // NOT_DEAL / COMPLETE, which marks a listing "not a deal" forever on the strength of a drifted
+  // aggregate and never re-examines it. R12 already refuses to trust a negative count; a negative
+  // total is the same corruption in the other column.
+  it("R23: parks a negative reference total instead of ruling on it", () => {
+    expect(
+      decide(
+        candidate({ referenceCount: 5, referenceTotalCents: -1000, candidatePriceCents: 1 }),
+        DISCOUNT_20,
+      ),
+    ).toEqual({
+      verdict: "NEEDS_REVIEW",
+      status: "NEEDS_REVIEW",
+      reason: "insufficient-evidence",
+    });
+  });
+});
+
 describe("dealRules -- the maximum-price leg", () => {
   // R7. Maximum-price mode must work with NO market history at all.
   it("R7: decides in maximum-price mode with no aggregate whatsoever", () => {
