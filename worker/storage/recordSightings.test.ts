@@ -548,9 +548,18 @@ describe("the count CHECK", () => {
 // ---------------------------------------------------------------------------
 describe("an explicitly free listing", () => {
   it("is stored and queued for evaluation but never enters the benchmark", async () => {
-    // BOTH listings sit in the SAME group on purpose. An assertion that the aggregate agrees
-    // with the observations is satisfied by BOTH SIDES BEING EMPTY, so the priced listing is
-    // the named survivor: the aggregate has to be exactly its row, at exactly its price.
+    // ALL THREE listings sit in the SAME group on purpose. An assertion that the aggregate
+    // agrees with the observations is satisfied by BOTH SIDES BEING EMPTY, so the priced
+    // listings are the named survivors: the aggregate has to be exactly their row, at exactly
+    // their total.
+    //
+    // `penny` AT 1 CENT IS THE BOUNDARY, and it is the whole reason this test is three
+    // listings rather than two. The gate is `> 0`; with only a 0 and a 30,000 in the fixture,
+    // `> 0`, `> 1` and `>= 100` are indistinguishable to the entire suite, so the exact
+    // boundary of the one production line this PR changes would be pinned by nothing. 1 cent
+    // is a real reference price -- excluding it would shrink reference_count and push groups
+    // under MINIMUM_REFERENCE_COUNT into insufficient-evidence, which is this PR's own
+    // rationale pointed the wrong way. ONLY zero is excluded.
     const report = await sight(
       [
         valid({
@@ -565,6 +574,12 @@ describe("an explicitly free listing", () => {
           priceCents: 0,
           title: "rx 7900 xtx, dead fan, free to a good home",
         }),
+        valid({
+          listingId: "penny",
+          modelKey: "RX_7900_XTX",
+          priceCents: 1,
+          title: "rx 7900 xtx, no fans, spares or repair",
+        }),
       ],
       T0,
     );
@@ -573,33 +588,40 @@ describe("an explicitly free listing", () => {
     // assertions are sequential, so whichever comes first is the one a mutation actually dies
     // on. Reverting the gate to `>= 0` must be caught by the ARITHMETIC, not by a string.
     //
-    // (1, 30_000), not (2, 30_000). The average the benchmark derives is 30_000, not 15_000 --
-    // a 50% drop manufactured out of a listing that was never a price reference.
+    // (2, 30_001), not (3, 30_001). The free listing is out and the 1c listing is IN: the
+    // count drops by exactly one against three sighted listings, and the total carries the
+    // penny. Loosen the gate to `>= 0` and this reads (3, 30_001); tighten it to `> 1` and it
+    // reads (1, 30_000). Either way the arithmetic here is what dies, not a label.
     expect(await allStats()).toEqual([
       {
         market_key: "43.4643,-80.5204|25km",
         model_key: "RX_7900_XTX",
         variant_key: "",
-        count: 1,
-        total_price_cents: 30_000,
+        count: 2,
+        total_price_cents: 30_001,
       },
     ]);
-    expect((await allObservations()).map((row) => row.listing_id)).toEqual(["paid"]);
+    expect((await allObservations()).map((row) => row.listing_id)).toEqual(["paid", "penny"]);
 
     expect(report.results).toEqual([
       { listingId: "paid", outcome: "NEW", contribution: "recorded" },
       { listingId: "free", outcome: "NEW", contribution: "skipped-no-price" },
+      { listingId: "penny", outcome: "NEW", contribution: "recorded" },
     ]);
 
     // STORED and EVALUATED. Only the contribution changes -- a free listing stays visible.
-    expect((await allListings()).map((row) => row.listing_id)).toEqual(["free", "paid"]);
+    expect((await allListings()).map((row) => row.listing_id)).toEqual([
+      "free",
+      "paid",
+      "penny",
+    ]);
     expect((await allListings())[0]).toMatchObject({
       listing_id: "free",
       price_cents: 0,
       validity: "VALID",
       model_key: "RX_7900_XTX",
     });
-    expect((await allTasks()).map((row) => row.listing_id)).toEqual(["free", "paid"]);
+    expect((await allTasks()).map((row) => row.listing_id)).toEqual(["free", "paid", "penny"]);
 
     expect(await p1Violations()).toEqual([]);
     expect(await p2Violations(T0)).toEqual([]);
