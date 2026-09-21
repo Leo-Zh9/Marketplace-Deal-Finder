@@ -11,6 +11,19 @@
       "database_id": "ac9a3013-7229-41e7-ae51-db1974193f88"
     }
   ],
+  // Cloudflare Cron scheduling is UTC: there is no timezone field and no DST. The spec asks
+  // for local noon, which no fixed expression satisfies year-round. 17:00 UTC is pinned to
+  // EST (UTC-5), so it fires at 12:00 local in winter and 13:00 local in summer.
+  // THE OPERATOR'S TIMEZONE IS AN INFERENCE, NOT A FACT -- America/Toronto, inferred from
+  // the product's example search location. See docs/phase-3e-scheduling.md.
+  "triggers": { "crons": ["0 17 * * *"] },
+  "workflows": [
+    {
+      "binding": "CLEANUP_WORKFLOW",
+      "name": "marketplace-deal-finder-cleanup",
+      "class_name": "CleanupWorkflow"
+    }
+  ],
   // APPROVED_EMAILS is a Worker secret and must never appear here.
   // These are the live deployment's values. Deploying your own copy? Replace both —
   // see docs/phase-2-deployment-setup.md.

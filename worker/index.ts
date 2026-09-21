@@ -4,8 +4,22 @@ import {
   type AuthDependencies,
   type WorkerEnvironment,
 } from "./auth/verifyFirebaseToken";
+import { handleScheduled, type ScheduledEnvironment } from "./scheduling/scheduled";
 
+/**
+ * NOT WIDENED to include DB or CLEANUP_WORKFLOW. `Environment` is the request path's
+ * environment, and `worker/index.test.ts` builds literals of it. The scheduled path names
+ * its own `ScheduledEnvironment`; the runtime hands both the same object.
+ */
 export type Environment = WorkerEnvironment;
+
+/**
+ * wrangler binds a Workflow to a class exported FROM THE MAIN ENTRY, so this re-export is
+ * not tidiness -- without it `wrangler deploy` fails, and with the wrong name it deploys a
+ * Cron that fires daily and does nothing. scheduled.test.ts S3 asserts config and entry
+ * agree.
+ */
+export { CleanupWorkflow } from "./scheduling/cleanupWorkflow";
 
 // Content-Type is added by `json` only: a 204 preflight carries no body.
 const securityHeaders = {
@@ -177,4 +191,12 @@ export const handleRequest = async (
 export default {
   fetch: (request: Request, environment: Environment) =>
     handleRequest(request, environment),
+  // The Cron entry point. The return value is discarded by the runtime, so it is dropped
+  // here rather than pretended to matter; `handleScheduled` returns it for the tests.
+  scheduled: async (
+    controller: ScheduledController,
+    environment: ScheduledEnvironment,
+  ): Promise<void> => {
+    await handleScheduled(controller, environment);
+  },
 };
