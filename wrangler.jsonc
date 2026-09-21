@@ -4,6 +4,13 @@
   "main": "worker/index.ts",
   "compatibility_date": "2026-09-11",
   "compatibility_flags": ["nodejs_compat"],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "marketplace-deal-finder-db",
+      "database_id": "ac9a3013-7229-41e7-ae51-db1974193f88"
+    }
+  ],
   // APPROVED_EMAILS is a Worker secret and must never appear here.
   // These are the live deployment's values. Deploying your own copy? Replace both —
   // see docs/phase-2-deployment-setup.md.
