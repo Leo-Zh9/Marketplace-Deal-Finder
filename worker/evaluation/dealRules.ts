@@ -14,10 +14,22 @@
  * that free.
  *
  * BigInt rather than Number is not about the plausible magnitudes -- those fit with 300x to
- * spare. It is that NOTHING IN THE SCHEMA BOUNDS THE INPUTS: `listings`' only price CHECK is
- * `price_cents IS NULL OR price_cents >= 0` and `model_stats`' only count CHECK is
- * `count >= 0`. "It fits in a double" would be an assumption about data, not a property of
- * the system.
+ * spare: a $10,000 part against 3,000 comparables gives P*C*10000 = 3e13, against a safe-integer
+ * ceiling of 9.007e15.
+ *
+ * IT IS THAT THE PRODUCTS DO NOT FIT EVEN WHEN EVERY FACTOR DOES. `decide`'s corrupt-aggregate
+ * gate bounds P, C and T to safe integers, so each is at most Number.MAX_SAFE_INTEGER
+ * (2^53 - 1 = 9,007,199,254,740,991) -- and then this comparison MULTIPLIES. The right-hand side
+ * alone, T * (10000 - bp), reaches 9.007e19 at the top of that range: the literal 10000 costs
+ * four orders of magnitude, putting the product 10,000x past the last integer a double
+ * represents exactly. The left-hand side multiplies two safe integers AND that same 10000, so it
+ * is far worse. Past 2^53 a double rounds silently, and this comparison is decided by `<=` AT
+ * EQUALITY -- precisely where a silent rounding flips the verdict.
+ *
+ * An earlier version of this comment justified BigInt by saying nothing in the schema bounds the
+ * inputs. That was true before the gate and the gate is now exactly that bound, so do not read
+ * the old sentence anywhere, find it false, and conclude the BigInt is unnecessary: the bound it
+ * gives you is on the FACTORS, and the overflow is in the PRODUCT.
  *
  * ON WHAT IT COSTS, and why there is DELIBERATELY NO NUMBER HERE. Three microbenchmarks written
  * while building 3D produced three different answers, in two directions. A timer around each
