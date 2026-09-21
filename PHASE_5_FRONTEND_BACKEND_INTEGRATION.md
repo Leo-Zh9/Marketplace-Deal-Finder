@@ -297,7 +297,11 @@ Show stale/error status.
 
 ### Authentication Expired
 
-Allow Cloudflare Access to reauthenticate instead of treating the event as a Facebook/backend failure.
+A 401 (`AUTH_TOKEN_MISSING` or `AUTH_TOKEN_INVALID`) is an identity event, not a Facebook/backend failure. **For the GET reads**, reuse the Phase 2 path: retry once with a force-refreshed Firebase ID token, and if that also fails, return the user to Google sign-in.
+
+That path is GET-only — Phase 2's client issues no other method. **Mutation retry policy remains deferred** (`PHASE_2_LOGIN_PRIVATE_ACCESS.md`, subtask 2.4, item 4: "Defer mutation retry policy until business APIs exist"). This phase is where those APIs arrive, so decide it when `PUT /api/settings`, `POST /api/monitoring/start`, `POST /api/monitoring/stop` and `POST /api/preview` are built. Do not assume the GET retry generalises to them.
+
+A 403 `AUTH_FORBIDDEN` means the signed-in Google account is not approved — for example, it was removed from the allowlist. Show access denied with sign-out/change-account, again not a provider failure.
 
 ---
 
@@ -344,7 +348,9 @@ The frontend should not infer service status from missing data.
 
 ## Authentication Integration
 
-All `/api/*` routes must remain protected by Cloudflare Access or identity validation established in Phase 2.
+Every `/api/*` route must reuse the identity path established in Phase 2: the Worker authenticates the request before dispatching any handler, except a valid CORS preflight. Do not introduce a second scheme.
+
+That means each request carries a Firebase ID token as `Authorization: Bearer <token>`, which the Worker verifies against Google's X.509 certificates and then checks against the `APPROVED_EMAILS` allowlist secret. Because the app and the Worker are separate origins, every new route also depends on the Worker's exact-origin `ALLOWED_ORIGINS` check; an unapproved origin is refused with 403 `CORS_ORIGIN_DENIED`.
 
 Test direct API calls without authentication.
 
@@ -461,7 +467,7 @@ Do not rely only on theoretical design estimates.
 
 Before declaring the project complete:
 
-- Cloudflare Access enabled;
+- Firebase Google sign-in enabled, the Worker's `FIREBASE_PROJECT_ID` var set to that same project, the `APPROVED_EMAILS` allowlist secret set, and the production app origin listed both in Firebase Authorized domains and in the Worker's `ALLOWED_ORIGINS`;
 - Worker secrets configured;
 - D1 production database migrated;
 - 30-minute monitoring Cron configured;

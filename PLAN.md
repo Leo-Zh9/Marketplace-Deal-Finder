@@ -126,12 +126,14 @@ Cloudflare currently documents 10 ms compute per Workflow step on Workers Free, 
                             User
                               |
                               v
-                     Cloudflare Access
-                    Private authentication
-                              |
-                              v
                      Cloudflare Pages
                   React + TypeScript + Vite
+                       Public app shell
+                              |
+                              v
+                   Firebase Authentication
+                 Google sign-in in the browser
+                       Firebase ID token
                               |
                               v
                      Cloudflare Worker
@@ -141,6 +143,8 @@ Cloudflare currently documents 10 ms compute per Workflow step on Workers Free, 
                |                             |
                v                             v
          User API calls               Cloudflare Cron
+   Firebase ID token verified                |
+     and allowlist checked                   |
                                              |
                                       every 30 minutes
                                              |
@@ -211,20 +215,40 @@ The frontend never communicates directly with eBay or Facebook and never receive
 
 ### 3. Authentication
 
-Use **Cloudflare Access** with an explicit allowlist for the application's 1-5 private users.
+Use **Firebase Authentication with Google sign-in**, checked in the Worker against an explicit email allowlist, for the application's 1-5 private users. This is the mechanism Phase 2 built (`PHASE_2_LOGIN_PRIVATE_ACCESS.md`).
 
 ```text
 User
  |
  v
-Cloudflare Access
+Google sign-in popup (Firebase browser SDK)
  |
- +---- authorized ----> Application
+ v
+Firebase ID token, sent as Authorization: Bearer <token>
  |
- +---- unauthorized --> Reject
+ v
+Cloudflare Worker verification
+ |
+ +---- token and policy valid ------> Application
+ |
+ +---- no token --------------------> 401 AUTH_TOKEN_MISSING
+ |
+ +---- token not valid -------------> 401 AUTH_TOKEN_INVALID
+ |
+ +---- policy refuses --------------> 403 AUTH_FORBIDDEN
 ```
 
-Cloudflare Access currently has a **$0 Free plan for teams under 50 users**, which is substantially above this application's scope.
+The Worker verifies the token's RS256 signature against Google's public X.509 signing certificates for Firebase ID tokens, then checks issuer, audience and expiry explicitly against the Firebase project ID. It then applies policy: `email_verified` must be true, the sign-in provider must be `google.com`, and the address must be a member of `APPROVED_EMAILS`, compared exactly after trimming and lowercasing. When Google's certificates cannot be fetched at the moment they are needed, the Worker fails closed with 503 `AUTH_KEYS_UNAVAILABLE`, which a client may retry — unlike the configuration 503s below, which need a human.
+
+`APPROVED_EMAILS` is a **Worker secret** holding a JSON array of email strings. It is never committed, never sent to the browser, and never returned in an error. Missing, malformed or empty configuration fails closed with a 503. The allowlist is re-read on every request.
+
+The browser app and the Worker API are **separate origins**. The Worker answers only the exact origins listed in its `ALLOWED_ORIGINS` var and refuses any other explicit `Origin` with 403 `CORS_ORIGIN_DENIED`.
+
+Access is removed by editing the allowlist secret. **This phase has no token revocation**: a removed address is denied on its next request, but an already issued ID token is not invalidated, and signing out does not revoke it. Firebase account-disable and immediate token-revocation checks are deferred.
+
+Local development is credential-free. With `APP_ENV=local` on a loopback host the Worker returns a `local-development` identity and verifies no token, so `npm run dev:full` needs no Firebase project and no secret.
+
+Firebase Authentication on the **Spark (free) plan** covers this scope. No Cloudflare Zero Trust organization, no purchased domain, and no paid service is required.
 
 No public registration system or custom password database is required.
 
@@ -1247,7 +1271,8 @@ Frontend
     Cloudflare Pages
 
 Authentication
-    Cloudflare Access
+    Firebase Authentication - Google sign-in
+    Worker-verified ID tokens, APPROVED_EMAILS allowlist secret
 
 Application API
     Cloudflare Workers
