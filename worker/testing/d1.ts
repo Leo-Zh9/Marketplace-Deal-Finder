@@ -6,6 +6,7 @@
 
 import { Miniflare, convertV4MiniflareOptions } from "miniflare";
 import schemaSql from "../../migrations/0001_initial_storage.sql?raw";
+import evaluationSql from "../../migrations/0002_evaluation_tasks.sql?raw";
 
 /**
  * Strip `--` line comments, split on `;`, trim, drop empties. The schema contains no
@@ -43,7 +44,12 @@ export const createTestDatabase = async (): Promise<TestDatabase> => {
 
   // db.batch, never db.exec: exec splits the string on newlines and runs each line as
   // a statement, so a pretty-printed CREATE TABLE fails with `incomplete input`.
+  //
+  // Every migration file, in wrangler's order, through the same mechanism -- this is the
+  // one test seam and there must not be a second. Without 0002 here, every 3D test would
+  // run against an evaluation_tasks table with none of the evaluation columns.
   await db.batch(splitSqlStatements(schemaSql).map((statement) => db.prepare(statement)));
+  await db.batch(splitSqlStatements(evaluationSql).map((statement) => db.prepare(statement)));
 
   return { db, dispose: () => mf.dispose() };
 };
