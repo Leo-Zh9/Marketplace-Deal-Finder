@@ -4,6 +4,16 @@
   "main": "worker/index.ts",
   "compatibility_date": "2026-09-11",
   "compatibility_flags": ["nodejs_compat"],
+  // Same database_id as wrangler.jsonc: only one D1 database exists. `wrangler dev` and
+  // `npm run db:migrate:local` are local-only and ignore it, but anything carrying --remote
+  // with this config WILL reach the production database. The file name does not protect you.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "marketplace-deal-finder-db",
+      "database_id": "ac9a3013-7229-41e7-ae51-db1974193f88"
+    }
+  ],
   "vars": {
     "APP_ENV": "local",
     "ALLOWED_ORIGINS": "[\"http://localhost:5173\",\"http://127.0.0.1:5173\"]"
