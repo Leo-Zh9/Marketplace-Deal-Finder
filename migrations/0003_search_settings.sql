@@ -31,7 +31,16 @@ CREATE TABLE search_revisions (
   CHECK (mode IN ('DISCOUNT', 'MAXIMUM_PRICE', 'BOTH')),
   CHECK (maximum_price_cents IS NULL OR maximum_price_cents >= 0),
   CHECK (minimum_discount_percent IS NULL
-         OR (minimum_discount_percent >= 0 AND minimum_discount_percent <= 100))
+         OR (minimum_discount_percent >= 0 AND minimum_discount_percent <= 100)),
+  -- A MODE MUST CARRY THE COLUMN IT NEEDS. `updateSearchSettings` can never write a row
+  -- that violates these -- it runs 3D's validateSettings before the batch -- but it is not
+  -- the only writer: the documented bootstrap in docs/phase-3e-scheduling.md is a
+  -- hand-written `wrangler d1 execute`, and it is the ONLY way to create revision 0 until
+  -- Phase 5 ships a form. Without these, `(0,'DISCOUNT',NULL,NULL,...)` is storable, and
+  -- 3E-b's drain then throws `DISCOUNT requires minimumDiscountPercent` on every call.
+  -- SQLite cannot drop or add a CHECK in place, so this is the only moment to say it.
+  CHECK (mode = 'MAXIMUM_PRICE' OR minimum_discount_percent IS NOT NULL),
+  CHECK (mode = 'DISCOUNT'      OR maximum_price_cents      IS NOT NULL)
 );
 
 CREATE TABLE search_settings (

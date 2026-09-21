@@ -20,12 +20,19 @@
 import { createTestDatabase, truncateAll, type TestDatabase } from "../testing/d1";
 import { STALE_AFTER_SECONDS, type CleanupReport } from "../storage/types";
 import {
+  CLEANUP_STEP_CONFIG,
+  ROWS_READ_BUDGET,
   runCleanup,
   type CleanupParams,
   type CleanupStepper,
 } from "./runCleanup";
 
-const T = 1_800_000_000;
+/**
+ * A frozen instant, and deliberately one in the PAST. `runCleanup` refuses a `now` more than
+ * a day ahead of the real clock, and the merged suite's `1_800_000_000` is 2027-01-15 -- it
+ * would be refused. `1_700_000_000` is 2023-11-14 and stays in the past forever.
+ */
+const T = 1_700_000_000;
 const DAY = 86_400;
 
 let database!: TestDatabase;
@@ -128,7 +135,7 @@ const SURVIVORS_4 = ["f0-0", "f0-1", "f0-2", "f0-3"];
  * also the faithful simulation -- wrangler delivers parsed JSON, not a typed object.
  */
 const handWrittenPayload = JSON.parse(
-  '{"now":1800000000,"staleAfterSeconds":0}',
+  `{"now":${T},"staleAfterSeconds":0}`,
 ) as CleanupParams;
 
 describe("runCleanup", () => {
@@ -149,6 +156,23 @@ describe("runCleanup", () => {
 
     expect(run.cutoff).toBe(T - STALE_AFTER_SECONDS);
     expect(await observations()).toEqual(SURVIVORS_4);
+
+    // ...and the OPTION is live. Without this the paragraph above reasons about a knob the
+    // suite cannot distinguish from a no-op: nothing else ever passes a non-default
+    // `staleAfterSeconds`, so both the resolution and the cutoff could ignore it and stay
+    // green. Both assertions below are load-bearing and catch opposite halves -- the cutoff
+    // catches plumbing the option into the cleanup call but not into the report, and the
+    // empty survivor set catches the reverse.
+    await seed(8, 4, 1);
+    const tuned = await runCleanup(
+      database.db,
+      recording().stepper,
+      { now: T },
+      { staleAfterSeconds: 43_200 },
+    );
+    expect(tuned.cutoff).toBe(T - 43_200);
+    // A 12-hour window makes the one-day-old "fresh" group stale as well.
+    expect(await observations()).toEqual([]);
   });
 
   it("R1: continues to exhaustion, with every step's granule asserted literally", async () => {
@@ -176,6 +200,25 @@ describe("runCleanup", () => {
     // both-losing pattern, so the count and the total are pinned, not just the row set.
     expect(await observations()).toEqual(SURVIVORS_4);
     expect(await aggregates()).toEqual([{ model_key: "F0", count: 4, total_price_cents: 400 }]);
+
+    // The REPORT, not just the database. `CleanupRun` is the whole of this phase's
+    // operational visibility -- there is no alerting and no telemetry until 3E-b, so an
+    // unasserted field is a detection path nobody has checked. The oracle for the two
+    // counters is the fixture (8 stale groups x 4 observations, one aggregate row each);
+    // for usage it is the per-step reports the stepper captured, which come from
+    // `cleanupStaleObservations`' own D1 meta and not from this accumulator.
+    expect(run.observationsDeleted).toBe(32);
+    expect(run.aggregatesPruned).toBe(8);
+    expect(run.usage).toEqual(
+      recorder.reports.reduce(
+        (total, report) => ({
+          rowsRead: total.rowsRead + report.usage.rowsRead,
+          rowsWritten: total.rowsWritten + report.usage.rowsWritten,
+        }),
+        { rowsRead: 0, rowsWritten: 0 },
+      ),
+    );
+    expect(run.usage.rowsWritten).toBeGreaterThan(0);
   });
 
   it("R2: interrupted at the step cap, then resumed, subtracts exactly once", async () => {
@@ -275,9 +318,29 @@ describe("runCleanup", () => {
       );
     }
 
+    // A wrong VALUE in the right unit, which the band cannot see: 18_000_000_000 is
+    // 1_800_000_000 with one extra digit, it is a safe integer, it is inside [1e9, 1e11],
+    // and its cutoff is past every row in the table. Checked against the REAL clock with no
+    // seam, so widening or deleting the bound dies here.
+    await expect(
+      runCleanup(database.db, recording().stepper, { now: 18_000_000_000 }),
+    ).rejects.toThrow(/must not be in the future/);
+    expect({ observations: await observations(), aggregates: await aggregates() }).toEqual(before);
+
+    const realNow = Math.floor(Date.now() / 1000);
+    await expect(
+      runCleanup(database.db, recording().stepper, { now: realNow + 2 * DAY }),
+    ).rejects.toThrow(/must not be in the future/);
+
     const run = await runCleanup(database.db, recording().stepper, { now: T });
     expect(run.cutoff).toBe(T - STALE_AFTER_SECONDS);
     expect(await observations()).toEqual(["f0-0"]);
+
+    // The bound is a boundary, not a blanket refusal of anything above the fixture: an hour
+    // of skew is still accepted, so a tolerance shrunk to zero fails here.
+    await seed(1, 1, 1);
+    const skewed = await runCleanup(database.db, recording().stepper, { now: realNow + 3_600 });
+    expect(skewed.cutoff).toBe(realNow + 3_600 - STALE_AFTER_SECONDS);
   });
 
   /**
@@ -295,5 +358,55 @@ describe("runCleanup", () => {
       groups: recorder.reports[0].groups,
     }).toEqual({ batches: 1, groups: 25 });
     expect(run.steps).toBe(2);
+  });
+
+  /**
+   * R7 pins `MAX_STEPS` the way R6 pins the granule: behaviourally, with an oracle. Without
+   * it the per-instance work cap can be raised and no test notices -- and `MAX_STEPS` is one
+   * of the two constants the whole cost argument in docs/phase-3e-scheduling.md rests on.
+   */
+  it("R7: the default step cap is 32, and stopping at it leaves the rest for tomorrow", async () => {
+    // 65 stale groups at 2 per step is 33 steps' worth -- one more than the cap.
+    await seed(65, 1, 1);
+
+    const run = await runCleanup(
+      database.db,
+      recording().stepper,
+      { now: T },
+      { groupsPerBatch: 2 },
+    );
+
+    expect(run).toMatchObject({
+      steps: 32,
+      groups: 64,
+      remaining: true,
+      stoppedBecause: "step-cap",
+    });
+    // The 65th stale group is untouched, not truncated away: unfinished work is persisted by
+    // not having been done, and tomorrow's Cron finishes it.
+    const left = await observations();
+    expect(left).toHaveLength(2);
+    expect(left).toContain("f0-0");
+  });
+
+  /**
+   * R8 is the other half of that pair, and it is a BOUND WITH AN ORACLE rather than a
+   * constant mirrored to itself: raising `ROWS_READ_BUDGET` past what D1's daily allowance
+   * can absorb fails here. It is not behavioural, and the reason is cost -- distinguishing a
+   * 1,000,000-row budget from a 10,000,000-row one by observation needs a fixture that
+   * actually reads a million rows, which is ~15,000 stale observations and tens of seconds
+   * on a suite that currently runs in sixteen. The downward direction IS behavioural: a
+   * budget small enough to trip early fails R6.
+   */
+  it("R8: the default read budget leaves room for the worst granule and its retries", () => {
+    const D1_DAILY_ROW_READS = 5_000_000;
+    // Measured first granule at 400 stale groups / 6,000 observations. The method and the
+    // other two regimes are in docs/phase-3e-scheduling.md.
+    const WORST_GRANULE_ROWS = 443_301;
+    // A step body that throws has already done its reads; the report never returns, so
+    // neither the budget check nor CleanupRun.usage can see them.
+    const attempts = CLEANUP_STEP_CONFIG.retries.limit + 1;
+
+    expect(ROWS_READ_BUDGET + attempts * WORST_GRANULE_ROWS).toBeLessThan(D1_DAILY_ROW_READS);
   });
 });

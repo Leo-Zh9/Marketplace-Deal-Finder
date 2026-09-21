@@ -47,19 +47,33 @@ export const GROUPS_PER_BATCH = 25;
  * THE UN-INTERRUPTIBLE GRANULE: one batch per step.
  *
  * Cost is superlinear in the stale set, because only `last_seen_at` is indexed and each
- * group re-walks the expired range -- ~160 rows per group in steady state, ~4,600 at mass
- * expiry, ~16,600 at 400 groups. A budget checked at a coarse granule bounds nothing,
+ * group re-walks the expired range. MEASURED ON THE FIRST BATCH, which is the one that
+ * matters -- the expired range shrinks as the run proceeds, so the first granule is the most
+ * expensive and a run-average understates it badly: 7,027 rows in steady state, 215,101 at
+ * 200 stale groups, 443,301 at 400. A budget checked at a coarse granule bounds nothing,
  * because the granule's own cost is unbounded. At one batch per step the budget is checked
- * after at most 25 groups, so the effective cap is the budget plus one granule.
+ * after at most 25 groups. See docs/phase-3e-scheduling.md for the cap arithmetic -- which
+ * is `budget + (retries + 1) x granule`, not `budget + one granule`, because a retried step
+ * body re-reads everything it read before throwing.
  */
 export const BATCHES_PER_STEP = 1;
 export const MAX_STEPS = 32;
 export const ROWS_READ_BUDGET = 1_000_000;
 
 /**
+ * How far ahead of the real clock a `now` may be before it is refused. A day covers clock
+ * skew and a Cron that fires late.
+ */
+const MAX_CLOCK_SKEW_SECONDS = 86_400;
+
+/**
  * Two retries, not the platform default. Measured against miniflare: the default ladder is
- * SIX body executions over ~31s, and at up to ~415k rows read for a worst-case granule that
- * is a budget event rather than a retry. See docs/phase-3e-scheduling.md.
+ * SIX body executions over ~31s, and at 443,301 rows read for a worst-case granule that is a
+ * budget event rather than a retry. THE RETRIES ARE NOT FREE AND ARE NOT COUNTED: a body
+ * that throws has already done its reads, but its report never returns, so neither
+ * `CleanupRun.usage` nor the budget check between steps can see them. `retries: 2` therefore
+ * means the worst case is three executions of one granule. runCleanup.test.ts R8 pins the
+ * resulting cap under D1's daily allowance; docs/phase-3e-scheduling.md carries the sum.
  */
 export const CLEANUP_STEP_CONFIG = {
   retries: { limit: 2, delay: "10 seconds", backoff: "exponential" },
@@ -102,6 +116,20 @@ export const runCleanup = async (
   // nanoseconds also fail isSafeInteger.
   if (!Number.isSafeInteger(params.now) || params.now < 1e9 || params.now > 1e11) {
     throw new Error(`runCleanup: now must be epoch seconds, got ${params.now}`);
+  }
+
+  // ...AND IT MUST NOT BE IN THE FUTURE. The band above rejects a wrong UNIT; it does not
+  // reject a wrong VALUE in the right unit, and that is the same catastrophe by a different
+  // door. `18_000_000_000` is `1_800_000_000` with one extra digit: a safe integer, inside
+  // the band, and its cutoff is past every row in the table. Measured: 7 observations to 0,
+  // including one last seen 60 seconds ago. A LOW `now` needs no bound -- it only narrows
+  // the deletion set.
+  //
+  // `Date.now()` is safe here and nowhere else in this file. Only `step.do` BODIES are
+  // memoized; runCleanup's own body re-executes from the top on every instance replay, and
+  // a later replay can only make this check more permissive, so it cannot flap.
+  if (params.now > Date.now() / 1000 + MAX_CLOCK_SKEW_SECONDS) {
+    throw new Error(`runCleanup: now must not be in the future, got ${params.now}`);
   }
 
   // Resolved from `options`, NEVER from `params`. This is the line that makes an extra

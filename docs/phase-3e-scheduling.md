@@ -30,7 +30,7 @@ into the morning.
 
 **This is not an off-peak slot, and nothing in this design claims it is.** 12:00/13:00
 local is the busiest hour available, and the run carries a burst of between 16,009
-rows read (3C's measured steady state) and ~1.4M (the effective cap below). Nothing
+rows read (3C's measured steady state) and ~2.33M (the effective cap below). Nothing
 about stale cleanup depends on the wall-clock hour — the requirement with real
 semantics is *once per day at a fixed, predictable instant* — so if the burst should
 land overnight instead, `0 7 * * *` is 02:00 local and is a one-character change.
@@ -43,19 +43,28 @@ execution time, so a re-run matches nothing and subtracts nothing. The Workflow 
 **bounding and continuation only** — it contributes nothing to correctness under retry.
 
 Cost is superlinear in the size of the stale set, because only `last_seen_at` is
-indexed and every group re-walks the expired range. Derived from 3C's measured
-figures in `docs/phase-3c-storage.md`:
+indexed and every group re-walks the expired range.
 
-| Regime | rows read per group | one granule (≤ 25 groups) | effective cap |
+**Measured on the FIRST batch, and the method is the point.** The expired range
+shrinks as a run proceeds, so the first granule is the most expensive one and a
+run-average understates it badly — at 200 stale groups, `25 × (run average)` gives
+115,000 against a measured 215,101. The cap below depends on the WORST granule, not
+the mean, so every figure here is a direct reading of
+`cleanupStaleObservations(db, { now, groupsPerBatch: 25, maxBatches: 1 }).usage.rowsRead`.
+The harness is validated by reproducing 3C's published whole-run figure for the
+mass-expiry fixture exactly: **921,409**.
+
+| Regime | first granule (25 groups) | per group | effective cap |
 |---|---|---|---|
-| Steady state (100 stale / 200 groups) | ~160 | ~4,000 | ~1,004,000 |
-| Mass expiry (3,000 stale / 200 groups) | ~4,600 | ~115,000 | ~1,115,000 |
-| Mass expiry at 400 groups | ~16,600 | ~415,000 | ~1,415,000 |
+| Steady state (2,900 live / 100 stale over 100 groups) | **7,027** | ~281 | ~1,021,081 |
+| Mass expiry (3,000 stale over 200 groups) | **215,101** | ~8,604 | ~1,645,303 |
+| Mass expiry (6,000 stale over 400 groups) | **443,301** | ~17,732 | ~2,329,903 |
 
 **The two rows in `docs/phase-3c-storage.md`'s cleanup table are not the same shape
 and must not be compared directly:** its steady-state row is one observation per
 group, its mass-expiry row is fifteen. The per-group column above is the figure that
-is comparable.
+is comparable — and it is a first-granule figure, so it is larger than the run
+average that table's totals imply.
 
 The constants live in `worker/scheduling/runCleanup.ts`:
 
@@ -65,10 +74,25 @@ MAX_STEPS        = 32        ROWS_READ_BUDGET  = 1,000,000
 ```
 
 `BATCHES_PER_STEP = 1` is the point. The budget is checked **after** a step returns,
-so the effective cap is always `budget + one granule` — and a granule whose own cost
-is unbounded bounds nothing. At one batch per step, the overshoot is at most the
-worst-case granule in the table above. Against D1's 5,000,000 reads/day this leaves
-the daily cleanup at roughly 28% of the budget in its worst measured shape.
+so a run always overshoots it by whatever the last granule cost — and a granule whose
+own cost is unbounded bounds nothing.
+
+**And the overshoot is more than one granule, because retries are neither counted nor
+free.** A `step.do` body that throws has already done its D1 reads, but its
+`CleanupReport` never returns, so neither `run.usage.rowsRead` nor the budget check
+between steps can see them. With `CLEANUP_STEP_CONFIG.retries.limit = 2`, one granule
+can execute three times. The honest cap is therefore
+
+```
+effective cap = ROWS_READ_BUDGET + (retries + 1) × worst granule
+              = 1,000,000 + 3 × 443,301
+              = 2,329,903        ≈ 47% of D1's 5,000,000 reads/day
+```
+
+not `budget + one granule`. `runCleanup.test.ts` R8 asserts that sum stays under the
+daily allowance, so raising either constant fails the suite. **`CleanupRun.usage`
+undercounts by every failed attempt** — it is the cost of the reads that produced a
+report, not of the reads that were performed.
 
 `MAX_STEPS = 32` caps a single instance at 800 groups. Hitting it is not data loss:
 the rows stay stale, the run reports `stoppedBecause: "step-cap"` with
@@ -125,6 +149,13 @@ INSERT INTO search_settings (id, current_revision) VALUES (1, 0);
 "
 ```
 
+Because this path bypasses `updateSearchSettings` entirely, `0003` carries the
+consistency rule in the schema rather than trusting the writer: a mode must carry the
+column it needs (`DISCOUNT` a percent, `MAXIMUM_PRICE` a maximum, `BOTH` both).
+`(0,'DISCOUNT',NULL,NULL,…)` is refused by a CHECK instead of being stored and then
+throwing `validateSettings: DISCOUNT requires minimumDiscountPercent` on every call
+3E-b's drain makes.
+
 ## What the revision log records, and what a settings form must know
 
 `updateSearchSettings` validates with 3D's merged `validateSettings` **before any
@@ -171,12 +202,23 @@ In order of speed:
 `evaluation_tasks`, and `listings.first_seen_at` — the one irreversible loss in the
 system — is unreachable from it.
 
-**The catastrophic case is a wrong cutoff, and the payload is one field, guarded.**
-`CleanupParams` is `{ now }` and nothing else, so a hand-written
+**The catastrophic case is a wrong cutoff, and the payload is one field, guarded
+twice.** `CleanupParams` is `{ now }` and nothing else, so a hand-written
 `wrangler workflows trigger '<json>'` payload cannot set a tuning value: an unexpected
-key is **inert**, not merely rejected. `now` itself must be a safe integer in
-`[1e9, 1e11]`, which rejects milliseconds, microseconds and nanoseconds. What is left
-is editing the module constants, which is a code change under review.
+key is **inert**, not merely rejected. `now` itself must pass two checks, and it needs
+both:
+
+1. a safe integer in `[1e9, 1e11]`, which rejects a wrong **unit** — milliseconds,
+   microseconds, nanoseconds;
+2. **not more than a day ahead of the real clock**, which rejects a wrong **value in
+   the right unit**. `18000000000` is `1800000000` with one extra digit; it is a safe
+   integer, it is inside the band, and its cutoff lands past every row in the table.
+   Measured before the second check existed: 7 observations to 0, including one last
+   seen 60 seconds ago.
+
+A `now` in the past needs no bound — it only narrows the deletion set. What is left
+after both checks is editing the module constants, which is a code change under
+review.
 
 **How a wrong cutoff would be noticed.** There is no alerting — Phase 4 owns it, and
 telemetry is 3E-b's. Today: `CleanupRun` is the instance output, readable with
@@ -224,7 +266,12 @@ a devDependency), hosts it in Miniflare with a D1 and a `workflows` binding, app
 the real migrations through the same `applyMigrations` the other seam uses, and
 returns a `fire(cron, seconds)`. `cleanupWorkflow.test.ts` drives the whole chain
 through it — cron string → `scheduled()` → `create()` → real `WorkflowEntrypoint` →
-real `step.do` → real `cleanupStaleObservations` → real D1.
+real `step.do` → real `cleanupStaleObservations` → real D1. Its fixture is
+**deliberately larger than one granule** (26 stale groups against
+`GROUPS_PER_BATCH = 25`, `BATCHES_PER_STEP = 1`), so reaching the expected end state
+proves the real Workflow *iterated*: the continuation — invariant 2, the phase's
+headline property — is not asserted only against the fake stepper that lives in the
+same file as the code it validates.
 
 A Node test cannot import a module with a runtime `cloudflare:workers` import, and
 wrangler requires the Workflow class to be exported from the main entry — which

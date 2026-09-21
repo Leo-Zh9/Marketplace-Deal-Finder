@@ -44,8 +44,9 @@ describe("0001_initial_storage.sql", () => {
   // nobody planned is write amplification on every insert into the table it covers, and the
   // only way that shows up is as a failure here. 0001 owns price_observations_last_seen_at;
   // 0002 owns the three evaluation_tasks indexes (queue = tiers 1/2, attempt = tier 3,
-  // revision = tier 4). createTestDatabase applies both migrations, so this is the list a
-  // deployed database holds.
+  // revision = tier 4). createTestDatabase applies 0001, 0002 and 0003, so this is the list
+  // a deployed database holds -- 0003 adds no index of its own, because both its primary
+  // keys are INTEGER rowid aliases and SQLite builds no child-side index for a foreign key.
   it("creates exactly the 0001 and 0002 indexes, and no others", async () => {
     const { results } = await database.db
       .prepare("SELECT name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL ORDER BY name")

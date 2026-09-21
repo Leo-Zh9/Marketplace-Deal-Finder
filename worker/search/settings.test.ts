@@ -106,10 +106,35 @@ describe("search settings", () => {
     ).rejects.toThrow(/FOREIGN KEY constraint failed/);
 
     // CHECK (mode IN ...): the column is TEXT, and `loadCurrentSettings` narrows it to
-    // DealMode on the way out. This CHECK is what makes that narrowing honest.
+    // DealMode on the way out. This CHECK is what makes that narrowing honest. The row is
+    // otherwise VALID -- both columns populated -- so only the mode CHECK can reject it.
     await expect(
-      database.db.prepare("INSERT INTO search_revisions VALUES (1,'WISHFUL',20,NULL,1)").run(),
+      database.db.prepare("INSERT INTO search_revisions VALUES (1,'WISHFUL',20,50000,1)").run(),
     ).rejects.toThrow(/CHECK constraint failed/);
+
+    // A mode must carry the column it needs. `updateSearchSettings` can never write one of
+    // these (T4 proves it validates first), but it is not the only writer: the documented
+    // bootstrap is a hand-written `wrangler d1 execute` and it is the only way to create
+    // revision 0 today. Each row below satisfies every OTHER constraint in the table.
+    for (const inconsistent of [
+      "INSERT INTO search_revisions VALUES (1,'DISCOUNT',NULL,NULL,1)",
+      "INSERT INTO search_revisions VALUES (2,'MAXIMUM_PRICE',NULL,NULL,1)",
+      "INSERT INTO search_revisions VALUES (3,'BOTH',20,NULL,1)",
+      "INSERT INTO search_revisions VALUES (4,'BOTH',NULL,50000,1)",
+    ]) {
+      await expect(database.db.prepare(inconsistent).run()).rejects.toThrow(
+        /CHECK constraint failed/,
+      );
+    }
+
+    // ...and the shapes the writer actually produces are all accepted.
+    for (const consistent of [
+      "INSERT INTO search_revisions VALUES (5,'DISCOUNT',20,NULL,1)",
+      "INSERT INTO search_revisions VALUES (6,'MAXIMUM_PRICE',NULL,50000,1)",
+      "INSERT INTO search_revisions VALUES (7,'BOTH',20,50000,1)",
+    ]) {
+      await expect(database.db.prepare(consistent).run()).resolves.toBeDefined();
+    }
   });
 
   it("T2: first configure is revision 0; an unchanged save does not bump; a change bumps by one", async () => {
