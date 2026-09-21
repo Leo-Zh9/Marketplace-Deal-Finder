@@ -28,6 +28,11 @@ export default defineConfig({
     // deliberate performance assertion about these tests, just the default they happened to sit
     // near.
     testTimeout: 15_000,
+    // runMonitor.test.ts R3 is the suite's only `console` spy. It restores itself on the success
+    // path, but a failure between `spyOn` and `mockRestore` would leak a SILENCING spy into the
+    // rest of that file -- only ever inside an already-red run, so it can never produce a false
+    // green, but it can make a red run unreadable. One line, and the red run stays legible.
+    restoreMocks: true,
     environment: "jsdom",
     globals: true,
     setupFiles: "./src/test/setup.ts",

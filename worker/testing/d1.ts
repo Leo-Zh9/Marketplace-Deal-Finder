@@ -8,6 +8,7 @@ import { Miniflare, convertV4MiniflareOptions } from "miniflare";
 import schemaSql from "../../migrations/0001_initial_storage.sql?raw";
 import evaluationSql from "../../migrations/0002_evaluation_tasks.sql?raw";
 import searchSql from "../../migrations/0003_search_settings.sql?raw";
+import monitorSql from "../../migrations/0004_monitor.sql?raw";
 
 /**
  * Strip `--` line comments, split on `;`, trim, drop empties. The schema contains no
@@ -38,10 +39,11 @@ export interface TestDatabase {
  * createTestDatabase and workerBundle.ts's workerd-hosted worker -- call it, so they cannot
  * drift apart. Without 0002 here, every 3D test would run against an evaluation_tasks table
  * with none of the evaluation columns; without 0003, every 3E-a settings test would fail on
- * a missing table.
+ * a missing table; without 0004, every 3E-b monitoring test would fail on a missing
+ * monitor_lock.
  */
 export const applyMigrations = async (db: D1Database): Promise<void> => {
-  for (const sql of [schemaSql, evaluationSql, searchSql]) {
+  for (const sql of [schemaSql, evaluationSql, searchSql, monitorSql]) {
     await db.batch(splitSqlStatements(sql).map((statement) => db.prepare(statement)));
   }
 };
@@ -66,12 +68,18 @@ export const createTestDatabase = async (): Promise<TestDatabase> => {
 };
 
 /**
- * One batch of DELETEs across all six tables, for `beforeEach` isolation.
+ * One batch of DELETEs across all eight tables, for `beforeEach` isolation.
  *
  * search_settings BEFORE search_revisions, and that is not style. D1 runs with
  * `PRAGMA foreign_keys = 1`, search_settings.current_revision REFERENCES
  * search_revisions.revision, and a failing statement rolls the WHOLE batch back -- so the
  * other order raises `FOREIGN KEY constraint failed` and truncates nothing.
+ *
+ * monitor_lock is RESET, not deleted. 0004 seeds `(1, '', 0, 0)` because the documented kill
+ * switch is a write to that row and, against an empty table, a bare UPDATE is a silent no-op
+ * -- so a truncate that left the table empty would reintroduce, in every test after the first,
+ * exactly the state the seed exists to prevent. The upsert restores the seed even when a test
+ * deleted the row on purpose.
  */
 export const truncateAll = async (db: D1Database): Promise<void> => {
   await db.batch([
@@ -81,5 +89,10 @@ export const truncateAll = async (db: D1Database): Promise<void> => {
     db.prepare("DELETE FROM listings"),
     db.prepare("DELETE FROM search_settings"),
     db.prepare("DELETE FROM search_revisions"),
+    db.prepare("DELETE FROM monitor_runs"),
+    db.prepare(
+      `INSERT INTO monitor_lock (id, run_id, acquired_at, expires_at) VALUES (1, '', 0, 0)
+       ON CONFLICT(id) DO UPDATE SET run_id = '', acquired_at = 0, expires_at = 0`,
+    ),
   ]);
 };

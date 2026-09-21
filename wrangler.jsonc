@@ -16,12 +16,20 @@
   // EST (UTC-5), so it fires at 12:00 local in winter and 13:00 local in summer.
   // THE OPERATOR'S TIMEZONE IS AN INFERENCE, NOT A FACT -- America/Toronto, inferred from
   // the product's example search location. See docs/phase-3e-scheduling.md.
-  "triggers": { "crons": ["0 17 * * *"] },
+  // The monitoring cron is UTC-agnostic: every 30 minutes is every 30 minutes
+  // everywhere. It collides with the cleanup cron once a day at 17:00, which the
+  // spec's two expressions make unavoidable -- see docs/phase-3e-monitoring.md.
+  "triggers": { "crons": ["0 17 * * *", "*/30 * * * *"] },
   "workflows": [
     {
       "binding": "CLEANUP_WORKFLOW",
       "name": "marketplace-deal-finder-cleanup",
       "class_name": "CleanupWorkflow"
+    },
+    {
+      "binding": "MONITOR_WORKFLOW",
+      "name": "marketplace-deal-finder-monitor",
+      "class_name": "MonitorWorkflow"
     }
   ],
   // APPROVED_EMAILS is a Worker secret and must never appear here.

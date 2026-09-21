@@ -114,7 +114,10 @@ describe("CleanupWorkflow, driven by a real Cron trigger", () => {
     await worker.db.batch(seed);
 
     const untouched = await state();
-    await worker.fire("*/30 * * * *", T);
+    // RETARGETED: this used to be "*/30 * * * *", which is now a real trigger. Leaving it
+    // would silently stop testing the guard -- a monitoring run also leaves price_observations
+    // and model_stats untouched, so the assertion below would pass for the wrong reason.
+    await worker.fire("13 4 * * *", T);
     await new Promise((resolve) => setTimeout(resolve, 500));
     expect(await state()).toEqual(untouched);
 

@@ -20,6 +20,7 @@ export type Environment = WorkerEnvironment;
  * agree.
  */
 export { CleanupWorkflow } from "./scheduling/cleanupWorkflow";
+export { MonitorWorkflow } from "./scheduling/monitorWorkflow";
 
 // Content-Type is added by `json` only: a 204 preflight carries no body.
 const securityHeaders = {
