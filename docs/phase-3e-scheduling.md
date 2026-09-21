@@ -3,8 +3,8 @@
 3E-a is the half of Phase 3E that needs no data source: the `search_settings` /
 `search_revisions` pair that 3C and 3D both deferred, and the daily Cron that drives
 3C's `cleanupStaleObservations` through a Cloudflare Workflow. The monitoring Cron,
-the Monitoring Workflow, `monitor_lock` and run telemetry are 3E-b's, and none of
-them exists yet.
+the Monitoring Workflow, `monitor_lock` and run telemetry are 3E-b's, and all four
+now exist — see docs/phase-3e-monitoring.md.
 
 ## The Cron is UTC, and "local noon" is not satisfiable
 
@@ -103,7 +103,11 @@ the rows stay stale, the run reports `stoppedBecause: "step-cap"` with
 the re-walk entirely at the cost of one extra row written per observation insert. It
 is **deliberately not taken in 3E-a**: nothing writes to `price_observations` in
 production yet (3A/3B collection is parked), so the stale-set size its value depends
-on cannot be measured. 3E-b's telemetry is what should decide it.
+on cannot be measured. **Correction (3E-b):** 3E-b's telemetry cannot decide it
+either — a monitoring run never writes `price_observations`, so `monitor_runs`
+reports flat figures about a stale set that does not exist. The number that decides
+it is `CleanupRun.usage.rowsRead` measured against a real `price_observations`
+count: cleanup's telemetry, not monitoring's.
 
 ## Deploy runbook
 

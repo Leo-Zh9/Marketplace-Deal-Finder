@@ -52,7 +52,12 @@ export const createScheduledTestWorker = async (): Promise<ScheduledTestWorker> 
       compatibilityDate: "2026-09-11",
       compatibilityFlags: ["nodejs_compat"],
       d1Databases: { DB: "test" },
-      workflows: { CLEANUP_WORKFLOW: { name: "cleanup", className: "CleanupWorkflow" } },
+      // BOTH bindings, and the second is required rather than cosmetic: without it the
+      // monitoring cron reaches `create` on an undefined binding and `scheduled()` rejects.
+      workflows: {
+        CLEANUP_WORKFLOW: { name: "cleanup", className: "CleanupWorkflow" },
+        MONITOR_WORKFLOW: { name: "monitor", className: "MonitorWorkflow" },
+      },
     } as Parameters<typeof convertV4MiniflareOptions>[0]),
   );
 

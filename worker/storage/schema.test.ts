@@ -3,6 +3,7 @@
 import { createTestDatabase, splitSqlStatements, type TestDatabase } from "../testing/d1";
 import schemaSql from "../../migrations/0001_initial_storage.sql?raw";
 import evaluationSql from "../../migrations/0002_evaluation_tasks.sql?raw";
+import monitorSql from "../../migrations/0004_monitor.sql?raw";
 
 /**
  * Every CHECK in `sql`, innermost text only, whitespace normalised.
@@ -53,12 +54,13 @@ afterAll(async () => {
 
 // Test 14 -- schema / migration.
 describe("0001_initial_storage.sql", () => {
-  // Test S1. createTestDatabase applies 0001, 0002 AND 0003, so this asserts what the three
-  // migrations together create and NOTHING ELSE: 0002 is purely additive and creates no
-  // table of its own, and 0003 adds exactly the two 3E-a tables. A table nobody planned --
-  // monitor_lock above all, which belongs to 3E-b and whose only reader is 3E-b's run lock
-  // -- shows up here and nowhere else.
-  it("creates exactly the six tables 0001, 0002 and 0003 define", async () => {
+  // Test S1. createTestDatabase applies 0001, 0002, 0003 AND 0004, so this asserts what the
+  // four migrations together create and NOTHING ELSE: 0002 is purely additive and creates no
+  // table of its own, 0003 adds exactly the two 3E-a tables, and 0004 adds exactly the two
+  // 3E-b ones. monitor_lock used to be named here as the table that would show up if someone
+  // created it early; it is 3E-b's now, it has a reader (the run lock's ACQUIRE_LOCK and
+  // LOCK_HELD, every run), and a table nobody planned still shows up here and nowhere else.
+  it("creates exactly the eight tables 0001, 0002, 0003 and 0004 define", async () => {
     // The filter is required: after the migration sqlite_master also holds D1's internal
     // _cf_METADATA and four sqlite_autoindex_* entries for the composite primary keys.
     const { results } = await database.db
@@ -71,6 +73,8 @@ describe("0001_initial_storage.sql", () => {
       "evaluation_tasks",
       "listings",
       "model_stats",
+      "monitor_lock",
+      "monitor_runs",
       "price_observations",
       "search_revisions",
       "search_settings",
@@ -84,6 +88,10 @@ describe("0001_initial_storage.sql", () => {
   // revision = tier 4). createTestDatabase applies 0001, 0002 and 0003, so this is the list
   // a deployed database holds -- 0003 adds no index of its own, because both its primary
   // keys are INTEGER rowid aliases and SQLite builds no child-side index for a foreign key.
+  // 0004 adds none either, and that is MEASURED rather than assumed: monitor_runs.run_seq is a
+  // rowid alias, and its `run_id TEXT UNIQUE` creates sqlite_autoindex_monitor_runs_1, whose
+  // `sql IS NULL` -- so it is invisible to this query by the same rule that hides the composite
+  // primary keys. The list below is byte-for-byte the one master returns.
   it("creates exactly the 0001 and 0002 indexes, and no others", async () => {
     const { results } = await database.db
       .prepare("SELECT name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL ORDER BY name")
@@ -219,5 +227,137 @@ describe("0002_evaluation_tasks.sql", () => {
     for (const statement of statements) {
       expect(statement).not.toMatch(/\b(DROP|CREATE TABLE|UPDATE|DELETE)\b/);
     }
+  });
+});
+
+/**
+ * Phase 3E-b's additive migration. Patterned off the 0002 block above -- applied column shapes
+ * through pragma_table_info, plus a file-level assertion that the file itself is additive,
+ * because a destructive statement would still leave the right columns on a FRESH database
+ * while destroying a deployed one. (There is no 0003 block: 0003's tables are covered by S1
+ * and by settings.test.ts.)
+ */
+describe("0004_monitor.sql", () => {
+  // Test S5.
+  it("creates monitor_lock as a singleton with the four lock columns, all NOT NULL", async () => {
+    const { results } = await database.db
+      .prepare("SELECT name, `notnull`, pk FROM pragma_table_info('monitor_lock')")
+      .all<{ name: string; notnull: number; pk: number }>();
+
+    expect(results.map((row) => row.name)).toEqual([
+      "id",
+      "run_id",
+      "acquired_at",
+      "expires_at",
+    ]);
+    // run_id NOT NULL above all: RELEASE_LOCK writes '' and the fence compares two strings.
+    // `lease_token = ?` against NULL matches zero rows, and so would `run_id = ?`.
+    expect(results.every((row) => row.notnull === 1)).toBe(true);
+    expect(results.find((row) => row.name === "id")?.pk).toBe(1);
+  });
+
+  // Test S6. The seed row, and it is not tidiness: the documented kill switch is a write to
+  // this row, and monitorLock.test.ts L10 measures what a bare UPDATE does when it is absent.
+  it("seeds monitor_lock with the inert free row, and refuses a second", async () => {
+    const { results } = await database.db
+      .prepare("SELECT id, run_id, acquired_at, expires_at FROM monitor_lock")
+      .all();
+
+    expect(results).toEqual([{ id: 1, run_id: "", acquired_at: 0, expires_at: 0 }]);
+
+    // CHECK (id = 1) is the schema saying EXACTLY ONE MONITORING RUN MAY MUTATE AT A TIME.
+    await expect(
+      database.db.prepare("INSERT INTO monitor_lock VALUES (2, '', 0, 0)").run(),
+    ).rejects.toThrow(/CHECK constraint failed/);
+  });
+
+  // Test S7. monitor_runs' columns, in order, with the two nullable ones named. Column ORDER
+  // is load-bearing: INSERT_RUN binds 24 positional parameters against this list.
+  it("creates monitor_runs with the spec's fields, and only search_revision nullable", async () => {
+    const { results } = await database.db
+      .prepare("SELECT name, `notnull` FROM pragma_table_info('monitor_runs')")
+      .all<{ name: string; notnull: number }>();
+
+    expect(results.map((row) => row.name)).toEqual([
+      "run_seq",
+      "run_id",
+      "scheduled_at",
+      "started_at",
+      "finished_at",
+      "status",
+      "search_revision",
+      "sources",
+      "sources_truncated",
+      "selected_components",
+      "request_count",
+      "result_count",
+      "new_count",
+      "changed_count",
+      "unchanged_count",
+      "claimed_count",
+      "evaluation_count",
+      "evaluation_error_count",
+      "discarded_count",
+      "batches",
+      "steps_used",
+      "step_failures",
+      "rows_read",
+      "rows_written",
+      "errors",
+    ]);
+    // search_revision is NULL for a run that never loaded settings -- SKIPPED_LOCKED and
+    // NO_SETTINGS, which is EVERY run in production until the bootstrap is applied.
+    expect(results.filter((row) => row.notnull === 0).map((row) => row.name)).toEqual([
+      "search_revision",
+    ]);
+
+    // run_id UNIQUE is what makes a replayed finalize an upsert rather than a UNIQUE failure
+    // that rolls back the whole batch -- and the batch carries the lock release.
+    await database.db
+      .prepare(
+        `INSERT INTO monitor_runs (run_id, scheduled_at, started_at, finished_at, status,
+           search_revision, sources, sources_truncated, selected_components, request_count,
+           result_count, new_count, changed_count, unchanged_count, claimed_count,
+           evaluation_count, evaluation_error_count, discarded_count, batches, steps_used,
+           step_failures, rows_read, rows_written, errors)
+         VALUES ('dup',0,0,0,'OK',NULL,'[]',0,'[]',0,0,0,0,0,0,0,0,0,0,0,0,0,0,'[]')`,
+      )
+      .run();
+    await expect(
+      database.db
+        .prepare(
+          `INSERT INTO monitor_runs (run_id, scheduled_at, started_at, finished_at, status,
+             search_revision, sources, sources_truncated, selected_components, request_count,
+             result_count, new_count, changed_count, unchanged_count, claimed_count,
+             evaluation_count, evaluation_error_count, discarded_count, batches, steps_used,
+             step_failures, rows_read, rows_written, errors)
+           VALUES ('dup',0,0,0,'OK',NULL,'[]',0,'[]',0,0,0,0,0,0,0,0,0,0,0,0,0,0,'[]')`,
+        )
+        .run(),
+    ).rejects.toThrow(/UNIQUE constraint failed/);
+    await database.db.prepare("DELETE FROM monitor_runs WHERE run_id = 'dup'").run();
+  });
+
+  // Test S8. The FILE, not the applied result.
+  it("is two CREATE TABLEs and one seed INSERT, and nothing destructive", () => {
+    const statements = splitSqlStatements(monitorSql);
+
+    expect(statements).toHaveLength(3);
+    expect(statements.filter((statement) => statement.startsWith("CREATE TABLE"))).toHaveLength(2);
+    expect(
+      statements.filter((statement) => statement.startsWith("INSERT INTO monitor_lock")),
+    ).toHaveLength(1);
+
+    // 0001, 0002 and 0003 are APPLIED IN PRODUCTION, and SQLite can neither drop a CHECK nor
+    // alter a primary key. An ALTER or a DROP in this file is the one edit that cannot be
+    // undone by editing the file again.
+    for (const statement of statements) {
+      expect(statement).not.toMatch(/\b(DROP|ALTER|UPDATE|DELETE)\b/);
+    }
+
+    // The singleton CHECK, exhaustively: 0004 declares this one and no others. The status
+    // column deliberately carries NO CHECK -- the status set will grow (the spec already names
+    // SOURCE_EMPTY) and SQLite cannot add or drop one in place.
+    expect(extractChecks(statements.join("\n"))).toEqual(["id = 1"]);
   });
 });
