@@ -1241,6 +1241,85 @@ describe("evaluateBatch -- budget, isolation and guards", () => {
     expect(claimed).toEqual([15, 15, 10, 0]);
   });
 
+  /**
+   * E22b / E22c. OLDEST-QUEUED-FIRST, over three real calls -- the tier 1 and tier 2 equivalent of
+   * E14, and for the same liveness reason.
+   *
+   * `QUEUE_TASK` rewrites `created_at = now` on EVERY contribution change, so a listing whose
+   * price flaps keeps earning a fresh timestamp. Under FIFO it goes to the back of the queue each
+   * time. Under LIFO it repeatedly jumps ahead of listings that were queued once and never
+   * touched again, and under sustained inflow those are never evaluated at all.
+   *
+   * C1b cannot see this: its 20,000 rows share ONE `created_at`, so ordering is invisible to it by
+   * construction. This fixture is the opposite -- 45 tasks, every `created_at` distinct.
+   *
+   * (Deleting the `ORDER BY` outright is an equivalent mutant here: the covering index
+   * `evaluation_tasks_queue` walks in that order anyway. It is the reversal that establishes the
+   * behaviour, and the reversal is what these two tests kill.)
+   */
+  const FIFO_SIZE = 45;
+
+  const fifoFixture = async (status: string, leaseExpiresAt: number, leaseToken: string) => {
+    const statements: D1PreparedStatement[] = [];
+    for (let index = 0; index < FIFO_SIZE; index += 1) {
+      const id = `t-${String(index).padStart(2, "0")}`;
+      statements.push(
+        insertListing({ listingId: id, priceCents: 25_000, validity: "INVALID_REFERENCE" }),
+        insertTask({
+          listingId: id,
+          status,
+          createdAt: T0 + index, // DISTINCT, so "which 15" is a real question
+          leaseExpiresAt,
+          leaseToken,
+        }),
+      );
+    }
+    await db.batch(statements);
+  };
+
+  const drainInThreeCalls = async (label: string, now: number): Promise<string[][]> => {
+    const perCall: string[][] = [];
+    for (let call = 0; call < 3; call += 1) {
+      const report = await evaluateBatch(db, {
+        source: SOURCE,
+        settings: maximum(30_000, 1),
+        now: now + call * 60,
+        batchSize: 15,
+        leaseToken: `token-${label}-${call}`,
+      });
+      expect(report.outcomes).toHaveLength(15);
+      perCall.push(report.outcomes.map((outcome) => outcome.listingId).sort());
+    }
+    return perCall;
+  };
+
+  const oldest = (from: number, count: number) =>
+    Array.from({ length: count }, (_, index) => `t-${String(from + index).padStart(2, "0")}`);
+
+  it("E22b: tier 1 claims the oldest-queued PENDING tasks first", async () => {
+    await fifoFixture("PENDING", 0, "");
+
+    const perCall = await drainInThreeCalls("e22b", T0 + 1000);
+
+    // The oldest third, then the next, then the last -- not the newest third first.
+    expect(perCall[0]).toEqual(oldest(0, 15));
+    expect(perCall[1]).toEqual(oldest(15, 15));
+    expect(perCall[2]).toEqual(oldest(30, 15));
+    expect(new Set(perCall.flat()).size).toBe(FIFO_SIZE);
+  });
+
+  it("E22c: tier 2 recovers the oldest-queued expired leases first", async () => {
+    // Every task abandoned by a crashed claimant: PROCESSING with a lease that expired at T0.
+    await fifoFixture("PROCESSING", T0, "token-crashed");
+
+    const perCall = await drainInThreeCalls("e22c", T0 + 1000);
+
+    expect(perCall[0]).toEqual(oldest(0, 15));
+    expect(perCall[1]).toEqual(oldest(15, 15));
+    expect(perCall[2]).toEqual(oldest(30, 15));
+    expect(new Set(perCall.flat()).size).toBe(FIFO_SIZE);
+  });
+
   // E23. `source = ?1` scopes every tier -- including each OR term of the revision tier, where it
   // is repeated. The other source's tasks are OLDER, so an unscoped tier would take them first.
   it("E23: claims only the requested source's tasks, in every tier", async () => {

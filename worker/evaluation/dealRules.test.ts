@@ -136,6 +136,11 @@ describe("dealRules -- the evidence gate", () => {
 
   // R12. A drifted aggregate. C = -1 satisfies the raw comparison (1 * -1 * 10000 = -10000 <=
   // 1000 * 8000), so it is the EVIDENCE GATE, not the arithmetic, that stops it becoming a DEAL.
+  //
+  // A negative COUNT stays `insufficient-evidence` while a negative TOTAL does not (R23), and the
+  // asymmetry is deliberate: for `count`, "corrupt" and "too few" are the same predicate with the
+  // same answer -- wait -- and `count < MINIMUM_REFERENCE_COUNT` is already that test. A corrupt
+  // total is not "too small"; it is unusable, and waiting need never repair it.
   it("R12: a negative reference count is insufficient evidence, never a deal", () => {
     expect(
       decide(
@@ -172,12 +177,13 @@ describe("dealRules -- a malformed aggregate is not thin evidence", () => {
     });
   });
 
-  // R23. The mirror of R12. A negative total cannot produce a false DEAL -- the right-hand side
-  // goes negative while the left stays non-negative -- but WITHOUT this term it produces
-  // NOT_DEAL / COMPLETE, which marks a listing "not a deal" forever on the strength of a drifted
-  // aggregate and never re-examines it. R12 already refuses to trust a negative count; a negative
-  // total is the same corruption in the other column.
-  it("R23: parks a negative reference total instead of ruling on it", () => {
+  // R23. A negative total cannot produce a false DEAL -- the right-hand side goes negative while
+  // the left stays non-negative -- but without this branch it produces NOT_DEAL / COMPLETE, which
+  // marks a listing "not a deal" forever on the strength of a drifted aggregate and never looks
+  // again. It reports the SAME reason as R22: both are a corrupt total, and R22's whole argument
+  // is that a corrupt aggregate must not be reported as thin evidence. Splitting them would apply
+  // that argument to one column value and not the other.
+  it("R23: reports a negative reference total as a corrupt total, not as thin evidence", () => {
     expect(
       decide(
         candidate({ referenceCount: 5, referenceTotalCents: -1000, candidatePriceCents: 1 }),
@@ -186,7 +192,7 @@ describe("dealRules -- a malformed aggregate is not thin evidence", () => {
     ).toEqual({
       verdict: "NEEDS_REVIEW",
       status: "NEEDS_REVIEW",
-      reason: "insufficient-evidence",
+      reason: "invalid-reference-total",
     });
   });
 });

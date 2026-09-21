@@ -17,9 +17,22 @@
  * spare. It is that NOTHING IN THE SCHEMA BOUNDS THE INPUTS: `listings`' only price CHECK is
  * `price_cents IS NULL OR price_cents >= 0` and `model_stats`' only count CHECK is
  * `count >= 0`. "It fits in a double" would be an assumption about data, not a property of
- * the system. Measured on this repository over 30,000 batches after a warm-up: BigInt and
- * Number are BOTH 0.00004 ms p95 per 15-row batch -- indistinguishable at timer resolution,
- * against an 8 ms budget. The safety is free.
+ * the system.
+ *
+ * ON WHAT IT COSTS, and why there is DELIBERATELY NO NUMBER HERE. Three microbenchmarks written
+ * while building 3D produced three different answers, in two directions. A timer around each
+ * 15-row batch measures its own clock at this magnitude, so both forms land on the timer floor and
+ * look identical. A block timer whose result is not consumed measures dead-code elimination, and
+ * reports BigInt as the FASTER of the two. Per-operation figures at nanosecond scale are not
+ * something this comment can carry honestly.
+ *
+ * What the suite proves, and prints on every run, is the end-to-end figure: `evaluationCpu.test.ts`
+ * C4 replays a real 15-candidate DISCOUNT-mode batch -- so all fifteen cross-multiplications run
+ * inside it -- and its p95 is currently ~600x under the 8 ms budget. BigInt is slower than Number
+ * per operation, because it allocates; it is not slower by anything this budget can notice, and
+ * that is the only claim being made. If you ever need the per-operation figure, block-time many
+ * batches per clock read AND consume the result -- getting either half wrong is how all three
+ * previous numbers were produced.
  */
 
 import {
@@ -150,12 +163,17 @@ export const decide = (
     const count = reference.referenceCount;
     const total = reference.referenceTotalCents;
 
-    // A malformed aggregate gets its OWN reason. It is not "insufficient evidence": more
-    // observations cure thin evidence, and nothing cures a corrupt total on its own. Both park
-    // the task at NEEDS_REVIEW so it self-heals if the aggregate is ever repaired -- a
-    // model_stats change never requeues a listing, so tier 3 is the only way back -- but a model
-    // parked on a corrupt total would otherwise rotate forever with no signal at all.
-    if (total !== null && !Number.isSafeInteger(total)) {
+    // A CORRUPT TOTAL, in either direction, gets its own reason. Not "insufficient evidence":
+    // more observations cure thin evidence, and nothing cures a corrupt aggregate on its own, so
+    // reporting the two the same way makes a permanently stuck model indistinguishable from a
+    // young market that is merely waiting. Both park the task at NEEDS_REVIEW so it self-heals if
+    // the aggregate is ever repaired -- a model_stats change never requeues a listing, so tier 3
+    // is the only way back -- but only this reason says which one you are looking at.
+    //
+    // A negative total also cannot produce a false DEAL (the right-hand side goes negative while
+    // the left stays non-negative), but without this branch it yields NOT_DEAL / COMPLETE, which
+    // marks a listing "not a deal" forever on the strength of drifted data and never looks again.
+    if (total !== null && (!Number.isSafeInteger(total) || total < 0)) {
       return {
         verdict: "NEEDS_REVIEW",
         status: "NEEDS_REVIEW",
@@ -163,16 +181,17 @@ export const decide = (
       };
     }
 
-    // `total < 0` mirrors the `count < MINIMUM_REFERENCE_COUNT` term. Both are only reachable if
-    // the 3C ledger has drifted, and neither can produce a false DEAL -- but without this term a
-    // negative total yields NOT_DEAL / COMPLETE, which permanently marks a listing "not a deal"
-    // on the strength of corrupt data and never re-examines it. Parking it is the honest answer.
+    // A negative COUNT deliberately stays here rather than joining the branch above, and the
+    // asymmetry is real rather than an oversight: for `count`, "corrupt" and "too few" are the
+    // same predicate with the same answer -- wait for more observations -- and
+    // `count < MINIMUM_REFERENCE_COUNT` is already that test, which -1 trips exactly as 0 and 4
+    // do. For `total` they are not the same: a corrupt total is not "too small", it is unusable,
+    // and no number of further observations is guaranteed to repair it.
     if (
       count === null ||
       total === null ||
       !Number.isSafeInteger(count) ||
-      count < MINIMUM_REFERENCE_COUNT ||
-      total < 0
+      count < MINIMUM_REFERENCE_COUNT
     ) {
       return { verdict: "NEEDS_REVIEW", status: "NEEDS_REVIEW", reason: "insufficient-evidence" };
     }

@@ -21,11 +21,21 @@ export type EvaluationReason =
   | "above-maximum-price"
   | "insufficient-evidence"
   /**
-   * The aggregate itself is malformed: a `total_price_cents` that is not a safe integer. Its own
-   * reason, not `insufficient-evidence`, because the two need different responses -- more
-   * observations fix thin evidence, and nothing fixes a corrupt total on its own. Every candidate
-   * in that model parks at NEEDS_REVIEW and rotates in tier 3 until the aggregate is repaired, so
-   * this reason is the only signal that a model is stuck rather than merely young.
+   * The aggregate itself is corrupt: a `total_price_cents` that is not a safe integer, or one
+   * below zero.
+   *
+   * NOT REACHABLE FROM 3C AS WRITTEN, and the comment says so on purpose. `recordSightings` gates
+   * every contribution on `Number.isSafeInteger(priceCents)`, so a non-integer price reaches
+   * `listings` but never `price_observations` or `model_stats` -- the canonical `19.99 * 100`
+   * artifact is stored as a listing and simply never contributes. This is defence in depth against
+   * the drift 3C's own doc anticipates between the observation ledger and the aggregate, not a
+   * live hazard. The column's INTEGER affinity would permit it; the only writer does not.
+   *
+   * It is separate from `insufficient-evidence` because the two need different responses -- more
+   * observations cure thin evidence, nothing cures a corrupt aggregate on its own -- and every
+   * candidate in that model parks at NEEDS_REVIEW and rotates in tier 3 until it is repaired.
+   * Note the signal lives in the returned `EvaluationReport` only: 3D persists `verdict`, not
+   * `reason`, so a stuck model is visible to the caller of the batch, not in `evaluation_tasks`.
    */
   | "invalid-reference-total"
   | "no-price"
