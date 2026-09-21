@@ -14,6 +14,20 @@ export default defineConfig({
     },
   },
   test: {
+    // The heaviest tests -- runCleanup R2/R7, cleanupWorkflow H1 -- seed tens of groups and run
+    // full cleanup passes against miniflare D1. Measured on this machine: R2 takes ~1.5s and R7
+    // ~1.8s for a single suite, but ~3.2s when three suites run concurrently, which is what
+    // happens when several agents verify at once. Against vitest's 5s default that is a 1.6x
+    // margin, and it has crossed: `Error: Test timed out in 5000ms` at 5124ms, roughly 1 run in
+    // 20. Nothing was slow or wrong -- the clock ran out under load, and a timeout failure is
+    // indistinguishable from a real regression on a repo with no CI, where one local run is the
+    // whole verification.
+    //
+    // 15s restores a ~8x margin on the slowest test. The cost: a genuinely hung test now takes
+    // 15s to surface instead of 5s. Accepted -- only the hung test waits, and 5s was never a
+    // deliberate performance assertion about these tests, just the default they happened to sit
+    // near.
+    testTimeout: 15_000,
     environment: "jsdom",
     globals: true,
     setupFiles: "./src/test/setup.ts",
