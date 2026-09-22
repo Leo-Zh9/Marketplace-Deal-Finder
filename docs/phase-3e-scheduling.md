@@ -225,9 +225,19 @@ after both checks is editing the module constants, which is a code change under
 review.
 
 **How a wrong cutoff would be noticed.** There is no alerting — Phase 4 owns it, and
-telemetry is 3E-b's. Today: `CleanupRun` is the instance output, readable with
-`npx wrangler workflows instances describe marketplace-deal-finder-cleanup <id>`, and
-it carries `cutoff`, so a wrong cutoff is visible without a database query.
+telemetry is 3E-b's. Today: `CleanupRun` is the instance output, and it carries
+`cutoff`, so a wrong cutoff is visible without a database query — **but only with
+`--json`:**
+
+```bash
+npx wrangler workflows instances describe marketplace-deal-finder-cleanup <id> --json
+```
+
+**The default human-readable output does not show it.** That form prints each *step's*
+return value, and `cutoff` is on the *instance's*. Measured against the first production
+run: the plain output showed only the step's `CleanupReport` (`groups`,
+`observationsDeleted`, `usage`, …), while `--json` carried `output.cutoff`. Reaching for
+`describe` without `--json` therefore looks like the field is missing.
 `docs/phase-3c-storage.md`'s drift query is the operational check. **This is a manual
 detection path and this document does not pretend otherwise.**
 
@@ -243,6 +253,7 @@ statements, no code.
 | Workflows run locally | miniflare 5's `workflows` plugin; a real `WorkflowEntrypoint` ran, with the D1 the test process holds |
 | `scheduled()` drivable in-process | `(await mf.getWorker()).scheduled({ cron, scheduledTime })` → `{ outcome: "ok" }`, real `controller.cron` delivered |
 | Step durability | only the failing step re-runs, memoized **by name** — which is why step names are `cleanup-${index}` |
+| Step names in production | **decorated.** The code emits `cleanup-0`; the first production run reported `cleanup-0-1` — a suffix miniflare does not add. Harmless, because the requirement is only that names be *distinct per iteration*, and a suffix preserves that. It matters if anything ever matches on a step name: the local and production strings differ |
 | Default retry ladder | 6 body executions over ~31s; `CLEANUP_STEP_CONFIG` overrides it to 2 |
 | Per-instance step limit | 10,000 **(local** — miniflare's `DEFAULT_STEP_LIMIT`; Cloudflare's documented figure may be smaller, and `MAX_STEPS = 32` is far under either) |
 | `NonRetryableError` lives in | `cloudflare:workflows`, **not** `cloudflare:workers` |
@@ -254,6 +265,15 @@ statements, no code.
 *alpha* local runner, not production Workflows.** Step memoization, the retry ladder
 and the step limit are all local facts. Closing that would take a deploy to a staging
 Worker plus `wrangler workflows instances describe`.
+
+**One part of it is now closed, by production rather than by staging.** The first
+scheduled run (2026-09-21 17:00 UTC, one step, `Completed` in 1s against an empty
+database) confirmed the whole `scheduledTime` → `Math.floor(/1000)` → `cutoff` chain
+end to end: `cutoff` came back `1789405222`, which is **exactly** the scheduled instant
+minus `STALE_AFTER_SECONDS`. It also showed the queue timestamp running ~21s behind the
+scheduled one — the delivery delay this document already notes is subtracted from any
+lease, observed rather than reasoned. What is still local-only: memoization semantics,
+the retry ladder, and the step limit.
 
 It is acceptable because `runCleanup`'s correctness does not depend on step semantics.
 Idempotence lives in `cleanupStaleObservations`' SQL, which 3C measured against D1. If
