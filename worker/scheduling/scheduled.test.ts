@@ -36,6 +36,7 @@ const T_MONITOR = 1_710_000_000;
 interface DeployedConfig {
   triggers: { crons: string[] };
   workflows: Array<{ binding: string; class_name: string }>;
+  d1_databases: Array<{ binding: string; database_name: string }>;
 }
 
 const controller = (cron: string, scheduledTime: number): ScheduledController => ({
@@ -156,6 +157,10 @@ describe("the cleanup Cron handler", () => {
     expect(config.workflows.find((b) => b.binding === "CLEANUP_WORKFLOW")!.class_name).not.toBe(
       config.workflows.find((b) => b.binding === "MONITOR_WORKFLOW")!.class_name,
     );
+    // The D1 binding, by the same argument as the Workflow bindings above: nothing in
+    // TypeScript can see wrangler.jsonc, and a missing or renamed `DB` now also makes the
+    // settings endpoint 503 while /api/status still reports ok.
+    expect(config.d1_databases.find((bound) => bound.binding === "DB")).toBeDefined();
     expect(typeof entry.default.scheduled).toBe("function");
   });
 });

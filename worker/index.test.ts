@@ -1,7 +1,12 @@
 // @vitest-environment node
 
 import type { AuthDependencies } from "./auth/verifyFirebaseToken";
-import worker, { handleRequest, type Environment } from "./index";
+import worker, {
+  handleRequest,
+  preflightHeadersFor,
+  ROUTE_METHODS,
+  type Environment,
+} from "./index";
 import { createTokenFactory, type TokenClaims } from "./testing/firebaseTokens";
 
 const projectId = "deal-finder-test";
@@ -365,5 +370,276 @@ describe("protected Worker API", () => {
       phase: 2,
       authentication: "local-development",
     });
+  });
+});
+
+/**
+ * The mutating route widens a boundary that until now answered exactly one method. These
+ * tests are about the WIDTH of that widening, not about what the handler stores.
+ */
+describe("the mutating route's CORS and auth boundary", () => {
+  /** Any touch is a failure: auth and the origin check both run before the handler. */
+  const untouchableDb = () =>
+    ({
+      prepare: () => {
+        throw new Error("the database must not be reached");
+      },
+      batch: () => {
+        throw new Error("the database must not be reached");
+      },
+    }) as unknown as D1Database;
+
+  const preflight = (
+    path: string,
+    headers: Record<string, string>,
+    env: Environment = environment(),
+  ) => call(path, { method: "OPTIONS", headers: { Origin: pagesOrigin, ...headers } }, env);
+
+  it("W1: advertises GET, PUT and Content-Type on the settings path and nowhere else", async () => {
+    const settings = await preflight("/api/settings", {
+      "Access-Control-Request-Method": "PUT",
+      "Access-Control-Request-Headers": "authorization, content-type",
+    });
+
+    expect(settings.status).toBe(204);
+    expect(settings.headers.get("Access-Control-Allow-Origin")).toBe(pagesOrigin);
+    expect(settings.headers.get("Access-Control-Allow-Methods")).toBe("GET, PUT, OPTIONS");
+    expect(settings.headers.get("Access-Control-Allow-Headers")).toBe(
+      "Authorization, Accept, Content-Type",
+    );
+    expect(settings.headers.get("Access-Control-Allow-Credentials")).toBeNull();
+
+    const status = await preflight("/api/status", { "Access-Control-Request-Method": "GET" });
+    expect(status.status).toBe(204);
+    expect(status.headers.get("Access-Control-Allow-Methods")).toBe("GET, OPTIONS");
+    expect(status.headers.get("Access-Control-Allow-Headers")).toBe("Authorization, Accept");
+  });
+
+  it.each([
+    ["PUT on a read-only path", "/api/status", { "Access-Control-Request-Method": "PUT" }],
+    [
+      "PUT on the session path",
+      "/api/auth/session",
+      { "Access-Control-Request-Method": "PUT" },
+    ],
+    [
+      "Content-Type on a read-only path",
+      "/api/status",
+      {
+        "Access-Control-Request-Method": "GET",
+        "Access-Control-Request-Headers": "authorization, content-type",
+      },
+    ],
+    ["a method no route declares", "/api/settings", { "Access-Control-Request-Method": "DELETE" }],
+    ["POST on the settings path", "/api/settings", { "Access-Control-Request-Method": "POST" }],
+    [
+      "an unknown header on the settings path",
+      "/api/settings",
+      {
+        "Access-Control-Request-Method": "PUT",
+        "Access-Control-Request-Headers": "content-type, x-admin",
+      },
+    ],
+    ["an unrouted path", "/api/nope", { "Access-Control-Request-Method": "GET" }],
+    ["a cased spelling of a real path", "/api/Settings", { "Access-Control-Request-Method": "PUT" }],
+    ["no requested method at all", "/api/settings", {}],
+    ["a trailing slash", "/api/settings/", { "Access-Control-Request-Method": "PUT" }],
+  ])("W2: refuses a preflight for %s", async (_label, path, headers) => {
+    const response = await preflight(path, headers);
+
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "CORS_ORIGIN_DENIED" },
+    });
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
+    expect(response.headers.get("Access-Control-Allow-Methods")).toBeNull();
+  });
+
+  it("W3: every method the table NAMES is accepted exactly as advertised", async () => {
+    for (const path of ROUTE_METHODS.keys()) {
+      const methods = ROUTE_METHODS.get(path) ?? [];
+      const advertised = await preflight(path, {
+        "Access-Control-Request-Method": methods[0],
+      });
+      const headerList = advertised.headers.get("Access-Control-Allow-Headers") ?? "";
+      const tokens = (advertised.headers.get("Access-Control-Allow-Methods") ?? "").split(", ");
+
+      // OPTIONS is advertised for the browser's benefit and is THE ONE DECLARED EXCEPTION
+      // to "advertised == accepted": a preflight is never itself preflighted, so asking for
+      // the OPTIONS method is refused. Asserted here, not filtered out of the list -- a
+      // filter would be the test agreeing with itself about the one case that differs.
+      expect([path, tokens]).toEqual([path, [...methods, "OPTIONS"]]);
+      const itself = await preflight(path, { "Access-Control-Request-Method": "OPTIONS" });
+      expect([path, itself.status]).toEqual([path, 403]);
+
+      for (const method of methods) {
+        const echoed = await preflight(path, {
+          "Access-Control-Request-Method": method,
+          "Access-Control-Request-Headers": headerList,
+        });
+        expect([path, method, echoed.status]).toEqual([path, method, 204]);
+      }
+    }
+  });
+
+  it.each([
+    "https://other.pages.dev",
+    "https://deal-finder.pages.dev.evil.com",
+    "http://deal-finder.pages.dev",
+    "null",
+  ])("W4: refuses the evil origin %s on PUT and on its preflight", async (origin) => {
+    const env = environment({ DB: untouchableDb() });
+    const write = await call(
+      "/api/settings",
+      {
+        method: "PUT",
+        body: '{"mode":"DISCOUNT","minimumDiscountPercent":23.5}',
+        headers: {
+          Origin: origin,
+          Authorization: await bearerFor(),
+          "Content-Type": "application/json",
+        },
+      },
+      env,
+    );
+    const ahead = await call(
+      "/api/settings",
+      {
+        method: "OPTIONS",
+        headers: { Origin: origin, "Access-Control-Request-Method": "PUT" },
+      },
+      env,
+    );
+
+    for (const response of [write, ahead]) {
+      expect(response.status).toBe(403);
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: "CORS_ORIGIN_DENIED" },
+      });
+      expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
+    }
+  });
+
+  it.each([
+    ["no token", undefined, 401, "AUTH_TOKEN_MISSING"],
+    ["a token for an unapproved account", "stranger@example.com", 403, "AUTH_FORBIDDEN"],
+  ])("W5: refuses a PUT with %s before the database is reached", async (_l, email, status, code) => {
+    const response = await call(
+      "/api/settings",
+      {
+        method: "PUT",
+        body: '{"mode":"DISCOUNT","minimumDiscountPercent":23.5}',
+        headers: {
+          Origin: pagesOrigin,
+          "Content-Type": "application/json",
+          ...(email === undefined ? {} : { Authorization: await bearerFor({ email }) }),
+        },
+      },
+      environment({ DB: untouchableDb() }),
+    );
+
+    expect(response.status).toBe(status);
+    await expect(response.json()).resolves.toMatchObject({ error: { code } });
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe(pagesOrigin);
+  });
+
+  it.each([["GET"], ["PUT"]])(
+    "W6: reports a missing database binding as 503, not as a 404 or a throw",
+    async (method) => {
+      const response = await call("/api/settings", {
+        method,
+        headers: { Authorization: await bearerFor(), Origin: pagesOrigin },
+        ...(method === "PUT" ? { body: "{}" } : {}),
+      });
+
+      expect(response.status).toBe(503);
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: "DATABASE_UNAVAILABLE" },
+      });
+    },
+  );
+
+  it("W7: every method the route table advertises is actually routed", async () => {
+    for (const [path, methods] of ROUTE_METHODS) {
+      for (const method of methods) {
+        const response = await call(path, {
+          method,
+          headers: { Authorization: await bearerFor(), Origin: pagesOrigin },
+          ...(method === "PUT" ? { body: "{}" } : {}),
+        });
+        expect([path, method, response.status]).not.toEqual([path, method, 404]);
+      }
+    }
+  });
+
+  /**
+   * The table has three rows and only one of them is multi-method, so W1/W2/W3 cannot tell
+   * "Content-Type follows a body-bearing method" apart from "Content-Type follows any path
+   * with more than one method". This is the only test that can.
+   */
+  it.each([
+    [["GET"], false],
+    [["GET", "HEAD"], false],
+    [["GET", "OPTIONS"], false],
+    [["GET", "PUT"], true],
+    [["POST"], true],
+    [["PATCH"], true],
+    [["DELETE"], false],
+  ])("W9: Content-Type is offered to %s exactly when it takes a body", (methods, offered) => {
+    expect(preflightHeadersFor(methods).includes("Content-Type")).toBe(offered);
+  });
+
+  /**
+   * W7 proves every method the table ADVERTISES is routed. This is the converse on the PATH
+   * axis: every path the route block accepts must be in the table, spelled EXACTLY. Two
+   * mutants survived all 422 tests without it -- `.startsWith("/api/settings")`, under which
+   * `PUT /api/settings-evil` answers 200 and writes revision 0 while its own preflight still
+   * 403s (reachable but never advertised), and `.toLowerCase()`, which reopens at the route
+   * the cased spelling W2 already refuses at the preflight.
+   *
+   * The database throws on contact, so a spelling that reaches the handler cannot answer 404:
+   * it lands on 503, 400 or 200 instead, and every one of those fails this test.
+   */
+  it.each([
+    ["a trailing slash", "/api/settings/"],
+    ["a cased spelling", "/api/Settings"],
+    ["a longer path with the same prefix", "/api/settings-evil"],
+    ["a sub-path", "/api/settings/extra"],
+  ])("W10: %s is not the settings route, on GET or on PUT", async (_label, path) => {
+    const env = environment({ DB: untouchableDb() });
+    const read = await call(
+      path,
+      { headers: { Authorization: await bearerFor(), Origin: pagesOrigin } },
+      env,
+    );
+    const write = await call(
+      path,
+      {
+        method: "PUT",
+        body: '{"mode":"DISCOUNT","minimumDiscountPercent":11.75}',
+        headers: {
+          Authorization: await bearerFor(),
+          Origin: pagesOrigin,
+          "Content-Type": "application/json",
+        },
+      },
+      env,
+    );
+
+    for (const response of [read, write]) {
+      expect(response.status).toBe(404);
+      await expect(response.json()).resolves.toMatchObject({ error: { code: "NOT_FOUND" } });
+    }
+  });
+
+  it("W8: a method no route declares is a 404, and the preflight never let it through", async () => {
+    const response = await call("/api/settings", {
+      method: "POST",
+      body: "{}",
+      headers: { Authorization: await bearerFor(), Origin: pagesOrigin },
+    });
+
+    expect(response.status).toBe(404);
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "NOT_FOUND" } });
   });
 });

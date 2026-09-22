@@ -4,14 +4,19 @@ import {
   type AuthDependencies,
   type WorkerEnvironment,
 } from "./auth/verifyFirebaseToken";
+import { handleGetSettings, handlePutSettings } from "./api/settings";
 import { handleScheduled, type ScheduledEnvironment } from "./scheduling/scheduled";
 
 /**
- * NOT WIDENED to include DB or CLEANUP_WORKFLOW. `Environment` is the request path's
- * environment, and `worker/index.test.ts` builds literals of it. The scheduled path names
- * its own `ScheduledEnvironment`; the runtime hands both the same object.
+ * Widened by exactly one member, and that member is OPTIONAL. `Environment` is the request
+ * path's environment and `worker/index.test.ts` builds 16 literals of it, so a required `DB`
+ * would break all of them on typecheck; `DB?` is what lets the settings route read a binding
+ * without touching a single merged literal, and it is why a MISSING binding is a runtime 503
+ * (`DATABASE_UNAVAILABLE`, pinned by W6) rather than a compile error. `CLEANUP_WORKFLOW` and
+ * `MONITOR_WORKFLOW` stay OUT: the scheduled path names its own `ScheduledEnvironment`, and
+ * the runtime hands both the same object.
  */
-export type Environment = WorkerEnvironment;
+export type Environment = WorkerEnvironment & { DB?: D1Database };
 
 /**
  * wrangler binds a Workflow to a class exported FROM THE MAIN ENTRY, so this re-export is
@@ -31,8 +36,28 @@ const securityHeaders = {
   "X-Frame-Options": "DENY",
 };
 
-const ALLOWED_PREFLIGHT_METHOD = "GET";
-const ALLOWED_PREFLIGHT_HEADERS = new Set(["authorization", "accept"]);
+/**
+ * THE ADVERTISED SURFACE IS THIS TABLE, and it is scoped BY PATH.
+ */
+export const ROUTE_METHODS = new Map<string, readonly string[]>([
+  ["/api/auth/session", ["GET"]],
+  ["/api/status", ["GET"]],
+  ["/api/settings", ["GET", "PUT"]],
+]);
+
+const BODY_METHODS = new Set(["PUT", "POST", "PATCH"]);
+const BASE_PREFLIGHT_HEADERS = ["Authorization", "Accept"] as const;
+const BODY_PREFLIGHT_HEADERS = ["Content-Type"] as const;
+
+/**
+ * Content-Type is offered to a path IF AND ONLY IF that path declares a body-bearing
+ * method. Exported so the rule can be tested over method sets the table does not yet
+ * contain -- three rows cannot tell this rule apart from `methods.length > 1`.
+ */
+export const preflightHeadersFor = (methods: readonly string[]): readonly string[] =>
+  methods.some((method) => BODY_METHODS.has(method))
+    ? [...BASE_PREFLIGHT_HEADERS, ...BODY_PREFLIGHT_HEADERS]
+    : BASE_PREFLIGHT_HEADERS;
 
 const errorMessages: Record<string, string> = {
   AUTH_TOKEN_MISSING: "Authentication is required.",
@@ -43,6 +68,13 @@ const errorMessages: Record<string, string> = {
   AUTH_CONFIG_INVALID: "The service configuration is not usable.",
   AUTH_KEYS_UNAVAILABLE: "Identity verification is temporarily unavailable.",
   NOT_FOUND: "Not found.",
+  DATABASE_UNAVAILABLE: "The database is not configured.",
+  SETTINGS_STORAGE_FAILED: "The settings could not be read or written.",
+  UNSUPPORTED_MEDIA_TYPE: "The request body must be application/json.",
+  PAYLOAD_TOO_LARGE: "The request body is too large.",
+  INVALID_JSON: "The request body is not a JSON object.",
+  INVALID_SETTINGS: "The settings in the request are not valid.",
+  SETTINGS_FIELD_UNSUPPORTED: "The request contains fields this API cannot store.",
 };
 
 type ExtraHeaders = Record<string, string>;
@@ -57,8 +89,12 @@ const json = (body: unknown, status: number, extra: ExtraHeaders = {}) =>
     },
   });
 
-const errorResponse = (code: string, status: number, extra: ExtraHeaders = {}) =>
-  json({ error: { code, message: errorMessages[code] } }, status, extra);
+const errorResponse = (
+  code: string,
+  status: number,
+  extra: ExtraHeaders = {},
+  details: Record<string, unknown> = {},
+) => json({ error: { ...details, code, message: errorMessages[code] } }, status, extra);
 
 const readAllowedOrigins = (
   environment: Environment,
@@ -132,16 +168,29 @@ export const handleRequest = async (
     if (allowedOrigin === null) {
       return errorResponse("CORS_ORIGIN_DENIED", 403, { Vary: "Origin" });
     }
-    if (request.headers.get("Access-Control-Request-Method") !== ALLOWED_PREFLIGHT_METHOD) {
+    // PATH-SCOPED. A global allowance would let /api/status advertise PUT the moment
+    // /api/settings needed it, and every future GET-only route would inherit a
+    // browser-usable mutating channel it never asked for.
+    const methods = ROUTE_METHODS.get(url.pathname);
+    if (methods === undefined) {
       return errorResponse("CORS_ORIGIN_DENIED", 403, { Vary: "Origin" });
     }
+    if (!methods.includes(request.headers.get("Access-Control-Request-Method") ?? "")) {
+      return errorResponse("CORS_ORIGIN_DENIED", 403, { Vary: "Origin" });
+    }
+
+    // ONE list feeds both the enforcement set and the advertised string, so what the
+    // preflight accepts and what it advertises cannot drift. Content-Type is added only for
+    // a path that actually takes a body.
+    const headerNames = preflightHeadersFor(methods);
+    const allowedHeaders = new Set(headerNames.map((name) => name.toLowerCase()));
 
     const requestedHeaders = request.headers.get("Access-Control-Request-Headers") ?? "";
     const requested = requestedHeaders
       .split(",")
       .map((name) => name.trim().toLowerCase())
       .filter((name) => name !== "");
-    if (requested.some((name) => !ALLOWED_PREFLIGHT_HEADERS.has(name))) {
+    if (requested.some((name) => !allowedHeaders.has(name))) {
       return errorResponse("CORS_ORIGIN_DENIED", 403, { Vary: "Origin" });
     }
 
@@ -151,8 +200,8 @@ export const handleRequest = async (
         ...securityHeaders,
         "Access-Control-Allow-Origin": allowedOrigin,
         Vary: "Origin",
-        "Access-Control-Allow-Methods": "GET, OPTIONS",
-        "Access-Control-Allow-Headers": "Authorization, Accept",
+        "Access-Control-Allow-Methods": [...methods, "OPTIONS"].join(", "),
+        "Access-Control-Allow-Headers": headerNames.join(", "),
         "Access-Control-Max-Age": "600",
       },
     });
@@ -182,6 +231,27 @@ export const handleRequest = async (
       200,
       cors,
     );
+  }
+
+  if (
+    url.pathname === "/api/settings" &&
+    (request.method === "GET" || request.method === "PUT")
+  ) {
+    const db = environment.DB;
+    if (db === undefined) return errorResponse("DATABASE_UNAVAILABLE", 503, cors);
+
+    const result =
+      request.method === "GET"
+        ? await handleGetSettings(db)
+        : await handlePutSettings(
+            request,
+            db,
+            dependencies?.now() ?? Math.floor(Date.now() / 1000),
+          );
+
+    return result.ok
+      ? json(result.body, result.status, cors)
+      : errorResponse(result.code, result.status, cors, result.details);
   }
 
   return errorResponse("NOT_FOUND", 404, cors);

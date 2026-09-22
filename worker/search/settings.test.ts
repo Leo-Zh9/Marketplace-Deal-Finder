@@ -114,7 +114,7 @@ describe("search settings", () => {
 
     // A mode must carry the column it needs. `updateSearchSettings` can never write one of
     // these (T4 proves it validates first), but it is not the only writer: the documented
-    // bootstrap is a hand-written `wrangler d1 execute` and it is the only way to create
+    // bootstrap is a hand-written `wrangler d1 execute` and it is still the way to create
     // revision 0 today. Each row below satisfies every OTHER constraint in the table.
     for (const inconsistent of [
       "INSERT INTO search_revisions VALUES (1,'DISCOUNT',NULL,NULL,1)",

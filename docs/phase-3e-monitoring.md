@@ -237,8 +237,11 @@ npx wrangler deploy --dry-run
 npm run db:migrate
 
 # 3. Bootstrap revision 0 BEFORE enabling the cron, or every run records NO_SETTINGS.
-#    There is no settings endpoint until Phase 5; this hand-written statement is the only
-#    way to create a revision, and 0003's CHECKs are what stop it creating a bad one.
+#    Phase 5A ships PUT /api/settings, but it needs a signed-in Firebase identity that only
+#    5D's form produces, so this hand-written statement remains the bootstrap, and 0003's
+#    CHECKs are what stop it creating a bad one -- see docs/phase-5a-settings-api.md for the
+#    one value class they do NOT stop (a maximum_price_cents that fails Number.isSafeInteger
+#    jams every later PUT) and its one-statement repair.
 npx wrangler d1 execute marketplace-deal-finder-db --remote --command \
   "INSERT INTO search_revisions VALUES (0,'MAXIMUM_PRICE',NULL,60000,unixepoch()); \
    INSERT INTO search_settings VALUES (1,0);"
