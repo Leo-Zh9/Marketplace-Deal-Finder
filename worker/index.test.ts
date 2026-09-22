@@ -589,6 +589,49 @@ describe("the mutating route's CORS and auth boundary", () => {
     expect(preflightHeadersFor(methods).includes("Content-Type")).toBe(offered);
   });
 
+  /**
+   * W7 proves every method the table ADVERTISES is routed. This is the converse on the PATH
+   * axis: every path the route block accepts must be in the table, spelled EXACTLY. Two
+   * mutants survived all 422 tests without it -- `.startsWith("/api/settings")`, under which
+   * `PUT /api/settings-evil` answers 200 and writes revision 0 while its own preflight still
+   * 403s (reachable but never advertised), and `.toLowerCase()`, which reopens at the route
+   * the cased spelling W2 already refuses at the preflight.
+   *
+   * The database throws on contact, so a spelling that reaches the handler cannot answer 404:
+   * it lands on 503, 400 or 200 instead, and every one of those fails this test.
+   */
+  it.each([
+    ["a trailing slash", "/api/settings/"],
+    ["a cased spelling", "/api/Settings"],
+    ["a longer path with the same prefix", "/api/settings-evil"],
+    ["a sub-path", "/api/settings/extra"],
+  ])("W10: %s is not the settings route, on GET or on PUT", async (_label, path) => {
+    const env = environment({ DB: untouchableDb() });
+    const read = await call(
+      path,
+      { headers: { Authorization: await bearerFor(), Origin: pagesOrigin } },
+      env,
+    );
+    const write = await call(
+      path,
+      {
+        method: "PUT",
+        body: '{"mode":"DISCOUNT","minimumDiscountPercent":11.75}',
+        headers: {
+          Authorization: await bearerFor(),
+          Origin: pagesOrigin,
+          "Content-Type": "application/json",
+        },
+      },
+      env,
+    );
+
+    for (const response of [read, write]) {
+      expect(response.status).toBe(404);
+      await expect(response.json()).resolves.toMatchObject({ error: { code: "NOT_FOUND" } });
+    }
+  });
+
   it("W8: a method no route declares is a 404, and the preflight never let it through", async () => {
     const response = await call("/api/settings", {
       method: "POST",

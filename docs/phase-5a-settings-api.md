@@ -136,15 +136,23 @@ INSERT INTO search_revisions VALUES (0,'MAXIMUM_PRICE',NULL,60000.5,1);
 fails — in **every** mode; a mode change does not escape it — while `GET` cheerfully returns 200
 with the corrupt value.
 
-**The exhaustive condition is `Number.isSafeInteger`, not "fractional".** MEASURED, all three:
+**The exhaustive condition is `Number.isSafeInteger`, not "fractional".** MEASURED, all four:
 
-| written literal | stored `typeof()` | stored value | a later valid `PUT` |
-|---|---|---|---|
-| `60000.0` | `integer` | `60000` | **200** |
-| `60000.5` | `real` | `60000.5` | **503** |
-| `9007199254740993.0` | `integer` | `9007199254740992` (silently rounded) | **503** |
+| written literal | stored `typeof()` | stored value | `GET` | a later valid `PUT` |
+|---|---|---|---|---|
+| `60000.0` | `integer` | `60000` | 200, `60000` | **200** |
+| `60000.5` | `real` | `60000.5` | 200, `60000.5` | **503** |
+| `9007199254740993.0` | `integer` | `9007199254740992` (silently rounded) | 200, that value | **503** |
+| `'abc'` | `text` | `"abc"` | 200, **`"abc"`** | **503** |
 
-A magnitude past 2^53 stores with integer type and still jams. **Repair — one statement:**
+A magnitude past 2^53 stores with integer type and still jams. A **TEXT** value gets through as
+well, because the column's only CHECK is a lower bound and SQLite orders text above every number,
+so `'abc' >= 0` is true — and then `GET` returns `maximumPriceCents: "abc"`, a string where the
+contract says `number | null`. There is **no symmetric jam on `minimum_discount_percent`**, and
+the reason is the constraint rather than luck: that column's CHECK carries an upper bound too
+(`<= 100`), which the same type ordering makes false, so a TEXT percent is refused at INSERT.
+
+**Repair — one statement:**
 
 ```sql
 UPDATE search_revisions SET maximum_price_cents = <integer> WHERE revision = <n>;
@@ -175,8 +183,17 @@ deliberately does not touch.
   Eligibility in `evaluateBatch` is `evaluated_revision IS NULL OR < ?5 OR > ?5`, so tasks stamped
   at the abandoned higher revision are re-opened by the `> ?5` term exactly as a forward bump
   re-opens them. No evaluation history is destroyed either way.
-- **Close the endpoint alone:** delete the `/api/settings` row from `ROUTE_METHODS` and the
-  routing block. The preflight and the route close together because they read the same table.
+- **Close the endpoint alone — BOTH edits are required.** Delete the `/api/settings` row from
+  `ROUTE_METHODS` **and** delete the routing block in `worker/index.ts`. They are two separate
+  reads: the routing block matches `url.pathname` directly and never consults `ROUTE_METHODS`, so
+  deleting the table row alone closes only the **preflight** and leaves `PUT /api/settings` fully
+  open to every non-browser client. What keeps the two in step is the test suite, not the code:
+  `W7` fails if the table advertises a method the router does not serve, and `W10` fails if the
+  router serves a path the table does not name.
+- **A closed CORS grant lingers in browsers.** The preflight replies
+  `Access-Control-Max-Age: 600`, so a browser that cached the old grant can keep using it for up
+  to ten minutes after the deploy. That is the reason the value is 600 and not a day; a rollback
+  is not instant for an already-warm browser, and only the server-side close is.
 - **Repair a jammed row:** the `UPDATE` above.
 
 ## Note for 5D (the settings form)
@@ -188,7 +205,9 @@ deliberately does not touch.
   the caller's own key names verbatim, by design — that is what makes the refusal legible — and
   it is not sanitised here.
 - Send exactly the three supported keys. Anything else is refused by name, not dropped.
-- **Debounce the save, and treat a 503 on `PUT` as safe to retry** — a double-clicked save is the
-  concurrent-write case above, and the retry is idempotent (`changed: false`).
+- **Debounce the save. A 503 on `PUT` is always safe to retry, but it is not always effective:**
+  under occupant (3) the retry succeeds and is idempotent (`changed: false`), and under occupant
+  (2) — the permanent jam — it will fail identically forever, so a retry loop must be bounded and
+  must surface the failure to the operator rather than spin.
 - The `PUT` response is the authority on what is stored. Render it; do not render the form state
   back to the user as if it had been saved.

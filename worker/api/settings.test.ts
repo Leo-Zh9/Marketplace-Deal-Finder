@@ -473,4 +473,124 @@ describe("the settings API", () => {
       expect(response.headers.get("Access-Control-Allow-Origin")).toBe(appOrigin);
     }
   });
+  /**
+   * THE ONLY REJECTABLE AWAIT ON THE REQUEST PATH. `await request.text()` rejects when a
+   * client disconnects mid-PUT or the body stream errors. Unwrapped it throws OUT of
+   * handleRequest, and the runtime's bare 500 carries none of securityHeaders, no Vary, no
+   * Access-Control-Allow-Origin and no error envelope -- the single reply that could escape
+   * the guarantee settings.ts' header comment calls structural. This test asserts a RETURNED
+   * Response, which is the property that guarantee is about, not merely a status code.
+   */
+  it("A15: a body stream that errors mid-upload is answered, not thrown out of", async () => {
+    const torn = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"mode":"DIS'));
+        controller.error(new Error("the client went away"));
+      },
+    });
+    const request = new Request(`${workerOrigin}/api/settings`, {
+      method: "PUT",
+      body: torn,
+      duplex: "half",
+      headers: {
+        Authorization: authorization,
+        Origin: appOrigin,
+        "Content-Type": "application/json",
+      },
+    } as RequestInit & { duplex: string });
+
+    const response = await handleRequest(request, environment(), dependencies);
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "INVALID_JSON" } });
+    // The envelope the throw would have skipped, asserted piece by piece.
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe(appOrigin);
+    expect(response.headers.get("Vary")).toBe("Origin");
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff");
+    expect(await revisionRows()).toEqual([]);
+  });
+
+  /**
+   * ORDER IS THE CONTRACT, AND EACH ROW CROSSES TWO AXES TO PIN IT. Every oversized body in
+   * A9 is well-formed, every wrong-type body in A7 is small, and A11's rows carry no extra
+   * fields -- so each check landed on the same status whichever order it ran in, and four
+   * independent reorderings survived all 422 tests. A row here fails the moment its two
+   * checks swap: the request has BOTH faults and only the earlier check's answer is correct.
+   */
+  it.each([
+    [
+      "a body that is both oversized and malformed is refused for its SIZE",
+      "application/json",
+      `{${"x".repeat(5400)}`,
+      413,
+      "PAYLOAD_TOO_LARGE",
+    ],
+    [
+      "a body that is both oversized and the wrong type is refused for its TYPE",
+      "text/plain",
+      "z".repeat(9000),
+      415,
+      "UNSUPPORTED_MEDIA_TYPE",
+    ],
+  ])("A16: %s", async (_label, contentType, body, status, code) => {
+    const response = await put(body, { "Content-Type": contentType });
+
+    expect(response.status).toBe(status);
+    await expect(response.json()).resolves.toMatchObject({ error: { code } });
+    expect(await revisionRows()).toEqual([]);
+  });
+
+  it("A16: an unsupported field is named even when the rest of the body is invalid too", async () => {
+    // RULING 1 IS WHAT THIS PROTECTS -- "refused by name, never dropped" is the thing the doc
+    // tells 5D to render. Moving the field refusal below the shape checks turns this into a
+    // bare INVALID_SETTINGS with no field names, and nothing else in the suite notices,
+    // because A5 and A6 always send an otherwise-valid body.
+    const response = await put(JSON.stringify({ mode: "WISHFUL", radiusKm: 25 }));
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({
+      error: {
+        fields: ["radiusKm"],
+        code: "SETTINGS_FIELD_UNSUPPORTED",
+        message: "The request contains fields this API cannot store.",
+      },
+    });
+    expect(await revisionRows()).toEqual([]);
+  });
+
+  it("A17: an oversized DECLARED length is refused before the body is read", async () => {
+    // The declared and measured checks answer the SAME status, so only this distinguishes
+    // their order: `bodyUsed` is the observable difference between refusing on the header and
+    // refusing after pulling the body into the isolate -- the property the constant's own
+    // comment claims. The control below is what stops `bodyUsed: false` being a vacuous pass.
+    const lying = new Request(`${workerOrigin}/api/settings`, {
+      method: "PUT",
+      body: JSON.stringify(FIRST),
+      headers: {
+        Authorization: authorization,
+        Origin: appOrigin,
+        "Content-Type": "application/json",
+        "Content-Length": String(MAX_SETTINGS_BODY_BYTES + 1),
+      },
+    });
+    const refused = await handleRequest(lying, environment(), dependencies);
+
+    expect(refused.status).toBe(413);
+    expect(lying.bodyUsed).toBe(false);
+
+    const honest = new Request(`${workerOrigin}/api/settings`, {
+      method: "PUT",
+      body: JSON.stringify(FIRST),
+      headers: {
+        Authorization: authorization,
+        Origin: appOrigin,
+        "Content-Type": "application/json",
+      },
+    });
+    const accepted = await handleRequest(honest, environment(), dependencies);
+
+    expect(accepted.status).toBe(200);
+    expect(honest.bodyUsed).toBe(true);
+  });
 });

@@ -78,7 +78,19 @@ export const handlePutSettings = async (
   }
 
   // The MEASURED size. Content-Length is a claim: absent on a chunked body, and a lie is free.
-  const raw = await request.text();
+  //
+  // THE TRY/CATCH IS WHAT KEEPS THE HEADER COMMENT TRUE. This is the only REJECTABLE await on
+  // the request path in this Worker: a client that disconnects mid-PUT, or any body-stream
+  // error, rejects here. Unwrapped, it throws out of handleRequest and the runtime answers a
+  // bare 500 carrying none of securityHeaders, no Vary, no Access-Control-Allow-Origin and no
+  // error envelope -- the one reply that could escape the guarantee this module claims to
+  // enforce structurally. A truncated body is not a JSON object, so it is reported as one.
+  let raw: string;
+  try {
+    raw = await request.text();
+  } catch {
+    return fail(400, "INVALID_JSON");
+  }
   if (new TextEncoder().encode(raw).byteLength > MAX_SETTINGS_BODY_BYTES) {
     return fail(413, "PAYLOAD_TOO_LARGE");
   }
@@ -146,7 +158,9 @@ export const handlePutSettings = async (
   //     ROW before comparing, so the jam fires exactly when the stored value fails
   //     `Number.isSafeInteger` -- not merely when it is fractional. MEASURED, both halves:
   //     60000.5 stores as typeof 'real' and jams; 9007199254740993.0 stores as typeof
-  //     'integer', is SILENTLY ROUNDED to 9007199254740992, and jams too; 60000.0 stores as
+  //     'integer', is SILENTLY ROUNDED to 9007199254740992, and jams too; 'abc' stores as
+  //     typeof 'text' (the column's only CHECK is a lower bound and SQLite orders text above
+  //     every number) and jams while GET hands the caller a STRING; 60000.0 stores as
   //     typeof 'integer' and does NOT jam. Once jammed, every subsequent PUT lands here, in
   //     EVERY mode -- a mode change does not escape it -- while GET happily returns 200 with
   //     the corrupt value. No new error code for it: the state is unreachable through this API

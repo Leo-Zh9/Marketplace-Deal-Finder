@@ -8,9 +8,13 @@ import { handleGetSettings, handlePutSettings } from "./api/settings";
 import { handleScheduled, type ScheduledEnvironment } from "./scheduling/scheduled";
 
 /**
- * NOT WIDENED to include DB or CLEANUP_WORKFLOW. `Environment` is the request path's
- * environment, and `worker/index.test.ts` builds literals of it. The scheduled path names
- * its own `ScheduledEnvironment`; the runtime hands both the same object.
+ * Widened by exactly one member, and that member is OPTIONAL. `Environment` is the request
+ * path's environment and `worker/index.test.ts` builds 16 literals of it, so a required `DB`
+ * would break all of them on typecheck; `DB?` is what lets the settings route read a binding
+ * without touching a single merged literal, and it is why a MISSING binding is a runtime 503
+ * (`DATABASE_UNAVAILABLE`, pinned by W6) rather than a compile error. `CLEANUP_WORKFLOW` and
+ * `MONITOR_WORKFLOW` stay OUT: the scheduled path names its own `ScheduledEnvironment`, and
+ * the runtime hands both the same object.
  */
 export type Environment = WorkerEnvironment & { DB?: D1Database };
 
