@@ -12,6 +12,7 @@
     "lint": "eslint .",
     "test": "vitest run",
     "test:watch": "vitest",
+    "e2e:local": "./scripts/e2e-local.sh --serve",
     "preview": "vite preview",
     "db:migrate:local": "wrangler d1 migrations apply marketplace-deal-finder-db --local",
     "db:migrate": "wrangler d1 migrations apply marketplace-deal-finder-db --remote",
