@@ -963,11 +963,13 @@ describe("the ingest route's credential boundary", () => {
   );
 
   /**
-   * THE REAL DATABASE IS BOUND HERE ON PURPOSE. With `untouchableDb()` the row count is 0 on
-   * every path, mutated or not -- an assertion satisfiable by an empty input, which is exactly
-   * the shape this project's brief flags. Bound to the real one, wiring the collector header
-   * into the Firebase path (or removing the ingest branch's own check) writes a row and the
-   * count goes to 1.
+   * THE REAL DATABASE IS BOUND HERE ON PURPOSE -- but this buys LEGIBILITY, NOT KILL-POWER, and
+   * saying so is the point. With `untouchableDb()` the row count was 0 on every path, mutated or
+   * not: an assertion satisfiable by an empty input, the shape this project's brief flags.
+   * MEASURED, however, that the status assertion below already caught every mutation this one
+   * does -- no path can both write a row and answer 401. What changed is which failure the run
+   * reports: "a row was written" rather than the weaker "the status was wrong". The count is
+   * asserted FIRST so that it is the one that fires.
    */
   it("X10: an approved Firebase identity does not open the ingest route", async () => {
     const response = await ingest(

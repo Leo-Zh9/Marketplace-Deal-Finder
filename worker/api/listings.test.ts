@@ -265,6 +265,12 @@ describe("POST /api/listings", () => {
     ["a javascript url", { url: "javascript:alert(1)" }, "listings[0].url"],
     ["not a url at all", { url: "not a url" }, "listings[0].url"],
     ["url 513 characters", { url: `https://e.invalid/${"u".repeat(513 - 18)}` }, "listings[0].url"],
+    // `url` WAS THE ONE REQUIRED FIELD WHOSE MISSING AND EMPTY BRANCHES NOTHING PINNED. The
+    // shipped code refuses both, but `listings.url` is TEXT NOT NULL, so "" satisfies the
+    // column: a regression here would STORE a listing with an empty url and render it as a
+    // link, invisibly. Same shape as the null-price defect, on the field the table skipped.
+    ["url missing", { url: undefined }, "listings[0].url"],
+    ["url empty", { url: "" }, "listings[0].url"],
     ["a numeric locationText", { locationText: 123 }, "listings[0].locationText"],
     ["a numeric priceText", { priceText: 123 }, "listings[0].priceText"],
     ["priceText 33 characters", { priceText: "C".repeat(33) }, "listings[0].priceText"],
@@ -562,6 +568,11 @@ describe("POST /api/listings", () => {
    * largest legal 100-listing ASCII batch is ~110 KB and cannot be padded to exactly 128 KiB
    * without breaking a per-field bound, so the cap itself is unreachable from a real payload.
    * `readBoundedBody` takes the cap as an argument precisely so it can be pinned directly.
+   *
+   * IT IS NARROWER THAN THE SHIPPED PATH, deliberately: it pins the COMPARISON at a 777-byte
+   * cap, not that `handlePostListings` passes the real constant. That half is L8a-L8d's --
+   * MEASURED that doubling the cap at the call site kills L8b and L8d. Between them the shipped
+   * behaviour is covered; neither alone covers it.
    */
   it("L8e: a body of exactly the cap is accepted and one byte more is not", async () => {
     const cap = 777;
