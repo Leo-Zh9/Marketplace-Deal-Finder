@@ -31,4 +31,12 @@ export default tseslint.config(
       globals: globals.serviceworker,
     },
   },
+  // The collector runs under Node on the operator's machine, not in a Worker isolate: it is the
+  // only directory here that legitimately reads `process` and writes to the console.
+  {
+    files: ["collector/**/*.ts"],
+    languageOptions: {
+      globals: globals.node,
+    },
+  },
 );

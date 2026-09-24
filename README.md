@@ -31,8 +31,8 @@ npm install
 npm run check
 ```
 
-`npm run check` is lint → unit tests → build → worker typecheck. It is offline, needs no
-configuration, and is the gate every change has to pass.
+`npm run check` is lint → unit tests → build → worker typecheck → collector typecheck. It is
+offline, needs no configuration, and is the gate every change has to pass.
 
 ---
 
@@ -109,14 +109,37 @@ as a `VITE_*` value — those are compiled into the browser bundle.
 
 ---
 
+## Collection runs on your machine, not on Cloudflare
+
+Everything in this project runs on Cloudflare **except the fetch**. Measured with identical code
+from two egress points one minute apart, Facebook Marketplace returns 10 listings to a
+residential IP and **0 listings plus a login wall — at HTTP 200 — to Cloudflare**. A VPS is the
+same class of address. So a small Node collector runs on the operator's machine and posts
+batches to `POST /api/listings`:
+
+```bash
+npm run collect     # see docs/collector-ingest.md for the environment it needs
+```
+
+It is a one-shot process: one request to the source, one POST, then it exits. The route is
+guarded by a Worker secret, `COLLECTOR_TOKEN`, which is a **third** identity and reaches the
+ingest route and nothing else — `docs/collector-ingest.md` states exactly what a leak of it
+would allow. **Until that secret is set, the deployed route answers 503 and the branch is dead.**
+
+**Before changing the evaluation mode, read the warning in `docs/collector-ingest.md`:** until
+model normalization lands, `MAXIMUM_PRICE` makes the drain mark un-normalized listings — a free
+one included — as deals.
+
+---
+
 ## How it fits together
 
 ```
-collection (per source)  ->  storage  ->  running price aggregate
-                                              |
-                              scheduled monitoring run
-                                              |
-                                     evaluation -> verdict
+collector (your Mac)  ->  POST /api/listings  ->  storage  ->  running price aggregate
+                                                                    |
+                                                    scheduled monitoring run
+                                                                    |
+                                                           evaluation -> verdict
 ```
 
 Storage, pricing, evaluation and scheduling are **source-agnostic**: `source` is an
@@ -132,6 +155,7 @@ is a provider module, not a redesign.
 | `docs/phase-3e-scheduling.md` | the daily cleanup Workflow |
 | `docs/phase-3e-monitoring.md` | the monitoring run, the lock, telemetry, the runbook |
 | `docs/phase-5a-settings-api.md` | the settings API contract |
+| `docs/collector-ingest.md` | the collector, the ingest route and its credential |
 
 ---
 

@@ -7,6 +7,7 @@ import worker, {
   ROUTE_METHODS,
   type Environment,
 } from "./index";
+import { createTestDatabase, truncateAll, type TestDatabase } from "./testing/d1";
 import { createTokenFactory, type TokenClaims } from "./testing/firebaseTokens";
 
 const projectId = "deal-finder-test";
@@ -641,5 +642,347 @@ describe("the mutating route's CORS and auth boundary", () => {
 
     expect(response.status).toBe(404);
     await expect(response.json()).resolves.toMatchObject({ error: { code: "NOT_FOUND" } });
+  });
+});
+
+/**
+ * THE INGEST ROUTE'S CREDENTIAL BOUNDARY.
+ *
+ * `POST /api/listings` admits exactly one identity -- a bearer secret with no human behind it --
+ * and every other route admits exactly the two it admitted before. These tests are what enforce
+ * that the two sets are disjoint IN BOTH DIRECTIONS; the type split between `WorkerEnvironment`
+ * and `CollectorEnvironment` is a tripwire that catches the careless edit and nothing more.
+ */
+describe("the ingest route's credential boundary", () => {
+  const collectorToken = "index-suite-ingest-token-3ce70b48a91d";
+  const ingestPath = "/api/listings";
+
+  /** Any touch is a failure: the credential check runs before the handler. */
+  const untouchableDb = () =>
+    ({
+      prepare: () => {
+        throw new Error("the database must not be reached");
+      },
+      batch: () => {
+        throw new Error("the database must not be reached");
+      },
+    }) as unknown as D1Database;
+
+  let ingestDatabase!: TestDatabase;
+
+  beforeAll(async () => {
+    ingestDatabase = await createTestDatabase();
+  }, 120_000);
+
+  afterAll(async () => {
+    await ingestDatabase.dispose();
+  });
+
+  // X7's 200 row is the only test here that writes; truncating keeps the rest order-independent.
+  beforeEach(async () => {
+    await truncateAll(ingestDatabase.db);
+  });
+
+  const ingestEnvironment = (overrides: Partial<Environment> = {}): Environment =>
+    environment({ COLLECTOR_TOKEN: collectorToken, DB: untouchableDb(), ...overrides });
+
+  /** Deliberately unlike every other suite's fixture values. */
+  const validBody = JSON.stringify({
+    source: "index-suite-market",
+    componentType: "case_fan",
+    market: { latitude: 51.0447, longitude: -114.0719, radiusKm: 7 },
+    listings: [
+      {
+        listingId: "X-11",
+        title: "a case fan",
+        priceText: "CA$19",
+        locationText: "Calgary, Alberta",
+        url: "https://www.facebook.com/marketplace/item/X-11",
+      },
+    ],
+  });
+
+  const ingest = (
+    init: RequestInit = {},
+    env: Environment = ingestEnvironment(),
+    origin: string = workerOrigin,
+    path: string = ingestPath,
+  ) =>
+    handleRequest(
+      new Request(`${origin}${path}`, {
+        method: "POST",
+        body: validBody,
+        ...init,
+        headers: { "Content-Type": "application/json", ...(init.headers as Record<string, string>) },
+      }),
+      env,
+      dependencies,
+    );
+
+  const listingCount = async (): Promise<number> => {
+    const row = await ingestDatabase.db
+      .prepare("SELECT COUNT(*) AS n FROM listings")
+      .first<{ n: number }>();
+    return row?.n ?? -1;
+  };
+
+  it.each([
+    ["the deployed worker origin", workerOrigin, "production"],
+    ["http://localhost", "http://localhost:8787", "local"],
+    ["http://127.0.0.1", "http://127.0.0.1:8787", "local"],
+  ])(
+    "X1: no collector token is a 401 on %s -- the loopback dev identity does not open ingest",
+    async (_label, origin, appEnv) => {
+      const response = await ingest({}, ingestEnvironment({ APP_ENV: appEnv }), origin);
+
+      expect(response.status).toBe(401);
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: "AUTH_TOKEN_MISSING" },
+      });
+    },
+  );
+
+  it("X2: a wrong collector token is a 401 INVALID, and the database is untouched", async () => {
+    const response = await ingest({
+      headers: { "X-Collector-Token": "not-the-collector-token-but-long-enough" },
+    });
+
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "AUTH_TOKEN_INVALID" },
+    });
+  });
+
+  it.each([
+    ["with a plausible header", { "X-Collector-Token": "any-value-at-all-32-characters-x" }],
+    ["with no header at all", {}],
+  ])("X3: an unconfigured secret is a 503 %s, never an open route", async (_label, headers) => {
+    const response = await ingest({ headers }, ingestEnvironment({ COLLECTOR_TOKEN: undefined }));
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      // NOT AUTH_CONFIG_MISSING: that code already means an unset ALLOWED_ORIGINS or
+      // FIREBASE_PROJECT_ID, and an operator reading it would run the wrong command.
+      error: { code: "COLLECTOR_CONFIG_MISSING" },
+    });
+  });
+
+  /**
+   * X4 IS THE ENFORCEMENT OF THE CREDENTIAL BOUNDARY, NOT THE TYPE SYSTEM. DO NOT DELETE IT AS
+   * REDUNDANT. `CollectorEnvironment` makes the NAIVE leak -- a direct property read inside an
+   * `authenticateRequest`-shaped function -- fail to compile, and that is all it does: three
+   * casts and a one-word parameter widening all compile clean under this repo's strict config,
+   * and eslint bans none of them. If the collector check were ever wired into
+   * `authenticateRequest`, every row here would go red and nothing else would.
+   */
+  it.each([
+    ["GET", "/api/auth/session"],
+    ["GET", "/api/status"],
+    ["GET", "/api/settings"],
+    ["PUT", "/api/settings"],
+  ])(
+    "X4: a VALID collector token buys nothing on %s %s",
+    async (method, path) => {
+      const response = await call(
+        path,
+        {
+          method,
+          headers: {
+            "X-Collector-Token": collectorToken,
+            ...(method === "PUT"
+              ? { "Content-Type": "application/json" }
+              : {}),
+          },
+          ...(method === "PUT"
+            ? { body: '{"mode":"DISCOUNT","minimumDiscountPercent":11.75}' }
+            : {}),
+        },
+        ingestEnvironment(),
+      );
+
+      expect(response.status).toBe(401);
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: "AUTH_TOKEN_MISSING" },
+      });
+    },
+  );
+
+  /**
+   * X5 is a REGRESSION GUARD, and it says so: these origins are refused by the PRE-EXISTING CORS
+   * block in `handleRequest`, measured, so this test survives removing the ingest branch's own
+   * Origin refusal. X6(a) -- the ALLOWED origin -- is the row that kills that mutation.
+   */
+  it.each([
+    ["an evil origin", "https://evil.example"],
+    ["the literal null origin", "null"],
+    ["an empty origin", ""],
+  ])("X5: %s is refused and never reflected, even with a valid token", async (_label, origin) => {
+    const response = await ingest({
+      headers: { Origin: origin, "X-Collector-Token": collectorToken },
+    });
+
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "CORS_ORIGIN_DENIED" },
+    });
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
+    expect(response.headers.get("Vary")).toBe("Origin");
+  });
+
+  it("X6a: even the ALLOWED origin is refused -- there is no browser channel at all", async () => {
+    const response = await ingest({
+      headers: { Origin: pagesOrigin, "X-Collector-Token": collectorToken },
+    });
+
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "CORS_ORIGIN_DENIED" },
+    });
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
+  });
+
+  it("X6b: the preflight for POST /api/listings is refused", async () => {
+    const response = await call(
+      ingestPath,
+      {
+        method: "OPTIONS",
+        headers: { Origin: pagesOrigin, "Access-Control-Request-Method": "POST" },
+      },
+      ingestEnvironment(),
+    );
+
+    expect(response.status).toBe(403);
+    expect(response.headers.get("Access-Control-Allow-Methods")).toBeNull();
+  });
+
+  /**
+   * X6c PINS A DELIBERATE INVERSION OF W10's NORM, and it is the ONLY guard on it.
+   * MEASURED: adding `["/api/listings", ["POST"]]` to ROUTE_METHODS leaves every other test in
+   * this file passing -- all of them -- while `OPTIONS /api/listings` from the allowed origin
+   * then answers 204 advertising `Access-Control-Allow-Methods: POST, OPTIONS`. That is a real
+   * browser channel invisible to every existing test. The table is the ADVERTISED BROWSER
+   * SURFACE; this route has no browser caller and must never advertise one.
+   */
+  it("X6c: /api/listings is deliberately absent from the advertised surface", () => {
+    expect(ROUTE_METHODS.has(ingestPath)).toBe(false);
+  });
+
+  it.each([
+    [
+      "a successful ingest",
+      200,
+      () => ingest({ headers: { "X-Collector-Token": collectorToken } }, ingestEnvironment({ DB: ingestDatabase.db })),
+    ],
+    ["a missing credential", 401, () => ingest({})],
+    [
+      "an allowed browser origin",
+      403,
+      () => ingest({ headers: { Origin: pagesOrigin, "X-Collector-Token": collectorToken } }),
+    ],
+    [
+      "a malformed body",
+      400,
+      () => ingest({ body: "{", headers: { "X-Collector-Token": collectorToken } }),
+    ],
+    [
+      "an unconfigured credential",
+      503,
+      () => ingest({ headers: { "X-Collector-Token": collectorToken } }, ingestEnvironment({ COLLECTOR_TOKEN: undefined })),
+    ],
+    [
+      "a missing database binding",
+      503,
+      () => ingest({ headers: { "X-Collector-Token": collectorToken } }, ingestEnvironment({ DB: undefined })),
+    ],
+  ])("X7: %s carries Vary, every security header and NO CORS header", async (_label, status, send) => {
+    const response = await send();
+
+    expect(response.status).toBe(status);
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
+    expect(response.headers.get("Vary")).toBe("Origin");
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(response.headers.get("Permissions-Policy")).toBe(
+      "camera=(), microphone=(), geolocation=()",
+    );
+    expect(response.headers.get("Referrer-Policy")).toBe("no-referrer");
+    expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff");
+    expect(response.headers.get("X-Frame-Options")).toBe("DENY");
+  });
+
+  /**
+   * X8: the path is matched EXACTLY. `.startsWith("/api/listings")` reaches the handler on every
+   * row but the last, and `.toLowerCase()` reopens the cased spelling. The database throws on
+   * contact, so a spelling that reached the handler could not answer 401 -- it would land on a
+   * 503, a 400 or a 200 instead, and every one of those fails this test.
+   */
+  it.each([
+    ["a trailing slash", "/api/listings/", 401, "AUTH_TOKEN_MISSING"],
+    ["a cased spelling", "/api/Listings", 401, "AUTH_TOKEN_MISSING"],
+    ["a longer path with the same prefix", "/api/listings-evil", 401, "AUTH_TOKEN_MISSING"],
+    ["a sub-path", "/api/listings/extra", 401, "AUTH_TOKEN_MISSING"],
+    ["an encoded slash", "/api/listings%2f", 401, "AUTH_TOKEN_MISSING"],
+    ["a doubled inner slash", "/api//listings", 401, "AUTH_TOKEN_MISSING"],
+    // This one never enters /api/ at all, so it is refused one branch earlier.
+    ["a doubled leading slash", "//api/listings", 404, "NOT_FOUND"],
+  ])("X8: %s is not the ingest route", async (_label, path, status, code) => {
+    const response = await ingest(
+      { headers: { "X-Collector-Token": collectorToken } },
+      ingestEnvironment(),
+      workerOrigin,
+      path,
+    );
+
+    expect(response.status).toBe(status);
+    await expect(response.json()).resolves.toMatchObject({ error: { code } });
+  });
+
+  /**
+   * X9: the method is matched exactly too. NOTE THE SHAPES, which are not what a first guess
+   * predicts: the collector-token rows answer 401 because they carry no `Authorization` and fall
+   * through to `authenticateRequest`, and the Firebase rows answer 404 because no route table
+   * entry matches. Dropping the method check sends the collector-token rows into the ingest
+   * handler instead, where they answer 400 or 415 depending on Content-Type.
+   */
+  it.each([["GET"], ["PUT"], ["DELETE"], ["PATCH"], ["HEAD"]])(
+    "X9: %s /api/listings is not the ingest route",
+    async (method) => {
+      const withCollectorToken = await call(
+        ingestPath,
+        { method, headers: { "X-Collector-Token": collectorToken } },
+        ingestEnvironment(),
+      );
+      expect(withCollectorToken.status).toBe(401);
+
+      const withFirebaseIdentity = await call(
+        ingestPath,
+        { method, headers: { Authorization: await bearerFor() } },
+        ingestEnvironment(),
+      );
+      expect(withFirebaseIdentity.status).toBe(404);
+    },
+  );
+
+  /**
+   * THE REAL DATABASE IS BOUND HERE ON PURPOSE -- but this buys LEGIBILITY, NOT KILL-POWER, and
+   * saying so is the point. With `untouchableDb()` the row count was 0 on every path, mutated or
+   * not: an assertion satisfiable by an empty input, the shape this project's brief flags.
+   * MEASURED, however, that the status assertion below already caught every mutation this one
+   * does -- no path can both write a row and answer 401. What changed is which failure the run
+   * reports: "a row was written" rather than the weaker "the status was wrong". The count is
+   * asserted FIRST so that it is the one that fires.
+   */
+  it("X10: an approved Firebase identity does not open the ingest route", async () => {
+    const response = await ingest(
+      { headers: { Authorization: await bearerFor() } },
+      ingestEnvironment({ DB: ingestDatabase.db }),
+    );
+
+    // THE COUNT IS ASSERTED FIRST so that it is the assertion that fires: any mutation which lets
+    // a Firebase identity through writes a row, and a status check above this line would mask it.
+    expect(await listingCount()).toBe(0);
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "AUTH_TOKEN_MISSING" },
+    });
   });
 });

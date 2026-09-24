@@ -1,0 +1,20 @@
+{
+  // The collector is the one part of this project that does NOT run on Cloudflare -- it runs on
+  // the operator's Mac, because Facebook serves Cloudflare's egress a login wall. So it gets its
+  // own config: Node types instead of @cloudflare/workers-types, and .ts-extension imports,
+  // which Node 24 executes directly with no flag and therefore no build step.
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "types": ["node", "vitest/globals"],
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true
+  },
+  "include": ["collector/**/*.ts"]
+}
