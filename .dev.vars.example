@@ -9,3 +9,15 @@
 # .dev.vars changes no behaviour. The addresses are dummies.
 #
 # APPROVED_EMAILS=["owner@example.com","tester@example.com"]
+
+# The collector credential. `POST /api/listings` is the only route that reads it, and with it
+# unset the route answers 503 -- which is what `npm run dev:worker` SHOULD do until you decide
+# to accept ingest locally. Uncomment and fill it in to accept local collector posts.
+#
+# Generate one with:  openssl rand -hex 32
+# The Worker refuses a configured value shorter than 32 characters.
+# In production this is a Worker secret (`wrangler secret put COLLECTOR_TOKEN`), never a var
+# and never a committed file. `npm run e2e:local` injects its own throwaway value with
+# `wrangler dev --var`, so it needs nothing here.
+#
+# COLLECTOR_TOKEN=REPLACE_WITH_COLLECTOR_TOKEN

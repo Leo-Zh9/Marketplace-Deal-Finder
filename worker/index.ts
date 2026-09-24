@@ -4,6 +4,8 @@ import {
   type AuthDependencies,
   type WorkerEnvironment,
 } from "./auth/verifyFirebaseToken";
+import { authorizeCollector, type CollectorEnvironment } from "./auth/collectorToken";
+import { handlePostListings } from "./api/listings";
 import { handleGetSettings, handlePutSettings } from "./api/settings";
 import { handleScheduled, type ScheduledEnvironment } from "./scheduling/scheduled";
 
@@ -16,7 +18,7 @@ import { handleScheduled, type ScheduledEnvironment } from "./scheduling/schedul
  * `MONITOR_WORKFLOW` stay OUT: the scheduled path names its own `ScheduledEnvironment`, and
  * the runtime hands both the same object.
  */
-export type Environment = WorkerEnvironment & { DB?: D1Database };
+export type Environment = WorkerEnvironment & { DB?: D1Database } & CollectorEnvironment;
 
 /**
  * wrangler binds a Workflow to a class exported FROM THE MAIN ENTRY, so this re-export is
@@ -75,6 +77,15 @@ const errorMessages: Record<string, string> = {
   INVALID_JSON: "The request body is not a JSON object.",
   INVALID_SETTINGS: "The settings in the request are not valid.",
   SETTINGS_FIELD_UNSUPPORTED: "The request contains fields this API cannot store.",
+  // Distinct from AUTH_CONFIG_MISSING / AUTH_CONFIG_INVALID on purpose: those already stand for
+  // an unset ALLOWED_ORIGINS and an unset FIREBASE_PROJECT_ID, and three different fixes behind
+  // one code sends an operator to the wrong one.
+  COLLECTOR_CONFIG_MISSING: "The collector credential is not configured.",
+  COLLECTOR_CONFIG_INVALID: "The collector credential is not usable.",
+  INGEST_EMPTY_BATCH: "The request contains no listings.",
+  INGEST_BATCH_TOO_LARGE: "The request contains too many listings.",
+  INVALID_LISTINGS: "The listings in the request are not valid.",
+  INGEST_STORAGE_FAILED: "The listings could not be stored.",
 };
 
 type ExtraHeaders = Record<string, string>;
@@ -211,6 +222,41 @@ export const handleRequest = async (
     allowedOrigin === null
       ? { Vary: "Origin" }
       : { "Access-Control-Allow-Origin": allowedOrigin, Vary: "Origin" };
+
+  // THE INGEST ROUTE IS DELIBERATELY NOT BEHIND authenticateRequest. It admits exactly ONE
+  // identity -- the collector secret -- and every other route admits exactly the two it
+  // admitted before. The two sets are disjoint in BOTH directions, and TESTS are what enforce
+  // that, not the type system: X4 proves a collector token buys nothing on the Firebase routes,
+  // X1 and X10 prove that neither the loopback development identity nor a Firebase token opens
+  // this one. DO NOT delete X4 because CollectorEnvironment "makes it impossible" -- it does
+  // not; three casts and a one-word parameter widening all compile.
+  //
+  // `/api/listings` is NOT in ROUTE_METHODS, which inverts W10's stated norm. That is
+  // deliberate and flagged: the table is the ADVERTISED BROWSER SURFACE and feeds only the
+  // OPTIONS preflight. MEASURED: adding the row makes OPTIONS /api/listings answer 204
+  // advertising "POST, OPTIONS" -- a real browser channel -- while every existing test in this
+  // file still passes. X6(c) is the only guard on that.
+  if (request.method === "POST" && url.pathname === "/api/listings") {
+    const authorized = await authorizeCollector(request, environment);
+    if (!authorized.ok) {
+      return errorResponse(authorized.code, authorized.status, { Vary: "Origin" });
+    }
+
+    const db = environment.DB;
+    if (db === undefined) return errorResponse("DATABASE_UNAVAILABLE", 503, { Vary: "Origin" });
+
+    const result = await handlePostListings(
+      request,
+      db,
+      dependencies?.now() ?? Math.floor(Date.now() / 1000),
+    );
+
+    // `{ Vary: "Origin" }`, NEVER `cors`: a request carrying ANY Origin was refused above, so no
+    // ingest response can ever carry Access-Control-Allow-Origin. X7 pins it on every outcome.
+    return result.ok
+      ? json(result.body, result.status, { Vary: "Origin" })
+      : errorResponse(result.code, result.status, { Vary: "Origin" }, result.details);
+  }
 
   const authentication = await authenticateRequest(request, environment, dependencies);
   if (!authentication.ok) {
