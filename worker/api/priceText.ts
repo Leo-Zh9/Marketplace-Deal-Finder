@@ -22,9 +22,16 @@ export const MAX_PRICE_CENTS = 100_000_000;
  * provider WOULD mis-parse ("Best offer 500" -> 50000); that is a reason to validate at that
  * provider, and it is written down here so it is not rediscovered.
  *
- * NO `m` FLAG. MEASURED: JavaScript's `$` does not match before a trailing line terminator
- * (Python's does), so "CA$5\n" is rejected. M8 pins it, because the obvious "port this regex"
- * change silently accepts a newline.
+ * NO `m` FLAG. With it, `^`...`$` anchor to a LINE rather than to the string, so a multi-line
+ * value would have its first line read as the price and the rest discarded. M8 pins that with an
+ * INTERIOR newline (`"CA$5\nCA$9"`).
+ *
+ * MEASURED CORRECTION, because the obvious version of this comment is wrong: a TRAILING newline
+ * never reaches the anchor here, since `parsePriceText` trims first -- `parsePriceText("CA$5\n")`
+ * is 500, not null, and M8 records that too. The fact that JavaScript's `$` does not match before
+ * a trailing line terminator while Python's does IS real and IS load-bearing, but on
+ * `SOURCE_PATTERN` in worker/api/listings.ts, which is NOT trimmed: `"facebook\n"` is refused
+ * there, pinned by listings.test.ts L6.
  */
 const PRICE_PATTERN = /^[A-Za-z$€£¥₹\s]*(\d{1,3}(?:,\d{3})*|\d+)(?:\.(\d{2}))?$/;
 
@@ -53,6 +60,8 @@ export const parsePriceText = (raw: unknown): number | null => {
   const fraction = Number(match[2] ?? "00");
   const cents = whole * 100 + fraction;
 
+  // UNREACHABLE and kept as defence in depth: the arithmetic is integer-only and the cap check
+  // on the next line already refuses everything that could reach 2^53. No mutation can kill it.
   if (!Number.isSafeInteger(cents)) return null;
   if (cents < 0 || cents > MAX_PRICE_CENTS) return null;
   return cents;

@@ -66,9 +66,16 @@ const COMPONENT_TYPES: Record<Listing["componentType"], true> = {
   case_fan: true,
 };
 
-/** EXACTLY the five fields that map to a stored column. Anything else is refused. */
+/**
+ * EXACTLY the fields that map to a stored column. Anything else is refused, at ALL THREE levels:
+ * the envelope, each listing, and `market`. `market` was the level that was missed -- extras
+ * there used to be silently dropped, because the handler reconstructs `{latitude, longitude,
+ * radiusKm}` explicitly. Harmless in itself, and exactly the shape of a future `market.currency`
+ * or `market.radiusMiles` that a caller believes was honoured and that was thrown away.
+ */
 const WIRE_KEYS = new Set(["listingId", "title", "priceText", "locationText", "url"]);
 const ENVELOPE_KEYS = new Set(["source", "componentType", "market", "listings"]);
+const MARKET_KEYS = new Set(["latitude", "longitude", "radiusKm"]);
 
 /**
  * `source` stays opaque -- shape-validated, never enumerated (invariant 1). No `m` flag and no
@@ -131,6 +138,8 @@ export const readBoundedBody = async (
     const { done, value } = await reader.read();
     if (done) break;
     total += value.byteLength;
+    // STRICTLY GREATER: a body of exactly `maxBytes` is accepted. L8e pins both sides of that
+    // one byte, because no other test in this file can send a body of exactly the cap.
     if (total > maxBytes) {
       await reader.cancel();
       return { ok: false };
@@ -190,6 +199,30 @@ export const summarizeReport = (
 const isBoundedString = (value: unknown, max: number): value is string =>
   typeof value === "string" && value.length > 0 && value.length <= max;
 
+/**
+ * `priceText` and `locationText` ARE NULLABLE ON THE WIRE, and the other three are not.
+ *
+ * This is not laxity, it is the only shape that does not stall collection. The source omits a
+ * price or a location on real listings, the collector's parser deliberately produces `null` for
+ * both, and its classifier deliberately ACCEPTS such a block -- so requiring a string here meant
+ * ONE price-less listing anywhere on the page answered 400 and stored NOTHING, for the whole
+ * batch, on every run, until that listing aged off. MEASURED through the repo's own
+ * `withoutLocation()` fixture and the real handler: SUCCESS, 6 listings parsed, 0 rows written.
+ *
+ * It is also the narrower-than-storage case: `Listing.locationText` and `Listing.priceCents` are
+ * already `| null` in worker/storage/types.ts, and this route's own stated policy for an
+ * UNPARSEABLE price is to store it as NULL rather than refuse the listing. A MISSING price is
+ * the same situation and now gets the same answer. `pricesUnparsed` counts it either way.
+ *
+ * An EMPTY STRING is still refused: the parser maps "" to null itself, so "" from a caller is a
+ * shape error, not a missing value.
+ */
+const isNullableBoundedString = (
+  value: unknown,
+  max: number,
+): value is string | null | undefined =>
+  value === null || value === undefined || isBoundedString(value, max);
+
 export const handlePostListings = async (
   request: Request,
   db: D1Database,
@@ -233,6 +266,8 @@ export const handlePostListings = async (
   }
 
   const source = envelope.source;
+  // The `source.length` term is REDUNDANT and kept as defence in depth: SOURCE_PATTERN is
+  // `[a-z0-9][a-z0-9-]{0,63}`, so it already bounds the value at 64. No mutation can kill it.
   if (
     typeof source !== "string" ||
     source.length > MAX_SOURCE_LENGTH ||
@@ -254,6 +289,9 @@ export const handlePostListings = async (
   const market = envelope.market;
   if (typeof market !== "object" || market === null || Array.isArray(market)) {
     return fail(400, "INVALID_LISTINGS", { field: "market" });
+  }
+  for (const key of Object.keys(market)) {
+    if (!MARKET_KEYS.has(key)) return fail(400, "INVALID_LISTINGS", { field: `market.${key}` });
   }
   const { latitude, longitude, radiusKm } = market as Record<string, unknown>;
   if (typeof latitude !== "number" || !Number.isFinite(latitude) || latitude < -90 || latitude > 90) {
@@ -302,10 +340,10 @@ export const handlePostListings = async (
     if (!isBoundedString(row.url, MAX_URL_LENGTH) || !row.url.startsWith("https://")) {
       return fail(400, "INVALID_LISTINGS", at("url"));
     }
-    if (!isBoundedString(row.priceText, MAX_PRICE_TEXT_LENGTH)) {
+    if (!isNullableBoundedString(row.priceText, MAX_PRICE_TEXT_LENGTH)) {
       return fail(400, "INVALID_LISTINGS", at("priceText"));
     }
-    if (!isBoundedString(row.locationText, MAX_LOCATION_LENGTH)) {
+    if (!isNullableBoundedString(row.locationText, MAX_LOCATION_LENGTH)) {
       return fail(400, "INVALID_LISTINGS", at("locationText"));
     }
 
@@ -327,7 +365,7 @@ export const handlePostListings = async (
         variantKey: null,
         title: row.title,
         priceCents,
-        locationText: row.locationText,
+        locationText: row.locationText ?? null,
         url: row.url,
         observedAt,
       },
@@ -367,6 +405,9 @@ export const handlePostListings = async (
   // would discard the rows that did land, and `recordSightings`' deliberate "never let one
   // poisoned listing abort a scan" is a property this route must not undo. The collector exits
   // non-zero on `outcomes.FAILED > 0`, so a partial failure is not silent either.
+  // The `length > 0` term is UNREACHABLE and kept as defence in depth against `[].every()` being
+  // `true`: an empty batch is refused above, and `recordSightings` returns one result per unique
+  // sighting, so `results.length >= 1` here always. No mutation can kill it.
   if (report.results.length > 0 && report.results.every((result) => result.outcome === "FAILED")) {
     return fail(503, "INGEST_STORAGE_FAILED");
   }

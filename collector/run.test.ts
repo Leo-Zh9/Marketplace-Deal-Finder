@@ -10,6 +10,7 @@ import {
   withMissingTitle,
   withRenamedTypename,
   reordered,
+  withoutLocation,
 } from "./testing/fixtures.ts";
 
 /** Every value here is distinct from every other suite's and from every shipped default. */
@@ -98,6 +99,25 @@ describe("one collector run", () => {
     expect(calls[0].market).toEqual({ latitude: 43.5448, longitude: -80.2482, radiusKm: 9 });
     expect(exitCode).toBe(0);
     expect(summary).toMatchObject({ state: "SUCCESS", reason: "ok", parsed: 6, posted: 4 });
+  });
+
+  /**
+   * R7 IS THE COLLECTOR END OF A SEAM DEFECT. A real page omits a location (and a price) on real
+   * listings, the parser emits `null`, and the classifier accepts the page -- so if the route
+   * refused a null, ONE such listing would answer 400 and store NOTHING for the whole batch,
+   * every run, until it aged off. The route accepts null for exactly these two fields
+   * (listings.test.ts L5) and `postListings` passes them through as null (Q5); this is the third
+   * link: the page really does produce one.
+   */
+  it("R7: a listing the source gave no location still posts, with locationText null", async () => {
+    const { calls, post } = recorder(okResult());
+
+    const { exitCode } = await run(config, { post, readHtmlFile: fromHtml(withoutLocation()) });
+
+    expect(exitCode).toBe(0);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].listings).toHaveLength(4);
+    expect(calls[0].listings[0].locationText).toBeNull();
   });
 
   it("R2: a genuinely empty market posts nothing and exits 3", async () => {

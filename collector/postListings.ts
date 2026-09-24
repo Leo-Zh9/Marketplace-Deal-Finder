@@ -32,7 +32,10 @@ export interface PostInput {
 }
 
 /**
- * EXACTLY the five wire fields. `creationTime` is dropped here on purpose -- it sorted and
+ * EXACTLY the five wire fields, AND `priceText`/`locationText` PASS THROUGH AS `null` when the
+ * source omitted them. Coercing either to "" -- or dropping the key -- turns a real listing into
+ * a 400 that stores nothing for the WHOLE batch; the route accepts null for exactly these two.
+ * `creationTime` is dropped here on purpose -- it sorted and
  * sliced the page and no column stores it -- and there is no `priceCents`, `modelKey`,
  * `variantKey`, `validity` or `observedAt` field for a compromised collector to set. The
  * Worker refuses unknown keys rather than dropping them, so adding one here is a 400, not a

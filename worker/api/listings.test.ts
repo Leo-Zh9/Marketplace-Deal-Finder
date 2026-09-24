@@ -11,7 +11,12 @@ import type { AuthDependencies } from "../auth/verifyFirebaseToken";
 import { handleRequest, type Environment } from "../index";
 import { createTestDatabase, truncateAll, type TestDatabase } from "../testing/d1";
 import type { SightingReport } from "../storage/types";
-import { MAX_INGEST_BODY_BYTES, MAX_LISTINGS_PER_BATCH, summarizeReport } from "./listings";
+import {
+  MAX_INGEST_BODY_BYTES,
+  MAX_LISTINGS_PER_BATCH,
+  readBoundedBody,
+  summarizeReport,
+} from "./listings";
 
 /** 37 characters, comfortably over the 32 minimum and distinct from every other suite's token. */
 const token = "listings-suite-token-6f2a91c4e8db0357";
@@ -263,6 +268,10 @@ describe("POST /api/listings", () => {
     ["a numeric locationText", { locationText: 123 }, "listings[0].locationText"],
     ["a numeric priceText", { priceText: 123 }, "listings[0].priceText"],
     ["priceText 33 characters", { priceText: "C".repeat(33) }, "listings[0].priceText"],
+    // NULL and ABSENT are accepted below; "" is still a shape error, because the collector's
+    // parser maps an empty value to null itself and never emits "".
+    ["an empty priceText", { priceText: "" }, "listings[0].priceText"],
+    ["an empty locationText", { locationText: "" }, "listings[0].locationText"],
   ])("L5: %s is a 400 naming the field, and D1 is untouched", async (_label, overrides, field) => {
     const entry = listing("L-901", overrides);
     for (const [key, value] of Object.entries(overrides)) {
@@ -290,6 +299,58 @@ describe("POST /api/listings", () => {
       error: { code: "INVALID_LISTINGS", field: "listings[0]" },
     });
     expect(await count("listings")).toBe(0);
+  });
+
+  /**
+   * THE TWO FIELDS THE SOURCE ACTUALLY OMITS ARE NULLABLE, AND THIS IS A REGRESSION TEST.
+   * Requiring a string here was a live total-collection-stall: the collector's parser produces
+   * `null` for a price-less or location-less listing and its classifier accepts the page, so ONE
+   * such listing anywhere answered 400 and stored NOTHING for the whole batch, every run, until
+   * it aged off the source. `Listing.locationText` and `Listing.priceCents` are already nullable
+   * in storage, and this route already stores an UNPARSEABLE price as NULL rather than refusing
+   * the listing -- a MISSING one is the same situation.
+   */
+  it.each([
+    ["priceText is null", { priceText: null }, "price_cents", 1],
+    ["priceText is absent", { priceText: undefined }, "price_cents", 1],
+    ["locationText is null", { locationText: null }, "location_text", 0],
+    ["locationText is absent", { locationText: undefined }, "location_text", 0],
+  ])("L5: %s is accepted and stored as NULL", async (_label, overrides, column, unparsed) => {
+    const entry = listing("L-901", overrides) as Record<string, unknown>;
+    for (const [key, value] of Object.entries(overrides)) {
+      if (value === undefined) delete entry[key];
+    }
+
+    const response = await post(envelope([entry]));
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      outcomes: { NEW: 1, FAILED: 0 },
+      pricesUnparsed: unparsed,
+    });
+    const stored = await database.db
+      .prepare(`SELECT ${column} AS value FROM listings WHERE listing_id = 'L-901'`)
+      .first<{ value: unknown }>();
+    expect(stored?.value).toBeNull();
+  });
+
+  it("L5: one listing with no price and no location does not block the other two", async () => {
+    const response = await post(
+      envelope([
+        listing("L-901"),
+        listing("L-902", { priceText: null, locationText: null }),
+        listing("L-903"),
+      ]),
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      received: 3,
+      stored: 3,
+      outcomes: { NEW: 3, FAILED: 0 },
+      pricesUnparsed: 1,
+    });
+    expect(await count("listings")).toBe(3);
   });
 
   /** The ACCEPTED side of every boundary: `<` and `<=` are one character apart. */
@@ -346,6 +407,29 @@ describe("POST /api/listings", () => {
     expect(response.status).toBe(400);
     await expect(response.json()).resolves.toMatchObject({
       error: { code: "INVALID_LISTINGS" },
+    });
+    expect(await count("listings")).toBe(0);
+  });
+
+  /**
+   * `market` IS THE THIRD LEVEL, and it used to be the one with no whitelist: the handler
+   * reconstructs `{latitude, longitude, radiusKm}` explicitly, so extras were silently dropped.
+   * Harmless in itself; the shape it allows is a future `market.currency` that a caller believes
+   * was honoured and that was thrown away.
+   */
+  it.each([
+    ["an invented key", { latitude: 43, longitude: -79, radiusKm: 18, currency: "CAD" }, "market.currency"],
+    [
+      "__proto__",
+      JSON.parse('{"latitude":43,"longitude":-79,"radiusKm":18,"__proto__":{"x":1}}') as Record<string, unknown>,
+      "market.__proto__",
+    ],
+  ])("L6: %s inside market is refused, not dropped", async (_label, market, field) => {
+    const response = await post(envelope(THREE, { market }));
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "INVALID_LISTINGS", field },
     });
     expect(await count("listings")).toBe(0);
   });
@@ -471,6 +555,24 @@ describe("POST /api/listings", () => {
     const response = await post(payload);
     expect(response.status).toBe(413);
     expect(await count("listings")).toBe(0);
+  });
+
+  /**
+   * L8e PINS THE ONE BYTE `>` AND `>=` DISAGREE ABOUT. No other test in this file can: the
+   * largest legal 100-listing ASCII batch is ~110 KB and cannot be padded to exactly 128 KiB
+   * without breaking a per-field bound, so the cap itself is unreachable from a real payload.
+   * `readBoundedBody` takes the cap as an argument precisely so it can be pinned directly.
+   */
+  it("L8e: a body of exactly the cap is accepted and one byte more is not", async () => {
+    const cap = 777;
+    const body = (bytes: number) =>
+      new Request(`${workerOrigin}/api/listings`, { method: "POST", body: "x".repeat(bytes) });
+
+    await expect(readBoundedBody(body(cap), cap)).resolves.toEqual({
+      ok: true,
+      text: "x".repeat(cap),
+    });
+    await expect(readBoundedBody(body(cap + 1), cap)).resolves.toEqual({ ok: false });
   });
 
   it.each([

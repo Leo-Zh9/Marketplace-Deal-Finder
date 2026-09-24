@@ -94,6 +94,36 @@ describe("posting a batch to the Worker", () => {
     expect(wire.listingId).toBe("2253354775457674");
   });
 
+  /**
+   * Q5: THE NULLS SURVIVE THE WIRE. The parser produces `null` for a price-less or location-less
+   * listing and the route accepts it; coercing either to "" here (or dropping the key) turns a
+   * real listing into a 400 that stores NOTHING for the whole batch.
+   */
+  it("Q5: a listing with no price and no location keeps both as null, not empty strings", async () => {
+    const calls: Array<[string, RequestInit]> = [];
+    const fake = (async (url: string, init: RequestInit) => {
+      calls.push([url, init]);
+      return jsonResponse(200, summary);
+    }) as unknown as typeof fetch;
+
+    await postListings(
+      { ...input, listings: [{ ...listings[0], priceText: null, locationText: null }] },
+      fake,
+    );
+
+    const wire = (JSON.parse(calls[0][1].body as string) as { listings: Array<Record<string, unknown>> })
+      .listings[0];
+    expect(Object.keys(wire).sort()).toEqual([
+      "listingId",
+      "locationText",
+      "priceText",
+      "title",
+      "url",
+    ]);
+    expect(wire.priceText).toBeNull();
+    expect(wire.locationText).toBeNull();
+  });
+
   it("Q2: a 200 carries the Worker's summary back", async () => {
     const fake = (async () => jsonResponse(200, summary)) as unknown as typeof fetch;
 

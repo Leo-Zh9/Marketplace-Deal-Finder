@@ -962,13 +962,25 @@ describe("the ingest route's credential boundary", () => {
     },
   );
 
+  /**
+   * THE REAL DATABASE IS BOUND HERE ON PURPOSE. With `untouchableDb()` the row count is 0 on
+   * every path, mutated or not -- an assertion satisfiable by an empty input, which is exactly
+   * the shape this project's brief flags. Bound to the real one, wiring the collector header
+   * into the Firebase path (or removing the ingest branch's own check) writes a row and the
+   * count goes to 1.
+   */
   it("X10: an approved Firebase identity does not open the ingest route", async () => {
-    const response = await ingest({ headers: { Authorization: await bearerFor() } });
+    const response = await ingest(
+      { headers: { Authorization: await bearerFor() } },
+      ingestEnvironment({ DB: ingestDatabase.db }),
+    );
 
+    // THE COUNT IS ASSERTED FIRST so that it is the assertion that fires: any mutation which lets
+    // a Firebase identity through writes a row, and a status check above this line would mask it.
+    expect(await listingCount()).toBe(0);
     expect(response.status).toBe(401);
     await expect(response.json()).resolves.toMatchObject({
       error: { code: "AUTH_TOKEN_MISSING" },
     });
-    expect(await listingCount()).toBe(0);
   });
 });

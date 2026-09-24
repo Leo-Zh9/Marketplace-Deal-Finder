@@ -67,11 +67,13 @@ describe("parsing a real Marketplace search page", () => {
    * ("Grey Highlands" vs "Markdale, Ontario"), so swapping the `??` order makes the first row
    * red rather than passing by coincidence.
    */
+  // The fixture is the LAST tuple member on purpose: with it second, `%s` printed the whole
+  // 28 KB page into the test name and a red run was unreadable.
   it.each([
-    ["display_name present", facebookSearchPage, "Markdale, Ontario"],
-    ["city_page null", withoutCityPage(), "Grey Highlands"],
-    ["location null", withoutLocation(), null],
-  ])("P3: with %s the location text is %s", (_label, html, expected) => {
+    ["display_name present", "Markdale, Ontario", facebookSearchPage],
+    ["city_page null", "Grey Highlands", withoutCityPage()],
+    ["location null", null, withoutLocation()],
+  ])("P3: with %s the location text is %s", (_label, expected, html) => {
     const page = parseSearchPage(html);
     expect(page.listings).toHaveLength(6);
     expect(page.listings[0].locationText).toBe(expected);

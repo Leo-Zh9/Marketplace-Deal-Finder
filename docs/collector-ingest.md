@@ -48,20 +48,28 @@ X-Collector-Token: <the secret>
 ```
 
 **Five fields per listing, and that is the whole list.** Each one maps to a stored column.
+**`priceText` and `locationText` may be `null`** (or absent); the other three may not. The source
+genuinely omits a price or a location on real listings, `listings.price_cents` and
+`listings.location_text` are already nullable, and refusing such a listing would refuse the
+**whole batch** — one price-less listing anywhere on the page would store nothing, on every run,
+until it aged off. An empty string is still refused: the parser emits `null`, never `""`.
 
 | field | who decides it |
 |---|---|
-| `listingId`, `title`, `locationText`, `url` | the wire, validated |
+| `listingId`, `title`, `url` | the wire, validated, required |
+| `locationText` | the wire, validated, **nullable** |
 | `componentType` | the envelope, checked against an exhaustive set with `Object.hasOwn` |
-| `priceCents` | **the server**, from `priceText` (see the grammar below) |
+| `priceCents` | **the server**, from `priceText` (see the grammar below), which is **nullable** |
 | `modelKey`, `variantKey` | **the server**, hardcoded `null` |
 | `validity` | **the server**, hardcoded `"VALID"` |
 | `observedAt` | **the server**, from the request clock |
 
 There is no field on this wire for `priceCents`, `modelKey`, `variantKey`, `validity` or
-`observedAt`, and **unknown keys are refused, not dropped** — at the envelope level and inside
-each listing. A batch carrying one is a `400 INVALID_LISTINGS` naming the field, and nothing is
-written. `creationTime` is absent too: the collector sorts and slices with it and then discards
+`observedAt`, and **unknown keys are refused, not dropped** — at ALL THREE levels: the
+envelope, each listing, and `market`. A batch carrying one is a `400 INVALID_LISTINGS` naming the
+field, and nothing is written. (`market` was the level that was missed: the handler reconstructs
+`{latitude, longitude, radiusKm}` explicitly, so a `market.currency` or `market.radiusMiles` used
+to be accepted with a 200 and thrown away. It is now refused like the other two.) `creationTime` is absent too: the collector sorts and slices with it and then discards
 it, because no column stores it.
 
 `source` stays opaque: shape-validated against `/^[a-z0-9][a-z0-9-]{0,63}$/` and never
@@ -112,6 +120,12 @@ to zero is how you will know it works.
 | `INGEST_EMPTY_BATCH` / `INGEST_BATCH_TOO_LARGE` | 400 | zero listings, or more than 100 |
 | `DATABASE_UNAVAILABLE` | 503 | no `DB` binding |
 | `INGEST_STORAGE_FAILED` | 503 | the write failed — see "a total write outage" below |
+| `AUTH_CONFIG_MISSING` | 503 | **`ALLOWED_ORIGINS` is unset.** Not a collector problem |
+| `AUTH_CONFIG_INVALID` | 503 | **`ALLOWED_ORIGINS` is malformed.** Not a collector problem |
+
+The last two are easy to meet and easy to misread: `readAllowedOrigins` runs on every `/api/*`
+request, **before** the ingest branch, so a Worker with no `ALLOWED_ORIGINS` answers
+`503 AUTH_CONFIG_MISSING` here even with a perfectly good collector token. Measured.
 
 The two configuration 503s are **distinct from** `AUTH_CONFIG_MISSING` / `AUTH_CONFIG_INVALID`,
 which already mean an unset `ALLOWED_ORIGINS` or `FIREBASE_PROJECT_ID`. Three different fixes
@@ -181,8 +195,14 @@ An unparseable price is `null`, not a rejection: the listing is real and is stor
 > contribute to the benchmark, where `model_key → NULL` removes one. It also lets them burn D1
 > write quota.
 >
-> It lets them **read nothing at all**: not settings, not listings, not evaluation results, not
-> aggregates, not any user identity, not even the error text of a failed write. It cannot reach
+> It lets them read **no settings, no evaluation results, no aggregates and no user identity**,
+> and not even the error text of a failed write. What it CAN read is narrow and worth stating
+> exactly, because an absolute claim here would be false: the response tells a caller **whether a
+> `(source, listingId)` it guesses already exists** — an unknown id answers `NEW` with
+> `usage.rowsRead: 0`, a known one answers `CHANGED` with `rowsRead: 2` — and **whether a guess
+> at that row's contents is exact**, because `UNCHANGED` is returned only when the content hash
+> matches, and that probe is non-destructive. Measured. The marginal harm is small, since the
+> same token can already overwrite those rows outright. It cannot reach
 > `/api/settings` or `/api/auth/session` — those routes never look at the header it carries.
 > It cannot be used from a browser, from any origin, even a permitted one. And because the route
 > sets `modelKey: null` itself and the wire format has no field for a model key, **no request to
