@@ -502,7 +502,7 @@ const WHOLE_MACHINES: string[] = [
 
 /**
  * Real board-partner component titles. The catalog stores GENERIC model names and holds no
- * board-partner brands at all, so "0 collisions against the 176" says nothing about these. This
+ * board-partner brands at all, so "0 collisions against the 336" says nothing about these. This
  * corpus is what says something about them, and it is why `nitro`, `aorus` and `predator` were
  * refused as SYSTEM_PHRASES.
  */
@@ -591,8 +591,8 @@ const FREE_PHRASINGS: [string, "usable" | "refused"][] = [
  *
  * ITS JOB IS TO MAKE THE RESIDUAL KNOWN, NOT TO FINISH AN OPEN-ENDED LIST. Written cold it found
  * TEN mis-pools in twenty titles. Three were closed by adding `ii`, `touch` and `argb`, each
- * measured free against the 176 names, the 15 live titles and every title this suite pins as a
- * match. Six remain ACCEPTED EXPOSURE, pinned below with the reason each word was refused, and a
+ * measured free against the 176 names AS OF PR #14, the 15 live titles and every title this
+ * suite pins as a match; T11 and T12 carry that forward at 336 and 2,688. Six remain ACCEPTED EXPOSURE, pinned below with the reason each word was refused, and a
  * seventh -- the year suffix -- was already a standing decision. An unmeasured residual is what
  * `Corsair RM850x 2021` was before anyone looked.
  */

@@ -1,6 +1,6 @@
 /**
  * The token layer and the per-component-type model index: everything that turns a title into one
- * of the 176 names in `src/data/catalog.ts`. The classification rules live next door in
+ * of the 336 names in `src/data/catalog.ts`. The classification rules live next door in
  * `./normalizeListing.ts`; nothing in this file knows what `validity` is.
  *
  * WHY A TOKEN TRIE AND NOT SUBSTRING MATCHING. Lower-cased and stripped of punctuation,
@@ -18,8 +18,8 @@ import type { Listing } from "../storage/types";
 
 /**
  * The tokenizer's hard bound. MEASURED: the longest catalog model is 11 tokens and the longest
- * of the 15 live titles is 18, so 64 is ~3.5x headroom over anything real; 0 of 176 catalog
- * names reach it.
+ * of the 15 live titles is 18, so 64 is ~3.5x headroom over anything real; 0 of 336 catalog
+ * names reach it -- the longest is still 11 tokens, which T33 asserts.
  *
  * `tokenize` TRUNCATES at this bound -- it does not throw and it does not refuse. A caller that
  * receives exactly MAX_TOKENS tokens therefore cannot tell a title that fits from one that was
@@ -46,7 +46,7 @@ export interface Token {
  * `TM` is lower-cased into the token stream: the live `AMD Radeon™ RX 6800 XT ...` tokenizes
  * `radeontm` instead of `radeon`, loses its gpu marker and drops from `model-unmatched` to
  * `component-unconfirmed`. T15 in normalizeListing.test.ts is the test that goes red for it.
- * MEASURED: 0 of the 176 catalog names contain a non-ASCII character, so the catalog side loses
+ * MEASURED: 0 of the 336 catalog names contain a non-ASCII character, so the catalog side loses
  * nothing either way.
  */
 export const tokenize = (text: string): Token[] => {
@@ -160,8 +160,11 @@ const OPTIONAL_LEADING = new Set(["geforce", "nvidia", "radeon", "amd", "intel",
  * `"Corsair RM850x 2021"` -> `Corsair RM850x` still stands: year-suffixed revisions are an
  * unbounded class and enumerating years would prove the list open-ended rather than close it.
  * That residual is PINNED by T36 in normalizeListing.test.ts so the next one is visible rather
- * than discovered. MEASURED: every addition beyond the original four leaves all 176
- * self-resolutions intact and the 1,408 cross-type pairs at 0 leaks.
+ * than discovered. MEASURED AGAINST THE 176-NAME CATALOG AS OF PR #14, and scoped rather than
+ * re-numbered because the per-addition ablation behind it cannot be re-run from the repo: every
+ * addition beyond the original four left all 176 self-resolutions intact and the 1,408
+ * cross-type pairs at 0 leaks. What holds TODAY, and is re-checked on every run, is T11 and T12:
+ * 336 self-resolutions and 2,688 cross-type pairs at 0 leaks.
  */
 const SUFFIX_WORDS = new Set([
   "ti",
@@ -177,8 +180,9 @@ const SUFFIX_WORDS = new Set([
   // ADDED AFTER A CORPUS WAS WRITTEN FOR THIS LIST RATHER THAN FROM IT -- see
   // SKU_SUFFIX_PHRASINGS in normalizeListing.test.ts, which found 10 mis-pools in 20 real
   // variant titles. Each of these three is a genuine SKU differentiator with no descriptive use
-  // this project could name, and each was measured against all 176 catalog names, the 15 live
-  // titles and every title the suite pins as a match.
+  // this project could name, and each was measured against all 176 catalog names AS OF PR #14,
+  // the 15 live titles and every title the suite pins as a match. T11 and T12 carry the same
+  // property forward to the 336-name catalog on every run.
   "ii",
   "touch",
   "argb",
@@ -193,11 +197,12 @@ export interface ModelIndex {
 
 /**
  * Insert each model's full token sequence plus every suffix obtained by dropping leading
- * OPTIONAL_LEADING tokens. MEASURED: 176 models produce 199 cores, and 0 of them begin with a
- * pure-digit token.
+ * OPTIONAL_LEADING tokens. MEASURED: 336 models produce 423 cores -- the names themselves plus
+ * 87 vendor-stripped entry points (geforce 43, radeon 20, intel 5, core 19) -- and 0 of them
+ * begin with a pure-digit token.
  *
  * First insert wins on a collision. MEASURED: no catalog name is shadowed -- T11 resolves all
- * 176 to themselves.
+ * 336 to themselves.
  */
 export const buildModelIndex = (models: readonly string[]): ModelIndex => {
   const root: ModelIndex = { children: new Map(), model: null };
@@ -273,7 +278,7 @@ const walkFrom = (
  * Every DISTINCT catalog model the title names, in the order their matches start.
  *
  * A start-of-run guard and a span-containment filter were both written, MEASURED and DELETED
- * rather than shipped untestable: 0 of the 199 cores begin with a digit token, and the greedy
+ * rather than shipped untestable: 0 of the 423 cores begin with a digit token, and the greedy
  * walk never yields two nested spans holding DIFFERENT models. Do not re-add either without a
  * test that can go red.
  */

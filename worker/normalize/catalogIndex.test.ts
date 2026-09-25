@@ -211,15 +211,49 @@ describe("catalog index -- every vocabulary element, one at a time", () => {
 describe("catalog index -- exhaustive properties", () => {
   /**
    * T11. The ANCHOR of the whole suite: a normalizer that always returns null fails 336 times
-   * here. The two counts are asserted FIRST so an empty or failed catalog import cannot pass
-   * this vacuously.
+   * here. The counts are asserted FIRST so an empty or failed catalog import cannot pass this
+   * vacuously.
+   *
+   * ALL NINE PER-TYPE COUNTS, NOT JUST `gpu`, AND THE REASON IS A HOLE THE OTHER GUARDS LEAVE
+   * OPEN. A name typed into the WRONG component block is invisible to every other check here:
+   * the total is unchanged, there is no duplicate, and the resolution loop below PASSES because
+   * it declares each name under whatever type it was found in -- so a misfiled name
+   * self-resolves happily under the wrong one. T12 cannot see it either, because it tests a name
+   * against the eight OTHER indexes and the name is no longer in its real one. MEASURED: moving
+   * `be quiet! Pure Power 11 600W` from the psu block to the case block left
+   * `worker/normalize` + `src/App.test.tsx` at 234 passed, 0 failed.
+   *
+   * With nine numbers a MOVE shows as two counts changing and the diff NAMES BOTH TYPES, a name
+   * added to the wrong block shows as the total plus one count, and a deletion shows as the
+   * total. The consequence of a misfile is a LOST reference rather than a wrong price -- the
+   * real listing stops matching and the foreign side is refused by rule 5 -- but with 336 names
+   * hand-sorted into nine arrays, which array a line landed in is the single most likely error
+   * in this file.
+   *
+   * THE KEYS ARE WORKER TYPES, NOT CATALOG IDS. `case_fan` here is `case_fans` in
+   * src/data/catalog.ts; `catalogModels` maps through CATALOG_COMPONENT_ID. See the named trap
+   * on that record.
    */
   it("T11: all 336 catalog names, declared as their own type, resolve to themselves", () => {
     const names = WORKER_TYPES.flatMap((componentType) =>
       catalogModels(componentType).map((model) => [componentType, model] as const),
     );
     expect(names).toHaveLength(336);
-    expect(catalogModels("gpu")).toHaveLength(68);
+    expect(
+      Object.fromEntries(
+        WORKER_TYPES.map((componentType) => [componentType, catalogModels(componentType).length]),
+      ),
+    ).toEqual({
+      cpu: 45,
+      cpu_cooler: 29,
+      motherboard: 36,
+      ram: 26,
+      storage: 40,
+      gpu: 68,
+      psu: 29,
+      case: 37,
+      case_fan: 26,
+    });
 
     for (const [componentType, model] of names) {
       expect(

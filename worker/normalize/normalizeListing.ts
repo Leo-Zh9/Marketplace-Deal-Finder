@@ -105,11 +105,11 @@ export const BROKEN = [
  *
  * THE BRAND LINES ARE THE SECOND DETECTOR FOR A MACHINE WITH NO WHOLE-UNIT WORD IN ITS TITLE --
  * `"Razer Blade 16 RTX 5080"` names no `pc`, no `laptop` and no system phrase otherwise.
- * MEASURED against all 176 catalog names and the 15 live titles; three candidates were REJECTED
+ * MEASURED against all 336 catalog names and the 15 live titles; three candidates were REJECTED
  * on collisions and are named here so they are not "tidied" back in:
- *   `aorus`   -- 5 catalog motherboards (`Gigabyte X870E Aorus Master`, ...) AND Gigabyte's GPU
+ *   `aorus`   -- 8 catalog motherboards (`Gigabyte X870E Aorus Master`, ...) AND Gigabyte's GPU
  *                line. A catalog collision: T11 goes red.
- *   `nitro`   -- `Sapphire Nitro+` is a mainstream AMD GPU board partner line. THE 0/176
+ *   `nitro`   -- `Sapphire Nitro+` is a mainstream AMD GPU board partner line. THE 0/336
  *                MEASUREMENT CANNOT SEE THIS: the catalog stores generic names (`Radeon RX 7800
  *                XT`) and holds no board-partner brands at all, so "0 collisions in the catalog"
  *                is a claim about the catalog, not about real listings.
@@ -158,8 +158,10 @@ export const SYSTEM_PHRASES = [
  * benchmark: MEASURED, `"ASUS TUF Gaming A15 laptop RTX 4060"` at CA$1,200 wrote
  * `model_stats: GeForce RTX 4060 count=1 total=120000` -- the benchmark for a 4060 was a laptop.
  * The two-word `SYSTEM_PHRASES` entries could not catch it because they need adjacency.
- * MEASURED after adding them: 0 of 176 self-resolutions move, 0 of 1,408 cross-type pairs leak,
- * and no live listing changes its stored validity or model key.
+ * MEASURED WHEN THEY WERE ADDED, against the 176-name catalog as of PR #14 -- scoped rather
+ * than re-numbered, because "0 move" is a before/after ablation that cannot be re-run now: 0 of
+ * 176 self-resolutions moved, 0 of 1,408 cross-type pairs leaked, and no live listing changed
+ * its stored validity or model key. T11 and T12 carry the invariant forward at 336 and 2,688.
  *
  * THE ONE COST, NAMED: `laptop` fires on the live `"Timetec 16GB DDR4 3200MHz SODIMM Laptop
  * RAM"`. Under a gpu search that listing was already refused, so nothing stored changes; declared
@@ -196,7 +198,7 @@ export const WHOLE_UNIT = new Set([
  * `two`, `three` and `both` close the INFLATING direction of a blocking defect: MEASURED,
  * `"Two GeForce RTX 5080 cards"` at CA$4,000 was stored `VALID / GeForce RTX 5080`, which puts
  * twice the unit price into that model's benchmark and makes every genuine 5080 look like a
- * deal. MEASURED: 0 collisions across the 176 catalog names, the 15 live titles and every title
+ * deal. MEASURED: 0 collisions across the 336 catalog names, the 15 live titles and every title
  * this suite asserts must stay matched.
  *
  * THE COST, STATED RATHER THAN OMITTED. These words decline real standalone listings, and the
@@ -240,8 +242,9 @@ const LETTERS = /^[a-z]+$/;
  * INDEX 0 OR 1, because one verb before the quantity is this marketplace's house style rather
  * than a constructed shape: `"Selling My 4070 TI"` is one of the 15 real listings, and
  * `"Selling 2x GeForce RTX 5080"` at CA$4,000 was storing twice the unit price as one 5080's
- * price -- the INFLATING direction. MEASURED at index <= 1: 0 collisions across the 176 catalog
- * names, the 1,408 cross-type pairs, the 15 live titles, and all three committed corpora.
+ * price -- the INFLATING direction. MEASURED at index <= 1: 0 of the 336 catalog names trips the
+ * predicate; T12's 2,688 cross-type pairs, the 15 live titles and all seven committed corpora
+ * stay green, which is the same claim re-checked on every run rather than a one-off sweep.
  *
  * THE RESIDUAL THE SECOND INDEX DOES NOT REACH, NAMED: two words before the quantity
  * (`"Selling my 2x RTX 5080"`) is still uncaught, and is pinned in ACCEPTED_EXPOSURE.
@@ -255,10 +258,12 @@ const LETTERS = /^[a-z]+$/;
  * Each of those is refused as `unknown-quantity` where it would otherwise have been a usable
  * reference with a null key. `STANDALONE_COMPONENTS` carries one.
  *
- * THE BOUND IS WHAT IS LOAD-BEARING. MEASURED: an `Nx`-anywhere form fires on
- * `"Ryzen 5 9600X processor"` and 5 other X-suffixed CPUs as soon as any word follows the model
- * name, on all four X-suffixed Corsair PSUs the same way (`RM850x`, `RM850x Shift`,
- * `RM1000x Shift`, `RM1200x Shift` -- T11 goes red naming `Corsair RM1200x Shift`), and on
+ * THE BOUND IS WHAT IS LOAD-BEARING, AND THE CATALOG SLICE MADE IT MORE SO. MEASURED: an
+ * `Nx`-anywhere form fires on `"Ryzen 5 9600X processor"` and 14 other X-suffixed CPUs as soon
+ * as any word follows the model name -- it was 5 others before the catalog grew to 336 -- on all
+ * EIGHT X-suffixed Corsair PSUs the same way (`RM650x`, `RM750x`, `RM750x Shift`, `RM850x`,
+ * `RM850x Shift`, `RM1000x`, `RM1000x Shift`, `RM1200x Shift` -- T11 goes red naming
+ * `Corsair RM1200x Shift`), and on
  * `"MSI RTX 5080 Ventus 3X OC"`, a real cooler designation. Every one of those triples sits at
  * index 2 or beyond, which is exactly why the bound stops at 1 and why widening it further is
  * not free.
@@ -305,7 +310,7 @@ export const multiplierPrefix = (tokens: readonly Token[]): boolean => {
 /**
  * A TRAILING multiplier: `"GeForce RTX 5080 x2"` is two cards, not one.
  *
- * The last two tokens only. MEASURED: 0 collisions across the 176 catalog names, the 15 live
+ * The last two tokens only. MEASURED: 0 collisions across the 336 catalog names, the 15 live
  * titles and every title this suite pins as a match -- no catalog name ENDS in `x` followed by
  * digits, because the capacity or generation always follows (`SN850X 2TB`, `NF-A12x25 PWM`).
  *
