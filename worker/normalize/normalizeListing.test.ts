@@ -53,6 +53,7 @@ const CASES: Case[] = [
   ["T9e (rule 4): a system PHRASE the token set alone misses", "Gaming Desktop RTX 5090", 410000, "gpu", "INVALID_REFERENCE", null, "whole-system"],
   ["T9f (rule 4): 'PC case' under a case search is a case", "Lian Li Lancool 216 PC Case", 13900, "case", "VALID", "Lian Li Lancool 216", "matched"],
   ["T9g (rule 4): 'tower case' under a case search is a case", "NZXT H7 Flow tower case white", 15900, "case", "VALID", "NZXT H7 Flow", "matched"],
+  ["T9h (rule 4): 'computer case' under a case search is a case", "Fractal North computer case", 16900, "case", "VALID", "Fractal North", "matched"],
 
   // Rule 5: the majority case in the live data -- the wrong component entirely.
   ["T16 (rule 5): live -- RAM in a GPU search", "Timetec 16GB DDR4 3200MHz SODIMM Laptop RAM", 5000, "gpu", "INVALID_REFERENCE", null, "wrong-component"],
@@ -128,6 +129,146 @@ describe("normalizeListing -- the classification rules", () => {
 
   it.each(ACCEPTED_EXPOSURE)("%s", (...testCase) => {
     assertCase(testCase);
+  });
+});
+
+/**
+ * PER-ELEMENT VOCABULARY COVERAGE. Each test below carries its OWN literal copy of the
+ * vocabulary it pins. That is deliberate and it is the point: a test that iterates the
+ * production table cannot detect a deletion FROM that table, because the row vanishes with the
+ * element. Measured -- removing one element at a time from all 18 vocabularies, 92 of 119
+ * elements changed real classifications while the whole suite stayed green.
+ *
+ * Every block has a CONTROL, because "every frame is refused" is also what a rule that refuses
+ * everything produces.
+ *
+ * Named limitation: these pin removals and changes, NOT additions. T13's bidirectional audit is
+ * what catches the dangerous kind of addition -- one that overlaps an existing phrase.
+ */
+describe("normalizeListing -- every vocabulary element, one at a time", () => {
+  const GPU_FRAME = (phrase: string) => `${phrase} GeForce RTX 5080 graphics card`;
+
+  /** T21: the three refusal vocabularies and the multiplicity phrases, element by element. */
+  it.each<[string, NormalizationReason]>([
+    ["wtb", "wanted-ad"],
+    ["want to buy", "wanted-ad"],
+    ["wanted", "wanted-ad"],
+    ["looking for", "wanted-ad"],
+    ["in search of", "wanted-ad"],
+    ["iso", "wanted-ad"],
+    ["for trade", "trade-only"],
+    ["trade only", "trade-only"],
+    ["trade for", "trade-only"],
+    ["will trade", "trade-only"],
+    ["swap", "trade-only"],
+    ["trading", "trade-only"],
+    ["for parts", "not-working"],
+    ["parts only", "not-working"],
+    ["not working", "not-working"],
+    ["doesn't work", "not-working"],
+    ["broken", "not-working"],
+    ["damaged", "not-working"],
+    ["faulty", "not-working"],
+    ["cracked", "not-working"],
+    ["for repair", "not-working"],
+    ["as is", "not-working"],
+    ["lot of", "unknown-quantity"],
+    ["bundle", "unknown-quantity"],
+    ["pair of", "unknown-quantity"],
+    ["set of", "unknown-quantity"],
+    ["pcs", "unknown-quantity"],
+    ["pieces", "unknown-quantity"],
+  ])("T21: %s refuses the listing as %s", (phrase, reason) => {
+    const result = normalizeListing({ title: GPU_FRAME(phrase), priceCents: 299000, componentType: "gpu" });
+    expect(result.reason).toBe(reason);
+    expect(result.modelKey).toBeNull();
+  });
+
+  /** T21b: SYSTEM_PHRASES, element by element, in the frame that also exposes the four whose
+   * effect is otherwise indistinguishable from a bare `pc` / `computer` token: here the
+   * whole-unit token IS covered by the declared type's own marker, so only the phrase can fire. */
+  it.each([
+    ["thinkcentre"], ["thinkpad"], ["alienware"], ["optiplex"], ["elitedesk"], ["prodesk"],
+    ["macbook"], ["imac"], ["nuc"], ["all in one"], ["workstation"], ["gaming desktop"],
+    ["desktop pc"], ["desktop computer"], ["mini pc"], ["gaming laptop"], ["laptop computer"],
+  ])("T21b: %s marks the listing a whole system", (phrase) => {
+    expect(
+      normalizeListing({ title: `NZXT H7 Flow ${phrase} case`, priceCents: 15800, componentType: "case" }),
+    ).toEqual({ modelKey: null, variantKey: null, validity: "INVALID_REFERENCE", reason: "whole-system" });
+  });
+
+  it("T21b control: the same frame with no system phrase is a case", () => {
+    expect(
+      normalizeListing({ title: "NZXT H7 Flow case", priceCents: 15700, componentType: "case" }),
+    ).toEqual({ modelKey: "NZXT H7 Flow", variantKey: null, validity: "VALID", reason: "matched" });
+  });
+
+  /** T21c: WHOLE_UNIT, element by element, uncovered by any gpu marker. */
+  it.each([
+    ["pc"], ["computer"], ["tower"], ["rig"], ["prebuilt"], ["build"], ["built"], ["setup"],
+    ["battlestation"], ["machine"], ["system"],
+  ])("T21c: the whole-unit token %s marks the listing a whole system", (token) => {
+    expect(
+      normalizeListing({ title: `GeForce RTX 5080 ${token}`, priceCents: 289000, componentType: "gpu" }),
+    ).toEqual({ modelKey: null, variantKey: null, validity: "INVALID_REFERENCE", reason: "whole-system" });
+  });
+
+  it("T21c control: an unlisted trailing word leaves the card a card", () => {
+    expect(
+      normalizeListing({ title: "GeForce RTX 5080 oc", priceCents: 288000, componentType: "gpu" }),
+    ).toEqual({ modelKey: "GeForce RTX 5080", variantKey: null, validity: "VALID", reason: "matched" });
+  });
+
+  /**
+   * T21d: every MARKERS phrase of the eight non-gpu types, beside a gpu catalog model under a
+   * gpu declaration. With the marker its type is evidenced and the bundle is refused; without
+   * it, the title reads as a plain 5080.
+   *
+   * THREE `case` MARKERS ARE DELIBERATELY ABSENT: `pc case`, `computer case` and `tower case`
+   * each contain a WHOLE_UNIT token, so under a gpu declaration rule 4 fires first and the frame
+   * stops discriminating. They are pinned by T9f, T9h and T9g instead, where the declared type is
+   * `case` and the marker's own coverage is what neutralises the token.
+   */
+  it.each<[string, Listing["componentType"]]>([
+    ["processor", "cpu"], ["ryzen", "cpu"], ["threadripper", "cpu"], ["xeon", "cpu"],
+    ["i 3", "cpu"], ["i 5", "cpu"], ["i 7", "cpu"], ["i 9", "cpu"], ["core ultra", "cpu"],
+    ["pentium", "cpu"], ["athlon", "cpu"],
+    ["cpu cooler", "cpu_cooler"], ["heatsink", "cpu_cooler"], ["aio cooler", "cpu_cooler"],
+    ["air cooler", "cpu_cooler"], ["liquid cooler", "cpu_cooler"],
+    ["motherboard", "motherboard"], ["mobo", "motherboard"], ["mainboard", "motherboard"],
+    ["ddr 3", "ram"], ["ddr 4", "ram"], ["ddr 5", "ram"], ["dimm", "ram"], ["sodimm", "ram"],
+    ["memory kit", "ram"],
+    ["ssd", "storage"], ["hdd", "storage"], ["nvme", "storage"], ["hard drive", "storage"],
+    ["m 2 drive", "storage"], ["solid state", "storage"],
+    ["psu", "psu"], ["power supply", "psu"],
+    ["chassis", "case"],
+    ["case fan", "case_fan"], ["case fans", "case_fan"], ["fan pack", "case_fan"],
+  ])("T21d: %s evidences a foreign component beside a GPU", (marker) => {
+    expect(
+      normalizeListing({ title: `GeForce RTX 5080 and a ${marker}`, priceCents: 301000, componentType: "gpu" }),
+    ).toEqual({ modelKey: null, variantKey: null, validity: "INVALID_REFERENCE", reason: "mixed-components" });
+  });
+
+  it("T21d control: the same frame with no foreign marker is a plain GPU", () => {
+    expect(
+      normalizeListing({ title: "GeForce RTX 5080 and a warranty", priceCents: 302000, componentType: "gpu" }),
+    ).toEqual({ modelKey: "GeForce RTX 5080", variantKey: null, validity: "VALID", reason: "matched" });
+  });
+
+  /** T21e: the gpu markers, which the frame above cannot reach -- they ARE the declared type. */
+  it.each([["gpu"], ["graphics card"], ["video card"], ["rtx"], ["gtx"], ["geforce"], ["radeon"]])(
+    "T21e: %s confirms the listing is a GPU even with no catalog match",
+    (marker) => {
+      expect(
+        normalizeListing({ title: `${marker} for sale`, priceCents: 45900, componentType: "gpu" }),
+      ).toEqual({ modelKey: null, variantKey: null, validity: "VALID", reason: "model-unmatched" });
+    },
+  );
+
+  it("T21e control: with no gpu marker at all the rule declines to guess", () => {
+    expect(
+      normalizeListing({ title: "widget for sale", priceCents: 45800, componentType: "gpu" }),
+    ).toEqual({ modelKey: null, variantKey: null, validity: "NEEDS_REVIEW", reason: "component-unconfirmed" });
   });
 });
 

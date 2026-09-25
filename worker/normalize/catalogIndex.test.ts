@@ -99,6 +99,60 @@ describe("catalog index -- the match and its guards", () => {
   });
 });
 
+/**
+ * PER-ELEMENT VOCABULARY COVERAGE. The tests below carry their OWN literal copy of each
+ * vocabulary, deliberately: a test that iterates the production list cannot detect a deletion
+ * FROM that list, because the row disappears with the element. Measured -- that is exactly how
+ * dropping `"intel"` from OPTIONAL_LEADING passed 134 tests while silently un-matching every
+ * Intel Arc listing that omits the word "Intel".
+ *
+ * Named limitation: these pin removals and changes, NOT additions. A new entry in either set is
+ * caught only where it breaks T11's 176 self-resolutions or T13's overlap audit.
+ */
+describe("catalog index -- every vocabulary element, one at a time", () => {
+  /**
+   * T14. OPTIONAL_LEADING, element by element. The behaviour rows use a title that drops the
+   * vendor word, which is the ONLY thing the set does: it adds suffix entry points to the trie.
+   *
+   * THE COUNT MAP IS THE EVIDENCE FOR THE TWO ELEMENTS THAT HAVE NO BEHAVIOUR ROW. `nvidia` and
+   * `amd` are inert against THIS catalog -- no catalog name begins with either, so neither can
+   * ever produce a suffix entry point, and no test can kill them. They are reported as dead
+   * vocabulary rather than quietly kept; if a future catalog adds an "AMD Ryzen ..." or
+   * "NVIDIA RTX ..." name, this map changes and that decision comes back into view.
+   */
+  it("T14: each vendor prefix that a catalog name actually carries is droppable", () => {
+    const leading: Record<string, number> = { geforce: 0, nvidia: 0, radeon: 0, amd: 0, intel: 0 };
+    for (const componentType of WORKER_TYPES) {
+      for (const model of catalogModels(componentType)) {
+        const first = tokenize(model)[0].value;
+        if (first in leading) leading[first] += 1;
+      }
+    }
+    expect(leading).toEqual({ geforce: 13, nvidia: 0, radeon: 7, amd: 0, intel: 3 });
+
+    expect(match("gpu", "RTX 5080 graphics card")).toBe("GeForce RTX 5080");
+    expect(match("gpu", "RX 7800 XT graphics card")).toBe("Radeon RX 7800 XT");
+    // The one the whole sweep exists for: an Arc listing that omits the word "Intel".
+    expect(match("gpu", "Arc B580 graphics card")).toBe("Intel Arc B580");
+  });
+
+  /**
+   * T20. SUFFIX_WORDS, element by element: each one, following an otherwise-complete model name,
+   * must refuse the match. The control is what stops this being satisfiable by a matcher that
+   * refuses EVERY trailing word.
+   */
+  it.each([["ti"], ["super"], ["xt"], ["xtx"], ["gre"], ["redux"], ["le"], ["chromax"], ["rgb"], ["d"]])(
+    "T20: a trailing %s refuses the match",
+    (suffix) => {
+      expect(match("gpu", `GeForce RTX 5080 ${suffix}`)).toBeNull();
+    },
+  );
+
+  it("T20 control: an unlisted trailing word does NOT refuse the match", () => {
+    expect(match("gpu", "GeForce RTX 5080 oc")).toBe("GeForce RTX 5080");
+  });
+});
+
 describe("catalog index -- exhaustive properties", () => {
   /**
    * T11. The ANCHOR of the whole suite: a normalizer that always returns null fails 176 times

@@ -105,6 +105,17 @@ export const containsPhrase = (values: readonly string[], phrase: string): boole
  * bare `5080` in the trie, and Dell ships an OptiPlex 5080; the live data already contains that
  * hazard shape (`Lenovo ThinkCentre M70q`). The named cost: a title naming a card without its
  * series word (`"Selling my 4070 Super"`) is a MISS, and a miss is safe.
+ *
+ * `nvidia` AND `amd` ARE MEASURED INERT, AND THEY ARE KEPT ON PURPOSE. MEASURED: 0 of the 176
+ * catalog names begin with either word -- every name this set can reach today is `GeForce ...`
+ * (13), `Radeon ...` (7) or `Intel Arc ...` (3) -- so neither can produce an entry point, and no
+ * test can kill either one. DO NOT DELETE THEM FOR TIDINESS. This set ANTICIPATES catalog names
+ * rather than describing them, and whether to grow the catalog is an open question this slice
+ * deliberately did not settle. Deleted, the day a vendor-prefixed name lands is SILENT: the full
+ * name still self-resolves so T11 stays green, while a title naming that card without its vendor
+ * word quietly stops matching. Kept, that day is LOUD: T14 in catalogIndex.test.ts asserts the
+ * count map `{geforce: 13, nvidia: 0, radeon: 7, amd: 0, intel: 3}` and fails the moment it stops
+ * being true, which puts the decision in front of a human instead of into an aggregate.
  */
 const OPTIONAL_LEADING = new Set(["geforce", "nvidia", "radeon", "amd", "intel"]);
 
