@@ -339,12 +339,47 @@ const COMPONENT_TYPES = Object.keys(MARKERS) as Listing["componentType"][];
 const containsAnyPhrase = (values: readonly string[], phrases: readonly string[]): boolean =>
   phrases.some((phrase) => containsPhrase(values, phrase));
 
+/**
+ * Tokens whose marker coverage must TRAIL the model name rather than lead it.
+ *
+ * WHY THIS EXISTS, AND WHY IT HOLDS EXACTLY ONE WORD. Retail box wording follows the product --
+ * `"Ryzen 7 9800X3D Desktop Processor"` -- while a prebuilt's spec list leads with the machine
+ * and then lists what is inside it. Punctuation is stripped before matching, so
+ * `"Dell Desktop | Processor: Core i9-14900K | 32GB | 1TB"` tokenizes `desktop` and `processor`
+ * ADJACENT: the `desktop processor` marker matched at the front of the title and neutralised the
+ * very token that says the listing is a whole machine. MEASURED: that title was stored
+ * `VALID / Core i9-14900K` at CA$1,500, so a whole prebuilt became the i9-14900K benchmark --
+ * roughly 2x the real price, in the inflating direction. The same shape reached RAM, and
+ * pipe-delimited spec lists are the live data's own house style: 2 of the 15 production listings
+ * are one, surviving today only because they happen to carry a `pc` token as well.
+ *
+ * SCOPED TO `desktop` DELIBERATELY. The general rule -- "a marker only neutralises what follows a
+ * matched model" -- regresses `"PC Case - Fractal North"`, where `pc case` leads and the model
+ * span follows it, which is ordinary case phrasing rather than a spec list. `pc`, `computer` and
+ * `tower` keep their position-free neutralisation.
+ *
+ * THE COST, NAMED: with no catalog match there is no span to trail, so
+ * `"AMD Ryzen 5 5600 Desktop Processor"` -- a real CPU the catalog does not list -- is refused as
+ * a whole system rather than stored as an unmatched component. A lost reference, never a wrong
+ * one, and the direction every tie in this file breaks.
+ */
+const COVERED_ONLY_WHEN_TRAILING = new Set(["desktop"]);
+
 /** The token positions consumed by a marker phrase of the DECLARED component type. */
-const markerCoverage = (values: readonly string[], declared: Listing["componentType"]): Set<number> => {
+const markerCoverage = (
+  values: readonly string[],
+  tokens: readonly Token[],
+  declared: Listing["componentType"],
+): Set<number> => {
   const covered = new Set<number>();
+  const modelSpans = matchCatalogSpans(MODEL_INDEXES[declared], tokens);
   for (const phrase of MARKERS[declared]) {
     for (const [from, to] of phraseSpans(values, tokenValues(tokenize(phrase)))) {
-      for (let index = from; index < to; index += 1) covered.add(index);
+      const trailsAModel = modelSpans.some((span) => from >= span.end);
+      for (let index = from; index < to; index += 1) {
+        if (COVERED_ONLY_WHEN_TRAILING.has(values[index]) && !trailsAModel) continue;
+        covered.add(index);
+      }
     }
   }
   return covered;
@@ -353,10 +388,11 @@ const markerCoverage = (values: readonly string[], declared: Listing["componentT
 /** True when a token of `vocabulary` appears at a position no declared-type marker covers. */
 const hasUncovered = (
   values: readonly string[],
+  tokens: readonly Token[],
   declared: Listing["componentType"],
   vocabulary: ReadonlySet<string>,
 ): boolean => {
-  const covered = markerCoverage(values, declared);
+  const covered = markerCoverage(values, tokens, declared);
   return values.some((value, index) => vocabulary.has(value) && !covered.has(index));
 };
 
@@ -405,7 +441,7 @@ export const freeItemEvidence = (
   declared: Listing["componentType"],
 ): boolean => {
   if (values[0] !== "free") return false;
-  if (markerCoverage(values, declared).has(1)) return true;
+  if (markerCoverage(values, tokens, declared).has(1)) return true;
   return matchCatalogSpans(MODEL_INDEXES[declared], tokens).some(
     (span) => span.start <= 1 && 1 < span.end,
   );
@@ -413,9 +449,10 @@ export const freeItemEvidence = (
 
 export const systemEvidence = (
   values: readonly string[],
+  tokens: readonly Token[],
   declared: Listing["componentType"],
 ): boolean =>
-  containsAnyPhrase(values, SYSTEM_PHRASES) || hasUncovered(values, declared, WHOLE_UNIT);
+  containsAnyPhrase(values, SYSTEM_PHRASES) || hasUncovered(values, tokens, declared, WHOLE_UNIT);
 
 /**
  * `modelKey` and `variantKey` are NULL whenever validity is not VALID. Otherwise the trade-only
@@ -473,7 +510,7 @@ export const normalizeListing = (input: {
 
   // 4: THE DANGEROUS CASE. A CA$2,000 machine whose title names a real GPU must never enter that
   // GPU's average.
-  if (systemEvidence(values, declared)) return refuse("INVALID_REFERENCE", "whole-system");
+  if (systemEvidence(values, tokens, declared)) return refuse("INVALID_REFERENCE", "whole-system");
 
   // 5: a component of another type is evidenced. The MAJORITY case in the live data.
   if (foreign.length > 0) {

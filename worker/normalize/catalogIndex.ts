@@ -130,7 +130,14 @@ const OPTIONAL_LEADING = new Set(["geforce", "nvidia", "radeon", "amd", "intel"]
  *   `atx`      -- a form factor, not a variant: `"MSI MAG B650 Tomahawk WiFi ATX motherboard"`
  *                 is the catalog model, and the collector's own fixture has that shape.
  *   `expo`     -- a memory profile the catalog kits already carry.
- *   `core`     -- collides with Intel's `Core` naming.
+ *   `core`     -- NOT for the reason first written here. "collides with Intel's `Core` naming"
+ *                 was DISPROVED: Intel's `Core` is always a PREFIX, and G2 only ever inspects the
+ *                 token AFTER a completed match, so that collision cannot occur -- 0 across 3,168
+ *                 catalog-derived titles. The real reason is that `core` genuinely follows a
+ *                 completed match in ordinary CPU phrasing, and THIS LIST IS GLOBAL ACROSS ALL
+ *                 NINE COMPONENT TYPES: a word admitted to fix one `case` variant applies to the
+ *                 cpu index too. Type-scoped suffix lists would let `case` have it without cpu
+ *                 paying for it; that is a design change and is out of scope here.
  *   `a`        -- the English article. `"GeForce RTX 5080 a great deal"` would stop matching.
  *   `fe`       -- a Founders Edition is the same die and the same comparison product.
  *   `tg`, `platinum` -- could not be established as DIFFERENT from the catalog entry rather than

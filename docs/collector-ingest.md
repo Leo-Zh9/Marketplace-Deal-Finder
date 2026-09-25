@@ -312,6 +312,24 @@ and that argument stopped being true once `MARKERS.cpu` gained `desktop processo
 already covers `pc`. Both titles resolve to their catalog models, and `"Dell Desktop GeForce RTX
 4060"` — a CA$1,100 prebuilt that was writing itself into the 4060 benchmark — is refused.
 
+**And coverage for `desktop` must TRAIL the model name, which is a second lesson from the same
+repair.** Punctuation is stripped before matching, so a prebuilt's spec list tokenizes `desktop`
+and `processor` adjacent — `"Dell Desktop | Processor: Core i9-14900K | 32GB | 1TB"` — and the
+marker that exists to neutralise retail box wording was neutralising the very token that says the
+listing is a whole machine. Measured, that title was stored `VALID / Core i9-14900K` at CA$1,500:
+a whole prebuilt as the CPU benchmark, roughly 2× the real price, in the inflating direction. The
+same shape reached RAM, and **pipe-delimited spec lists are the live data's own house style** — 2
+of the 15 production listings are one. So `desktop` is neutralised only by a marker phrase that
+starts at or after the end of a matched model's span: retail wording trails the product, a spec
+list leads it. **Scoped to `desktop` alone** — the general rule regresses `"PC Case - Fractal
+North"`, where `pc case` leads and the model follows, which is ordinary case phrasing. The named
+cost: with no catalog match there is no span to trail, so `"AMD Ryzen 5 5600 Desktop Processor"` —
+a real CPU the catalog does not list — is refused rather than stored with a null key.
+
+**The measurement that accompanied the `desktop` repair was blind to word order**, because every
+collision title it tested puts the retail wording after the model. The corpora caught what the
+targeted measurement could not; that has now happened three times in this slice.
+
 **That question has a general answer, so it is not re-asked each round.** A marker can only
 neutralise a **whole-unit token**: `systemEvidence` is the single place coverage is consulted,
 while `SYSTEM_PHRASES`, `MULTIPLE`, `MULTI_UNIT` and both multiplier predicates are checked
@@ -371,7 +389,7 @@ live 5080 is CA$3,000. Any threshold would be a fabricated number.
 **Every figure below is measured from a corpus committed in
 `worker/normalize/normalizeListing.test.ts`** — `STANDALONE_COMPONENTS` (28 titles),
 `WHOLE_MACHINES` (30), `BOARD_PARTNER_TITLES` (6), `ACCEPTED_BRAND_WORD_TITLES` (8),
-`FREE_PHRASINGS` (17) and `SKU_SUFFIX_PHRASINGS` (20).
+`FREE_PHRASINGS` (19) and `SKU_SUFFIX_PHRASINGS` (21).
 
 **These are not the corpora the earlier figures came from, and the numbers are not continuous
 with them.** The previous "3 of 24" and "1 of 29" were quoted from sets that lived only in a
@@ -407,8 +425,13 @@ having improved by one. That old set's gap is how a laptop's whole price reached
    — `"Free to a good home GeForce RTX 5080"`, or the same phrase written tail-first. Rule 8
    requires the token after a leading `free` to be the item. A free listing cannot reach a
    benchmark in any case, so this costs a `DEAL` verdict rather than a reference.
-   `FREE_PHRASINGS` (17 real phrasings) is the committed corpus that keeps the family
-   re-measurable; it found two live defects on its first run.
+   `FREE_PHRASINGS` (19 real phrasings) is the committed corpus that keeps the family
+   re-measurable; it found two live defects on its first run. It also bounds the **free-accessory**
+   family: when the free thing is an accessory whose own word is a marker of the declared type
+   (`"Free graphics card box with GeForce RTX 5080"`), the predicate reads it as the item and the
+   listing stays `VALID` at CA$0. No benchmark impact — a zero price cannot contribute — so the
+   cost is a spurious `DEAL` under `MAXIMUM_PRICE`, which is the square row 3 of the evaluation
+   table already documents and accepts.
 7. **Seven real SKU-variant phrasings still pool into their base model** — a year suffix
    (`RM850x 2021`), a form factor (`Focus GX-850 ATX 3.0`), an `A-RGB` that tokenizes as two
    words, `North XL TG`, a `DDR5 EXPO` kit, `SF1000 Platinum` and `4000D Airflow Core`. Each is a

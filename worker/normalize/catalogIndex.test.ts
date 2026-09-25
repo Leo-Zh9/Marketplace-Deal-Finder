@@ -141,7 +141,12 @@ describe("catalog index -- every vocabulary element, one at a time", () => {
    * must refuse the match. The control is what stops this being satisfiable by a matcher that
    * refuses EVERY trailing word.
    */
-  it.each([["ti"], ["super"], ["xt"], ["xtx"], ["gre"], ["redux"], ["le"], ["chromax"], ["rgb"], ["d"]])(
+  it.each([
+    ["ti"], ["super"], ["xt"], ["xtx"], ["gre"], ["redux"], ["le"], ["chromax"], ["rgb"], ["d"],
+    // The three the SKU-suffix corpus added. Without these rows each is killed only by a single
+    // corpus row -- and corpus rows get edited when a mis-pool closes. This file's own rule.
+    ["ii"], ["touch"], ["argb"],
+  ])(
     "T20: a trailing %s refuses the match",
     (suffix) => {
       expect(match("gpu", `GeForce RTX 5080 ${suffix}`)).toBeNull();

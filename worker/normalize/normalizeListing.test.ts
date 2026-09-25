@@ -70,6 +70,16 @@ const CASES: Case[] = [
   // R3: `katana` was admitted as a laptop line and had to come out -- Scythe Katana is a
   // mainstream tower cooler.
   ["R3a (rule 4): a cooler line that is not a laptop", "Scythe Katana 5 CPU cooler", 4500, "cpu_cooler", "VALID", null, "model-unmatched"],
+  // B1: a marker phrase neutralises `desktop` only where it TRAILS the matched model. Punctuation
+  // is stripped, so a prebuilt's spec list tokenizes `desktop` and `processor` adjacent and the
+  // marker was neutralising the very token that says the listing is a whole machine. MEASURED:
+  // the first row was stored VALID / Core i9-14900K at CA$1,500 -- a prebuilt as the CPU
+  // benchmark, and pipe-delimited spec lists are the live data's own house style.
+  ["B1a (rule 4): a spec list LEADS with the machine", "Dell Desktop | Processor: Core i9-14900K | 32GB | 1TB", 150000, "cpu", "INVALID_REFERENCE", null, "whole-system"],
+  ["B1b (rule 4): the same shape on RAM", "Dell Desktop | Memory: Kingston Fury Beast 32GB DDR4 | 1TB", 151000, "ram", "INVALID_REFERENCE", null, "whole-system"],
+  // B1c PINS THE SCOPE: the trailing rule is `desktop` only. `pc case` LEADS this title and the
+  // model follows it, which is ordinary case phrasing -- the general rule would refuse it.
+  ["B1c (rule 4): a leading 'pc case' still neutralises", "PC Case - Fractal North", 17700, "case", "VALID", "Fractal North", "matched"],
 
   // Rule 5: the majority case in the live data -- the wrong component entirely.
   //
@@ -165,6 +175,9 @@ const ACCEPTED_EXPOSURE: Case[] = [
   // The trailing multiplier's own residual, in the SAFE direction: a model name truncated to
   // exactly `<letters> x <digits>` reads as a count. A lost reference, never a wrong one.
   ["T36e: a truncated model name reads as a count", "G.Skill Flare X5", 17500, "ram", "NEEDS_REVIEW", null, "unknown-quantity"],
+  // B1's own named cost: with no catalog match there is no model span for the marker to trail,
+  // so a real CPU the catalog does not list is refused rather than stored with a null key.
+  ["T36f: retail box wording on an uncatalogued model", "AMD Ryzen 5 5600 Desktop Processor", 22000, "cpu", "INVALID_REFERENCE", null, "whole-system"],
 ];
 
 const assertCase = ([, title, priceCents, componentType, validity, modelKey, reason]: Case): void => {
@@ -509,6 +522,13 @@ const FREE_PHRASINGS: [string, "usable" | "refused"][] = [
   ["GeForce RTX 5080, free to a good home", "refused"],
   // THE NAMED COST: a real free item with anything between `free` and the item.
   ["Free to a good home GeForce RTX 5080", "refused"],
+  // THE FREE-ACCESSORY FAMILY, BOUNDED RATHER THAN CODED AROUND. When the free thing is an
+  // accessory whose own word is a marker of the declared type, the predicate reads it as the
+  // item. Both are VALID with a model key at CA$0 -- no benchmark impact, because
+  // `recordSightings` requires `priceCents > 0`; the cost is a spurious DEAL under MAXIMUM_PRICE,
+  // which is the square the evaluation table already documents and accepts. Rows, not a fix.
+  ["Free graphics card box with GeForce RTX 5080", "usable"],
+  ["Free gpu support bracket with GeForce RTX 5080", "usable"],
 ];
 
 /**
@@ -523,8 +543,8 @@ const FREE_PHRASINGS: [string, "usable" | "refused"][] = [
  * TEN mis-pools in twenty titles. Three were closed by adding `ii`, `touch` and `argb`, each
  * measured free against the 176 names, the 15 live titles and every title this suite pins as a
  * match. Six remain ACCEPTED EXPOSURE, pinned below with the reason each word was refused, and a
- * seventh -- the year suffix -- was already a standing decision. An unmeasured residual is --
- * an unmeasured residual is what `Corsair RM850x 2021` was before anyone looked.
+ * seventh -- the year suffix -- was already a standing decision. An unmeasured residual is what
+ * `Corsair RM850x 2021` was before anyone looked.
  */
 const SKU_SUFFIX_PHRASINGS: [Listing["componentType"], string, "refused" | "pooled"][] = [
   // Closed by the list as it stands.
@@ -553,6 +573,10 @@ const SKU_SUFFIX_PHRASINGS: [Listing["componentType"], string, "refused" | "pool
   // NOT A MIS-POOL, and listed so nobody "fixes" it: a Founders Edition is the same die and the
   // same comparison product as the board-partner cards. Refusing it would cost a real reference.
   ["gpu", "GeForce RTX 5080 Founders Edition", "pooled"],
+  // The abbreviation IS the decision `fe` was refused over; the spelled-out row above exercises
+  // the word `founders` instead. Also correct: the catalog stores generic names, so every
+  // board-partner variant already pools into them and an FE is no different.
+  ["gpu", "GeForce RTX 5080 FE", "pooled"],
 ];
 
 describe("normalizeListing -- the measured cost and the measured residual", () => {
@@ -632,31 +656,32 @@ describe("normalizeListing -- the measured cost and the measured residual", () =
    * predicate asks what `free` is attached to instead of listing what it must not be.
    */
   it("R1c: every real free phrasing lands on the right side of rule 8", () => {
-    expect(FREE_PHRASINGS).toHaveLength(17);
+    expect(FREE_PHRASINGS).toHaveLength(19);
     for (const [title, expected] of FREE_PHRASINGS) {
       const result = normalizeListing({ title, priceCents: 0, componentType: "gpu" });
       const actual = result.validity === "VALID" && result.modelKey !== null ? "usable" : "refused";
       expect(actual, title).toBe(expected);
     }
-    // Not satisfiable by refusing everything: five rows must still come back with a model key.
-    expect(FREE_PHRASINGS.filter(([, e]) => e === "usable")).toHaveLength(8);
+    // Not satisfiable by refusing everything: ten rows must still come back with a model key.
+    expect(FREE_PHRASINGS.filter(([, e]) => e === "usable")).toHaveLength(10);
   });
 
   /**
-   * R6. THE SUFFIX RESIDUAL, MEASURED. Seven of the eight pooling rows are mis-pools and are
-   * ACCEPTED EXPOSURE (the eighth, the Founders Edition, is correct); the assertion is per row, so closing one shows up as a failure asking for the
+   * R6. THE SUFFIX RESIDUAL, MEASURED. Seven of the nine pooling rows are mis-pools and are
+   * ACCEPTED EXPOSURE (the other two, the Founders Edition rows, are correct); the assertion is per row, so closing one shows up as a failure asking for the
    * comment to be updated, and a NEW mis-pool shows up as a row that was refused and no longer is.
    */
   it("R6: every real SKU-suffix phrasing lands where the measurement says, pooled ones included", () => {
-    expect(SKU_SUFFIX_PHRASINGS).toHaveLength(20);
+    expect(SKU_SUFFIX_PHRASINGS).toHaveLength(21);
     for (const [componentType, title, expected] of SKU_SUFFIX_PHRASINGS) {
       const result = normalizeListing({ title, priceCents: 6300, componentType });
       expect(result.modelKey === null ? "refused" : "pooled", title).toBe(expected);
     }
-    // Not satisfiable by refusing everything, nor by matching everything. EIGHT rows pool:
-    // seven are mis-pools and accepted exposure, and the eighth -- the Founders Edition -- is
-    // the correct answer, because it is the same product as the board-partner cards.
-    expect(SKU_SUFFIX_PHRASINGS.filter(([, , e]) => e === "pooled")).toHaveLength(8);
+    // Not satisfiable by refusing everything, nor by matching everything. NINE rows pool: seven
+    // are mis-pools and accepted exposure, and two -- the Founders Edition spelled out and
+    // abbreviated -- are the correct answer, because the catalog stores generic names and every
+    // board-partner variant already pools into them.
+    expect(SKU_SUFFIX_PHRASINGS.filter(([, , e]) => e === "pooled")).toHaveLength(9);
   });
 
   it("F5c: no board-partner brand word refuses a real component listing", () => {
