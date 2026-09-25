@@ -276,14 +276,16 @@ Two or more distinct models in one title is a refusal, not a choice.
 2.  trade only        for trade, trade only, swap, trading, ...             -> INVALID_REFERENCE
 3.  broken / parts    for parts, not working, damaged, as is, ...           -> INVALID_REFERENCE
 4.  whole system      a system brand or product line, or an uncovered whole-unit
-                      token (pc, tower, build, rig, laptop, notebook, ...)  -> INVALID_REFERENCE
+                      token (pc, tower, build, rig, laptop, notebook,
+                      desktop, ...)                                         -> INVALID_REFERENCE
 5.  foreign parts     another component type is evidenced                   -> INVALID_REFERENCE
 6.  multiple models   two catalog models of the declared type               -> INVALID_REFERENCE
 7.  unknown quantity  lot of / bundle / pcs / two / three / both, a `pack`
                       token, or an `Nx` multiplier in the first two tokens
                       or the last two                                       -> NEEDS_REVIEW
-8.  placeholder zero  price 0 and nothing says the ITEM is free (a leading
-                      `free`, or `free to a good home` / `free item`)       -> NEEDS_REVIEW
+8.  placeholder zero  price 0 and nothing says the ITEM is free: `free` must
+                      LEAD the title and no shipping/pickup/delivery word
+                      may appear ANYWHERE in it                             -> NEEDS_REVIEW
 9.  unconfirmed       no catalog match and no marker for the declared type  -> NEEDS_REVIEW
 10. unmatched         the right component, not in the catalog   -> VALID, modelKey null
 11. matched           exactly one catalog model                 -> VALID, that model
@@ -293,16 +295,32 @@ Rule 4 is neutralised by a marker of the **declared** type, so `"Lian Li Lancool
 under a `case` search is a case and not a PC. Rule 7's `pack` is **not**: a fan pack really is a
 pack, on the one component type where Arctic, Noctua and Corsair all sell in 3- and 5-packs.
 
-**Rule 4's whole-unit tokens include `laptop` and `notebook` but not `desktop`**, and those are
-two different measurements rather than one. `desktop` fires on the catalog's own product wording
-— `"AMD Ryzen 7 9800X3D Desktop Processor"`, `"Kingston Fury Beast 32GB DDR4 desktop memory"` —
-so it is a phrase, never a token. `laptop` and `notebook` carry no such collision. Nine
-system-only product lines (`razer blade`, `legion`, `omen`, `victus`, `zephyrus`, `xps`,
-`ideapad`, `pavilion`, `katana`) are the second detector for a machine whose title names no
-whole-unit word at all, such as `"Razer Blade 16 RTX 5080"`. **Three brand candidates were
-refused on measured collisions:** `aorus` (5 catalog motherboards, and Gigabyte's GPU line),
-`nitro` (`Sapphire Nitro+` is a mainstream AMD board-partner GPU line) and `predator` (Acer sells
-Predator RAM and NVMe drives).
+**Rule 4's whole-unit tokens include `laptop`, `notebook` and `desktop`.** `desktop` was
+excluded at first because the bare token fires on the catalog's own product wording —
+`"AMD Ryzen 7 9800X3D Desktop Processor"`, `"Kingston Fury Beast 32GB DDR4 desktop memory"` —
+and that argument stopped being true once `MARKERS.cpu` gained `desktop processor` and
+`MARKERS.ram` gained `desktop memory`: those phrases **cover** the word exactly as `pc case`
+already covers `pc`. Both titles resolve to their catalog models, and `"Dell Desktop GeForce RTX
+4060"` — a CA$1,100 prebuilt that was writing itself into the 4060 benchmark — is refused.
+
+**That question has a general answer, so it is not re-asked each round.** A marker can only
+neutralise a **whole-unit token**: `systemEvidence` is the single place coverage is consulted,
+while `SYSTEM_PHRASES`, `MULTIPLE`, `MULTI_UNIT` and both multiplier predicates are checked
+unconditionally. Measured over the other seven words excluded on a collision argument — `dual`,
+`x 2`, `x 3`, `aorus`, `nitro`, `predator`, `katana` — **none is marker-dissolvable**, on two
+independent grounds: none sits in a marker-neutralised vocabulary, and no marker phrase contains
+any of them. Their collisions are with catalog model names and with component product lines,
+which a marker cannot dissolve by construction.
+
+**Eight system-only product lines** (`razer blade`, `legion`, `omen`, `victus`, `zephyrus`,
+`xps`, `ideapad`, `pavilion`) are the second detector for a machine whose title names no
+whole-unit word at all, such as `"Razer Blade 16 RTX 5080"`. **Four brand candidates were refused
+on measured collisions:** `aorus` (5 catalog motherboards, and Gigabyte's GPU line), `nitro`
+(`Sapphire Nitro+` is a mainstream AMD board-partner GPU line), `predator` (Acer sells Predator
+RAM and NVMe drives) and `katana` (`Scythe Katana` is a mainstream tower CPU cooler) — the last
+of these was **admitted for a round and caught on re-review**, because the corpus guarding these
+words held a title for every *rejected* word and none for any *accepted* one, so it could only
+ever confirm a refusal. It now carries a row for each accepted word too.
 
 **Rule 7's multiplier is POSITIONAL, at both ends, and the bound is the whole design.** An `Nx`
 within the **first two** tokens and an `x2` in the **last two** are counts. The first two rather
@@ -332,16 +350,19 @@ live 5080 is CA$3,000. Any threshold would be a fabricated number.
 - **10** sub-phrase overlaps exist across the eighteen vocabularies, all of them known and
   pinned; an eleventh fails the suite.
 - CPU, measured in Node on a development machine rather than in workerd — the same caveat
-  `worker/evaluation/evaluationCpu.test.ts` carries: **p95 0.20 ms** for a 15-listing window, and
-  **p95 2.95 ms** for the worst legal batch (100 listings × 300-character titles one token under
-  the cap, which is the expensive side of it — a title that *hits* the cap short-circuits at rule
-  0 and costs 0.22 ms). The repo's own invariant is p95 < 8 ms.
+  `worker/evaluation/evaluationCpu.test.ts` carries, and re-measured after the vocabularies grew:
+  **p95 0.22 ms** for a 15-listing window, and **p95 3.3 ms** (3.29–3.36 over three consecutive
+  runs) for the worst legal batch — 100 listings × 300-character titles one token under the cap,
+  which is the expensive side of it, since a title that *hits* the cap short-circuits at rule 0
+  and costs 0.21 ms. The repo's own invariant is p95 < 8 ms, and the test asserts against it
+  rather than against these figures.
 
 ### The residuals, named — and the corpora they are measured from
 
 **Every figure below is measured from a corpus committed in
-`worker/normalize/normalizeListing.test.ts`** — `STANDALONE_COMPONENTS` (24 titles),
-`WHOLE_MACHINES` (30) and `BOARD_PARTNER_TITLES` (5).
+`worker/normalize/normalizeListing.test.ts`** — `STANDALONE_COMPONENTS` (28 titles),
+`WHOLE_MACHINES` (30), `BOARD_PARTNER_TITLES` (6), `ACCEPTED_BRAND_WORD_TITLES` (8) and
+`FREE_PHRASINGS` (15).
 
 **These are not the corpora the earlier figures came from, and the numbers are not continuous
 with them.** The previous "3 of 24" and "1 of 29" were quoted from sets that lived only in a
@@ -363,15 +384,30 @@ having improved by one. That old set's gap is how a laptop's whole price reached
    can never be a count word here. Both put N units' price into a one-unit benchmark, which makes
    genuine listings look like deals. The second is a **permanent** residual rather than an
    oversight; the first would cost the collisions listed above to close.
-4. **4 of 24 realistic standalone-component titles are declined** that a human would accept:
-   three from the token `build` or the phrase `gaming PC`, and one — `"Arctic P12 Max fan pack"` —
-   from the deliberate choice that a fan pack really is a pack. Every one costs a lost reference,
-   never a wrong one. *(The figure was previously reported as 3; that count omitted the fourth.)*
+4. **8 of 28 realistic standalone-component titles are declined** that a human would accept:
+   three from the token `build` or the phrase `gaming PC`; one from the deliberate choice that a
+   fan pack really is a pack; three from the quantity words (`"two months old"`,
+   `"fits both AM4 and AM5"`, and `"32GB 2x16"`, which PLAN.md:54 calls one kit); and one from the
+   multiplier bound (`"AMD 9600X processor"` — a bare SKU with one word in front of it). Every one
+   costs a lost reference, never a wrong one. **The figure has moved twice and both moves are the
+   point:** it was reported as 3 when it was 4, and the four quantity shapes were simply not in
+   the corpus until the vocabulary that declines them was reviewed.
 5. **A model name truncated to `<letters> x <digits>`** — `"G.Skill Flare X5"` with nothing after
    it — reads as a trailing count. A lost reference, in the safe direction.
+6. **A genuinely free item phrased tail-first** (`"GeForce RTX 5080, free to a good home"`) and a
+   free item that is also collection-only (`"FREE GeForce RTX 5080 pick up only"`) are both
+   `NEEDS_REVIEW`. Rule 8 requires `free` to LEAD the title and no shipping or pickup word to
+   appear anywhere; a token denylist cannot tell `"free … pick up only"` from `"free pick up"`.
+   Lost references, in the safe direction, and `FREE_PHRASINGS` is the committed corpus that
+   makes the whole family re-measurable rather than one word per review round.
+7. **A component pulled from a machine of an admitted brand line** — `"RTX 4070 pulled from a
+   Razer Blade 16"` — is refused as a whole system. Correct for a laptop part, which is a
+   different product from its desktop namesake; a lost reference for a desktop part.
+   `ACCEPTED_BRAND_WORD_TITLES` carries one row per admitted word.
 
-Residuals 1, 2, 3 and 5 are pinned as expected-to-behave-this-way rows in
-`ACCEPTED_EXPOSURE`, so the next one is visible rather than discovered in an aggregate.
+Residuals 1, 2, 3 and 5 are pinned as expected-to-behave-this-way rows in `ACCEPTED_EXPOSURE`,
+and 4, 6 and 7 are pinned by the corpora named above, so the next one is visible rather than
+discovered in an aggregate.
 
 ---
 

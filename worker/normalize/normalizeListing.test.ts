@@ -18,7 +18,6 @@ import { tokenValues, tokenize } from "./catalogIndex";
 import {
   BROKEN,
   FREE_IS_NOT_THE_ITEM,
-  FREE_ITEM_PHRASES,
   MARKERS,
   MULTIPLE,
   MULTI_UNIT,
@@ -63,6 +62,15 @@ const CASES: Case[] = [
   ["F1b (rule 4): the whole-unit token 'notebook'", "Dell G15 notebook RTX 4060", 125000, "gpu", "INVALID_REFERENCE", null, "whole-system"],
   ["F1c (rule 4): a brand line with NO whole-unit word at all", "Razer Blade 16 RTX 5080", 351000, "gpu", "INVALID_REFERENCE", null, "whole-system"],
   ["F1d (rule 4): a second brand line, same shape", "HP Omen 16 with RTX 4060", 130000, "gpu", "INVALID_REFERENCE", null, "whole-system"],
+  // R2: `desktop` was excluded because the bare token fired on the catalog's own product
+  // wording. Two marker phrases dissolve that collision, and the prebuilt it was letting
+  // through was writing a CA$1,100 whole desktop into the 4060 benchmark.
+  ["R2a (rule 4): the whole-unit token 'desktop'", "Dell Desktop GeForce RTX 4060", 110000, "gpu", "INVALID_REFERENCE", null, "whole-system"],
+  ["R2b (rule 4): 'desktop processor' covers it for a CPU", "AMD Ryzen 7 9800X3D Desktop Processor", 79000, "cpu", "VALID", "Ryzen 7 9800X3D", "matched"],
+  ["R2c (rule 4): 'desktop memory' covers it for RAM", "Kingston Fury Beast 32GB DDR4 desktop memory", 11900, "ram", "VALID", "Kingston Fury Beast 32GB DDR4", "matched"],
+  // R3: `katana` was admitted as a laptop line and had to come out -- Scythe Katana is a
+  // mainstream tower cooler.
+  ["R3a (rule 4): a cooler line that is not a laptop", "Scythe Katana 5 CPU cooler", 4500, "cpu_cooler", "VALID", null, "model-unmatched"],
 
   // Rule 5: the majority case in the live data -- the wrong component entirely.
   //
@@ -106,6 +114,11 @@ const CASES: Case[] = [
   // this table now carry priceCents 0; in every one of them the zero IS the subject.
   ["F3a (rule 8): free SHIPPING is not a free item", "GeForce RTX 5080 - free shipping", 0, "gpu", "NEEDS_REVIEW", null, "ambiguous-zero-price"],
   ["F3b (rule 8): nor is it when it leads the title", "Free shipping on this GeForce RTX 5080", 0, "gpu", "NEEDS_REVIEW", null, "ambiguous-zero-price"],
+  // R1: the first guard tested three words at exactly the SECOND token, so one adjective walked
+  // through -- and "free local pickup" is the commonest form of the phrase here. The position is
+  // now on the qualifier and the "anywhere" on the disqualifier.
+  ["R1a (rule 8): an adjective between 'free' and 'pickup'", "Free local pickup - GeForce RTX 5080", 0, "gpu", "NEEDS_REVIEW", null, "ambiguous-zero-price"],
+  ["R1b (rule 8): a free-item phrase that does not lead the title", "GeForce RTX 5080 with free item included", 0, "gpu", "NEEDS_REVIEW", null, "ambiguous-zero-price"],
 
   // Rule 9: nothing says this is even the declared component. Do not guess.
   ["T5 (rule 9): live -- no brand, no series word", "Selling My 4070 TI", 100000, "gpu", "NEEDS_REVIEW", null, "component-unconfirmed"],
@@ -232,7 +245,7 @@ describe("normalizeListing -- every vocabulary element, one at a time", () => {
     ["macbook"], ["imac"], ["nuc"], ["all in one"], ["workstation"], ["gaming desktop"],
     ["desktop pc"], ["desktop computer"], ["mini pc"], ["gaming laptop"], ["laptop computer"],
     ["razer blade"], ["legion"], ["omen"], ["victus"], ["zephyrus"], ["xps"], ["ideapad"],
-    ["pavilion"], ["katana"],
+    ["pavilion"],
   ])("T21b: %s marks the listing a whole system", (phrase) => {
     expect(
       normalizeListing({ title: `NZXT H7 Flow ${phrase} case`, priceCents: 15800, componentType: "case" }),
@@ -248,7 +261,7 @@ describe("normalizeListing -- every vocabulary element, one at a time", () => {
   /** T21c: WHOLE_UNIT, element by element, uncovered by any gpu marker. */
   it.each([
     ["pc"], ["computer"], ["tower"], ["rig"], ["prebuilt"], ["build"], ["built"], ["setup"],
-    ["battlestation"], ["machine"], ["system"], ["laptop"], ["notebook"],
+    ["battlestation"], ["machine"], ["system"], ["laptop"], ["notebook"], ["desktop"],
   ])("T21c: the whole-unit token %s marks the listing a whole system", (token) => {
     expect(
       normalizeListing({ title: `GeForce RTX 5080 ${token}`, priceCents: 289000, componentType: "gpu" }),
@@ -307,22 +320,21 @@ describe("normalizeListing -- every vocabulary element, one at a time", () => {
     },
   );
 
-  /** T23b: each phrase that can only describe the ITEM being free, at a real CA$0 price. */
-  it.each([["free to a good home"], ["free item"]])(
-    "T23b: %s keeps a CA$0 listing usable",
-    (phrase) => {
-      expect(
-        normalizeListing({ title: `GeForce RTX 5080 ${phrase}`, priceCents: 0, componentType: "gpu" }),
-      ).toEqual({ modelKey: "GeForce RTX 5080", variantKey: null, validity: "VALID", reason: "matched" });
-    },
-  );
-
-  /** T23c: each word that makes a LEADING `free` describe something other than the item. */
-  it.each([["shipping"], ["delivery"], ["postage"]])(
-    "T23c: a leading 'free %s' does not make the item free",
+  /**
+   * T23c: each disqualifier word, placed at the END of the title rather than beside the `free`.
+   * The frame is deliberately the one the FIRST version of this guard passed and the defect
+   * walked through: a leading `free`, the word far away from it, and a real CA$0 price.
+   *
+   * WHAT THIS TEST CANNOT DO, SAID PLAINLY: it iterates the same words the production set holds,
+   * so it proves each listed word works and is blind to every word NOT listed -- which is
+   * exactly how `pickup` was missed. `FREE_PHRASINGS` below is the independent corpus that
+   * covers that gap; this test covers only the members.
+   */
+  it.each([["shipping"], ["ship"], ["ships"], ["delivery"], ["delivered"], ["pickup"], ["postage"]])(
+    "T23c: a title whose free-ness is about %s does not make the item free",
     (word) => {
       expect(
-        normalizeListing({ title: `Free ${word} on this GeForce RTX 5080`, priceCents: 0, componentType: "gpu" }),
+        normalizeListing({ title: `Free GeForce RTX 5080 - ${word} included`, priceCents: 0, componentType: "gpu" }),
       ).toEqual({ modelKey: null, variantKey: null, validity: "NEEDS_REVIEW", reason: "ambiguous-zero-price" });
     },
   );
@@ -374,6 +386,14 @@ const STANDALONE_COMPONENTS: [Listing["componentType"], string][] = [
   ["cpu_cooler", "Arctic Liquid Freezer III 360 liquid cooler"],
   ["case_fan", "Noctua NF-A12x25 PWM case fan"],
   ["case_fan", "Arctic P12 Max fan pack"],
+  // FOUR SHAPES ADDED ON RE-REVIEW, because the quantity vocabulary costs real references and
+  // the comment on it used to claim no cost at all. Age phrasing, compatibility copy, a kit
+  // written the trailing way round -- which PLAN.md:54 calls ONE kit -- and a bare SKU with one
+  // word in front of it, which is what the index<=1 bound costs.
+  ["gpu", "GeForce RTX 5080, two months old"],
+  ["cpu_cooler", "Noctua NH-D15 fits both AM4 and AM5"],
+  ["ram", "Corsair Vengeance 32GB 2x16"],
+  ["cpu", "AMD 9600X processor"],
 ];
 
 /**
@@ -424,20 +444,78 @@ const BOARD_PARTNER_TITLES: [Listing["componentType"], string][] = [
   ["gpu", "Sapphire Nitro+ RX 7800 XT graphics card"],
   ["gpu", "Gigabyte Aorus GeForce RTX 5080 Master graphics card"],
   ["ram", "Acer Predator Apollo 32GB DDR5 memory kit"],
+  ["cpu_cooler", "Scythe Katana 5 CPU cooler"],
   ["gpu", "PowerColor Red Devil Radeon RX 9070 XT"],
   ["gpu", "ASUS ROG Strix GeForce RTX 5080 OC"],
+];
+
+/**
+ * ONE ROW PER *ACCEPTED* BRAND WORD, WHICH IS THE HALF THAT WAS MISSING.
+ *
+ * `BOARD_PARTNER_TITLES` above holds a title for every word that was REFUSED, so it can only
+ * ever confirm a refusal -- it could never catch a bad ADMISSION, and that is exactly how
+ * `katana` shipped for a round while Scythe sells a tower cooler under that name.
+ *
+ * For each of the eight words that DO ship, this is the closest thing to a real component
+ * listing containing it: a part pulled from a machine of that line. Every one is refused, and
+ * that refusal IS the cost of admitting the word -- correct for a laptop part, which is a
+ * different product from its desktop namesake, and a lost reference for a desktop part. If any
+ * of these eight ever gains a component line of its own, this is the row that has to change.
+ */
+const ACCEPTED_BRAND_WORD_TITLES: [Listing["componentType"], string][] = [
+  ["gpu", "RTX 4070 pulled from a Razer Blade 16"],
+  ["gpu", "RTX 4060 removed from my Legion 5 Pro"],
+  ["psu", "Corsair RM850x from an HP Omen 45L"],
+  ["ram", "Kingston Fury Beast 32GB DDR4 from a Victus 15"],
+  ["storage", "Samsung 990 Pro 2TB out of a Zephyrus G14"],
+  ["psu", "Corsair SF850 from a Dell XPS 8960"],
+  ["ram", "Corsair Vengeance 32GB DDR5 from an IdeaPad"],
+  ["storage", "WD Black SN850X 2TB from an HP Pavilion"],
+];
+
+/**
+ * REAL `free` PHRASINGS AT A REAL CA$0, AND THE ANSWER TO A CLASS RATHER THAN A WORD.
+ *
+ * The per-element test for the disqualifier set iterates the same words the production set
+ * holds, so it is blind to every word NOT in it -- which is how `pickup` was missed the first
+ * time and `pick up`, two tokens, the second. THIS corpus is written from the phrasings a seller
+ * actually uses, independently of what the code denies, so a hole shows up as a row with the
+ * wrong answer rather than as a word nobody thought of.
+ */
+const FREE_PHRASINGS: [string, "usable" | "refused"][] = [
+  ["Free GeForce RTX 5080", "usable"],
+  ["Free RTX 5070 graphics card", "usable"],
+  ["Free! GeForce RTX 5080", "usable"],
+  ["Free to a good home GeForce RTX 5080", "usable"],
+  ["Free GeForce RTX 5080 no longer needed", "usable"],
+  ["GeForce RTX 5080 - free shipping", "refused"],
+  ["Free local pickup - GeForce RTX 5080", "refused"],
+  ["FREE GeForce RTX 5080 pick up only", "refused"],
+  ["Free porch pickup GeForce RTX 5080", "refused"],
+  ["Free collection - GeForce RTX 5080", "refused"],
+  ["Free GeForce RTX 5080 - will ship", "refused"],
+  ["Free GeForce RTX 5080, delivery available", "refused"],
+  ["Free ships anywhere GeForce RTX 5080", "refused"],
+  ["GeForce RTX 5080 with free item included", "refused"],
+  ["GeForce RTX 5080, free to a good home", "refused"],
 ];
 
 describe("normalizeListing -- the measured cost and the measured residual", () => {
   /**
    * F5a. THE COST, ABSOLUTE AND RE-DERIVABLE. The declined set is asserted by name, not by
-   * count: a count alone would stay green while the four swapped for four different ones.
-   * Three are the whole-unit token `build` or the phrase `gaming PC`; the fourth is ruling 2's
-   * deliberate choice that a fan pack really is a pack. Every one is a LOST reference, never a
-   * wrong one. The previously reported figure of 3 counted only the whole-system declines.
+   * count: a count alone would stay green while the eight swapped for eight different ones.
+   *
+   * THE NUMBER HAS MOVED TWICE AND BOTH MOVES ARE THE POINT. It was reported as 3 when it was
+   * 4 -- that count omitted the fan pack, which is ruling 2's deliberate choice. It is now 8 of
+   * 28, because four shapes the corpus did not cover were added once the quantity vocabulary
+   * grew: age phrasing (`two months old`), compatibility copy (`fits both AM4 and AM5`), a kit
+   * written the trailing way round (`32GB 2x16`, which PLAN.md:54 calls ONE kit), and a bare SKU
+   * with one word before it (`AMD 9600X processor`), which is what the index<=1 multiplier bound
+   * costs. Every one is a LOST reference, never a wrong one -- but a vocabulary whose comment
+   * claims no cost at all is the thing this corpus exists to prevent.
    */
-  it("F5a: exactly 4 of 24 realistic standalone titles are declined, and these are the four", () => {
-    expect(STANDALONE_COMPONENTS).toHaveLength(24);
+  it("F5a: exactly 8 of 28 realistic standalone titles are declined, and these are the eight", () => {
+    expect(STANDALONE_COMPONENTS).toHaveLength(28);
     const declined = STANDALONE_COMPONENTS.filter(([componentType, title]) => {
       const result = normalizeListing({ title, priceCents: 6300, componentType });
       return !(result.validity === "VALID" && result.modelKey !== null);
@@ -448,6 +526,10 @@ describe("normalizeListing -- the measured cost and the measured residual", () =
       "RTX 5080 graphics card for gaming PC",
       "Seasonic Focus GX-850 PSU for desktop build",
       "Arctic P12 Max fan pack",
+      "GeForce RTX 5080, two months old",
+      "Noctua NH-D15 fits both AM4 and AM5",
+      "Corsair Vengeance 32GB 2x16",
+      "AMD 9600X processor",
     ]);
   });
 
@@ -470,7 +552,40 @@ describe("normalizeListing -- the measured cost and the measured residual", () =
    * SYSTEM_PHRASES turns one of these real component listings into a whole system, and this test
    * is what says so out loud.
    */
+  /**
+   * R3b. THE OTHER HALF OF THE BRAND-WORD GUARD. Each accepted word's closest real component
+   * listing, and the refusal that is the cost of admitting it. A word that later turns out to
+   * name a component line shows up here as a row that should not be refused.
+   */
+  it("R3b: every accepted brand word has a real component title, and each is refused", () => {
+    expect(ACCEPTED_BRAND_WORD_TITLES).toHaveLength(8);
+    for (const [componentType, title] of ACCEPTED_BRAND_WORD_TITLES) {
+      expect(
+        normalizeListing({ title, priceCents: 12345, componentType }),
+        title,
+      ).toMatchObject({ validity: "INVALID_REFERENCE", reason: "whole-system", modelKey: null });
+    }
+  });
+
+  /**
+   * R1b. THE FREE FAMILY, FROM THE SELLER'S SIDE RATHER THAN THE CODE'S. Two of these rows --
+   * `pick up only` and `porch pickup` -- were VALID with a model key when this corpus was
+   * written, at a real CA$0, which under MAXIMUM_PRICE is the exact verdict PR #6 exists to
+   * prevent.
+   */
+  it("R1c: every real free phrasing lands on the right side of rule 8", () => {
+    expect(FREE_PHRASINGS).toHaveLength(15);
+    for (const [title, expected] of FREE_PHRASINGS) {
+      const result = normalizeListing({ title, priceCents: 0, componentType: "gpu" });
+      const actual = result.validity === "VALID" && result.modelKey !== null ? "usable" : "refused";
+      expect(actual, title).toBe(expected);
+    }
+    // Not satisfiable by refusing everything: five rows must still come back with a model key.
+    expect(FREE_PHRASINGS.filter(([, e]) => e === "usable")).toHaveLength(5);
+  });
+
   it("F5c: no board-partner brand word refuses a real component listing", () => {
+    expect(BOARD_PARTNER_TITLES).toHaveLength(6);
     for (const [componentType, title] of BOARD_PARTNER_TITLES) {
       const result = normalizeListing({ title, priceCents: 49900, componentType });
       expect(result.validity, title).toBe("VALID");
@@ -493,7 +608,7 @@ describe("normalizeListing -- properties of the vocabularies", () => {
    * here until it is removed, neutralised, or -- as with `pack` -- deliberately allowed to win.
    * The four SYSTEM_PHRASES rows are harmless: both paths give `whole-system`.
    */
-  it("T13: exactly ten sub-phrase overlaps exist across the eighteen vocabularies", () => {
+  it("T13: exactly fifteen sub-phrase overlaps exist across the seventeen vocabularies", () => {
     const vocabularies: [string, readonly string[]][] = [
       ...(Object.entries(MARKERS) as [string, readonly string[]][]).map(
         ([type, phrases]) => [`MARKERS.${type}`, phrases] as [string, readonly string[]],
@@ -505,10 +620,9 @@ describe("normalizeListing -- properties of the vocabularies", () => {
       ["MULTIPLE", MULTIPLE],
       ["WHOLE_UNIT", [...WHOLE_UNIT]],
       ["MULTI_UNIT", [...MULTI_UNIT]],
-      ["FREE_ITEM_PHRASES", FREE_ITEM_PHRASES],
       ["FREE_IS_NOT_THE_ITEM", [...FREE_IS_NOT_THE_ITEM]],
     ];
-    expect(vocabularies).toHaveLength(18);
+    expect(vocabularies).toHaveLength(17);
 
     const sequence = (phrase: string): string[] => tokenValues(tokenize(phrase));
     const isSubPhrase = (inner: string[], outer: string[]): boolean => {
@@ -535,10 +649,18 @@ describe("normalizeListing -- properties of the vocabularies", () => {
 
     expect(overlaps.sort()).toEqual(
       [
-        // The two `laptop` rows arrived with F1's whole-unit tokens and are harmless in the same
-        // way the four SYSTEM_PHRASES rows are: both paths give `whole-system`.
+        // The `laptop` and `desktop` rows against SYSTEM_PHRASES are harmless in the same way the
+        // four original ones are: both paths give `whole-system`.
         "WHOLE_UNIT:laptop < SYSTEM_PHRASES:gaming laptop",
         "WHOLE_UNIT:laptop < SYSTEM_PHRASES:laptop computer",
+        "WHOLE_UNIT:desktop < SYSTEM_PHRASES:desktop computer",
+        "WHOLE_UNIT:desktop < SYSTEM_PHRASES:desktop pc",
+        "WHOLE_UNIT:desktop < SYSTEM_PHRASES:gaming desktop",
+        // THESE TWO ARE LOAD-BEARING, NOT INCIDENTAL: they are the marker phrases that COVER the
+        // whole-unit token `desktop` for a cpu or ram listing, exactly as `pc case` covers `pc`.
+        // Deleting either one re-opens the collision that used to keep `desktop` out entirely.
+        "WHOLE_UNIT:desktop < MARKERS.cpu:desktop processor",
+        "WHOLE_UNIT:desktop < MARKERS.ram:desktop memory",
         "MULTI_UNIT:pack < MARKERS.case_fan:fan pack",
         "WHOLE_UNIT:computer < MARKERS.case:computer case",
         "WHOLE_UNIT:computer < SYSTEM_PHRASES:desktop computer",

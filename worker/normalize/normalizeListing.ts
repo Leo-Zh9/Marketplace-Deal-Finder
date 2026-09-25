@@ -76,11 +76,14 @@ export const BROKEN = [
 /**
  * Whole systems named by BRAND or by a two-word phrase.
  *
- * `desktop` IS A PHRASE HERE AND NEVER A TOKEN, and that is a measurement about `desktop` ALONE:
- * as a bare token it fires on the catalog's own product wording -- `"AMD Ryzen 7 9800X3D Desktop
- * Processor"` and `"Kingston Fury Beast 32GB DDR4 desktop memory"` both become `whole-system`,
- * and `src/data/catalog.ts` literally describes cpu as "Desktop processors" and ram as "Desktop
- * memory kits". `laptop` and `notebook` carry no such collision and ARE tokens; see WHOLE_UNIT.
+ * `desktop` IS NOW A TOKEN TOO, and the argument that kept it out was true of the BARE token and
+ * stopped being true the moment the marker mechanism could cover it. It used to fire on the
+ * catalog's own product wording -- `"AMD Ryzen 7 9800X3D Desktop Processor"` and `"Kingston Fury
+ * Beast 32GB DDR4 desktop memory"` -- so `MARKERS.cpu` gained `desktop processor` and
+ * `MARKERS.ram` gained `desktop memory`, and those two phrases COVER the word exactly as
+ * `pc case` already covers `pc`. Both titles now resolve to their catalog models, and
+ * `"Dell Desktop GeForce RTX 4060"` -- a CA$1,100 prebuilt that was writing itself into the
+ * 4060 benchmark -- is refused.
  *
  * THE BRAND LINES ARE THE SECOND DETECTOR FOR A MACHINE WITH NO WHOLE-UNIT WORD IN ITS TITLE --
  * `"Razer Blade 16 RTX 5080"` names no `pc`, no `laptop` and no system phrase otherwise.
@@ -93,7 +96,12 @@ export const BROKEN = [
  *                XT`) and holds no board-partner brands at all, so "0 collisions in the catalog"
  *                is a claim about the catalog, not about real listings.
  *   `predator` -- Acer sells Predator RAM and Predator NVMe drives, not only Predator machines.
- * The nine that ship are system-only product lines with no component line behind them.
+ *   `katana`  -- `Scythe Katana` is a mainstream tower CPU cooler line. It was ADMITTED in the
+ *                first pass and caught on re-review; it fails the same test that rejected
+ *                `nitro`, and the corpus that should have caught it held a title for every
+ *                REJECTED word and none for any ACCEPTED one, so it could only ever confirm
+ *                refusals. `BOARD_PARTNER_TITLES` now carries a row per accepted word too.
+ * The eight that ship are system-only product lines with no component line behind them.
  */
 export const SYSTEM_PHRASES = [
   "thinkcentre",
@@ -121,7 +129,6 @@ export const SYSTEM_PHRASES = [
   "xps",
   "ideapad",
   "pavilion",
-  "katana",
 ];
 
 /**
@@ -162,6 +169,7 @@ export const WHOLE_UNIT = new Set([
   "system",
   "laptop",
   "notebook",
+  "desktop",
 ]);
 
 /**
@@ -172,6 +180,15 @@ export const WHOLE_UNIT = new Set([
  * twice the unit price into that model's benchmark and makes every genuine 5080 look like a
  * deal. MEASURED: 0 collisions across the 176 catalog names, the 15 live titles and every title
  * this suite asserts must stay matched.
+ *
+ * THE COST, STATED RATHER THAN OMITTED. These words decline real standalone listings, and the
+ * comment here used to claim no cost at all while the WHOLE_UNIT table above stated its own
+ * honestly. MEASURED, and now carried in `STANDALONE_COMPONENTS`: age phrasing
+ * (`"GeForce RTX 5080, two months old"`), compatibility copy
+ * (`"Noctua NH-D15 fits both AM4 and AM5"`) and a kit written the trailing way round
+ * (`"Corsair Vengeance 32GB 2x16"`, which PLAN.md:54 calls ONE kit) are all refused as
+ * `unknown-quantity`. Lost references, never wrong ones -- but a vocabulary whose comment claims
+ * no cost is how a cost stops being counted.
  *
  * THREE CANDIDATES WERE REJECTED ON MEASURED COLLISIONS, named so they are not added later:
  *   `dual`  -- `ASUS Dual` is a real board-partner cooler line. It collides with three titles
@@ -203,13 +220,42 @@ export const MULTI_UNIT = new Set(["pack"]);
  * and `dealRules.decide` reads `VALID` plus a zero price under `MAXIMUM_PRICE` as
  * `DEAL / within-maximum`. That is the verdict PR #6 exists to prevent.
  *
- * The anchor is the ITEM: `free` leading the title, or a phrase that can only describe the item.
- * The leading token is refused when the next word is the thing being given away instead --
- * `"Free shipping on this GeForce RTX 5080"` is not a free graphics card. That second clause is
- * not an extra: without it the same defect returns by word order, which is not a fix.
+ * THE POSITION IS ON THE QUALIFIER AND THE "ANYWHERE" IS ON THE DISQUALIFIER. That asymmetry is
+ * the whole design, and the first attempt had it backwards: it tested three words at exactly the
+ * SECOND token, so one adjective walked straight through -- `"Free local pickup - GeForce RTX
+ * 5080"` at CA$0 was stored VALID with a model key, and "free local pickup" is the commonest
+ * form of the phrase on this marketplace. A denylist tested at one position is a denylist of
+ * positions, not of words.
+ *
+ * So: `free` must LEAD the title, and none of the words below may appear ANYWHERE in it. One
+ * predicate closes the whole family -- pickup, local pickup, free shipping, ships free, free
+ * delivery -- instead of one word per review round.
+ *
+ * `pick` IS IN THE SET BECAUSE THE TOKENIZER SPLITS `pick up` INTO TWO TOKENS, so `pickup` alone
+ * does not cover it -- MEASURED: `"FREE GeForce RTX 5080 pick up only"` walked through the set
+ * without it, at a real CA$0. THE HONEST COST OF THAT ENTRY: a genuinely free item that is ALSO
+ * collection-only is now refused, because a token denylist cannot tell `free ... pick up only`
+ * from `free pick up`. A lost reference, and the reason `FREE_PHRASINGS` is committed beside it.
+ *
+ * A POSITION-FREE PHRASE LIST WAS DELETED HERE RATHER THAN PATCHED. `FREE_ITEM_PHRASES`
+ * (`free to a good home`, `free item`) matched anywhere, so `"GeForce RTX 5080 with free item
+ * included"` qualified at CA$0. Anchoring those phrases at position 0 would have made them
+ * exactly equivalent to the leading-token test they sit beside, since both begin with `free` --
+ * dead vocabulary by the same measure that keeps `nvidia` and `amd` under review. The cost is
+ * named: a genuinely free item phrased tail-first (`"GeForce RTX 5080, free to a good home"`) is
+ * now NEEDS_REVIEW. A lost reference, never a wrong one.
  */
-export const FREE_ITEM_PHRASES = ["free to a good home", "free item"];
-export const FREE_IS_NOT_THE_ITEM = new Set(["shipping", "delivery", "postage"]);
+export const FREE_IS_NOT_THE_ITEM = new Set([
+  "shipping",
+  "ship",
+  "ships",
+  "delivery",
+  "delivered",
+  "pickup",
+  "pick",
+  "collection",
+  "postage",
+]);
 
 const DIGITS = /^[0-9]+$/;
 const LETTERS = /^[a-z]+$/;
@@ -225,6 +271,15 @@ const LETTERS = /^[a-z]+$/;
  *
  * THE RESIDUAL THE SECOND INDEX DOES NOT REACH, NAMED: two words before the quantity
  * (`"Selling my 2x RTX 5080"`) is still uncaught, and is pinned in ACCEPTED_EXPOSURE.
+ *
+ * AND THE COST OF THE SECOND INDEX, WHICH THE FIRST VERSION OF THIS COMMENT DID NOT STATE.
+ * "every collision sits at index 2 or beyond" is measured over catalog names AND their
+ * vendor-stripped forms, with and without a trailing word -- 20 triples, all at index exactly 2,
+ * 0 at index <= 1. It is NOT true of a title that names only the bare SKU: `"9600X processor"`
+ * puts the triple at index 0 (a pre-existing cost of the leading form) and `"AMD 9600X
+ * processor"` or `"Corsair 850x power supply"` put it at index 1 (the cost this bound adds).
+ * Each of those is refused as `unknown-quantity` where it would otherwise have been a usable
+ * reference with a null key. `STANDALONE_COMPONENTS` carries one.
  *
  * THE BOUND IS WHAT IS LOAD-BEARING. MEASURED: an `Nx`-anywhere form fires on
  * `"Ryzen 5 9600X processor"` and 5 other X-suffixed CPUs as soon as any word follows the model
@@ -297,6 +352,8 @@ export const multiplierSuffix = (tokens: readonly Token[]): boolean => {
 
 export const MARKERS: Record<Listing["componentType"], readonly string[]> = {
   cpu: [
+    // Covers the whole-unit token `desktop` for a cpu listing; see WHOLE_UNIT.
+    "desktop processor",
     "processor",
     "ryzen",
     "threadripper",
@@ -311,7 +368,8 @@ export const MARKERS: Record<Listing["componentType"], readonly string[]> = {
   ],
   cpu_cooler: ["cpu cooler", "heatsink", "aio cooler", "air cooler", "liquid cooler"],
   motherboard: ["motherboard", "mobo", "mainboard"],
-  ram: ["ddr 3", "ddr 4", "ddr 5", "dimm", "sodimm", "memory kit"],
+  // `desktop memory` covers the whole-unit token `desktop` for a ram listing; see WHOLE_UNIT.
+  ram: ["ddr 3", "ddr 4", "ddr 5", "dimm", "sodimm", "memory kit", "desktop memory"],
   storage: ["ssd", "hdd", "nvme", "hard drive", "m 2 drive", "solid state"],
   gpu: ["gpu", "graphics card", "video card", "rtx", "gtx", "geforce", "radeon"],
   psu: ["psu", "power supply"],
@@ -345,11 +403,25 @@ const hasUncovered = (
   return values.some((value, index) => vocabulary.has(value) && !covered.has(index));
 };
 
-/** True when the TITLE says the item itself is free -- not that the shipping is. */
+/** True when the TITLE says the ITEM itself is free -- not that the shipping or pickup is. */
 export const freeItemEvidence = (values: readonly string[]): boolean =>
-  (values[0] === "free" && !FREE_IS_NOT_THE_ITEM.has(values[1] ?? "")) ||
-  containsAnyPhrase(values, FREE_ITEM_PHRASES);
+  values[0] === "free" && !values.some((value) => FREE_IS_NOT_THE_ITEM.has(value));
 
+/**
+ * ONLY WHOLE_UNIT IS NEUTRALISED BY A MARKER. This is the only place `hasUncovered` is called;
+ * SYSTEM_PHRASES here, and MULTIPLE / MULTI_UNIT / both multiplier predicates in rule 7, are
+ * checked UNCONDITIONALLY -- ruling 2 makes that deliberate for MULTI_UNIT, because a fan pack
+ * really is a pack even under a `case_fan` search.
+ *
+ * THE GENERAL ANSWER TO "WHICH OTHER EXCLUDED WORDS COULD A MARKER NOW ADMIT": none of them.
+ * `desktop` was admitted once `desktop processor` and `desktop memory` could cover it, and it is
+ * the only excluded word that belonged in WHOLE_UNIT in the first place. MEASURED over the other
+ * seven -- `dual`, `x 2`, `x 3` (MULTIPLE) and `aorus`, `nitro`, `predator`, `katana`
+ * (SYSTEM_PHRASES) -- on two independent grounds: none sits in a marker-neutralised vocabulary,
+ * and no marker phrase contains any of them, so there would be nothing to cover them with even
+ * if the mechanism were extended. Their collisions are with catalog MODEL NAMES and with
+ * component product lines, which a marker cannot dissolve by construction.
+ */
 export const systemEvidence = (
   values: readonly string[],
   declared: Listing["componentType"],
