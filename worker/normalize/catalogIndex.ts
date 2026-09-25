@@ -106,18 +106,29 @@ export const containsPhrase = (values: readonly string[], phrase: string): boole
  * hazard shape (`Lenovo ThinkCentre M70q`). The named cost: a title naming a card without its
  * series word (`"Selling my 4070 Super"`) is a MISS, and a miss is safe.
  *
- * `nvidia` AND `amd` ARE MEASURED INERT, AND THEY ARE KEPT ON PURPOSE. MEASURED: 0 of the 176
+ * `core` IS HERE BECAUSE THE CATALOG FORCED IT. Every Intel CPU name is `Core i7-12700K`, and a
+ * seller writes `"i7 12700K"`; with `core` undroppable, 19 of the 45 cpu names were unreachable in
+ * the phrasing sellers actually use. There is no catalog-only fix -- a second entry for the same
+ * product would split its pool. MEASURED, and re-derivable from this repo alone: take each of the
+ * 19 `Core ...` names, strip the leading word, and append `processor` / `cpu` /
+ * `desktop processor` -- 57 titles. WITH `core` here, 0 fail to resolve to their own name;
+ * WITHOUT it, all 57 do. It is a PREFIX only; G2 inspects the token AFTER a completed match, so
+ * this cannot interact with `core` as a trailing word, which SUFFIX_WORDS below refuses to admit
+ * for a separate and still-valid reason.
+ *
+ * `nvidia` AND `amd` ARE MEASURED INERT, AND THEY ARE KEPT ON PURPOSE. MEASURED: 0 of the 336
  * catalog names begin with either word -- every name this set can reach today is `GeForce ...`
- * (13), `Radeon ...` (7) or `Intel Arc ...` (3) -- so neither can produce an entry point, and no
- * test can kill either one. DO NOT DELETE THEM FOR TIDINESS. This set ANTICIPATES catalog names
- * rather than describing them, and whether to grow the catalog is an open question this slice
- * deliberately did not settle. Deleted, the day a vendor-prefixed name lands is SILENT: the full
+ * (43), `Radeon ...` (20), `Intel Arc ...` (5) or `Core ...` (19) -- so neither can produce an
+ * entry point, and no test can kill either one. DO NOT DELETE THEM FOR TIDINESS. This set
+ * ANTICIPATES catalog names rather than describing them, and whether to grow the catalog further
+ * is an open question. Deleted, the day a vendor-prefixed name lands is SILENT: the full
  * name still self-resolves so T11 stays green, while a title naming that card without its vendor
  * word quietly stops matching. Kept, that day is LOUD: T14 in catalogIndex.test.ts asserts the
- * count map `{geforce: 13, nvidia: 0, radeon: 7, amd: 0, intel: 3}` and fails the moment it stops
- * being true, which puts the decision in front of a human instead of into an aggregate.
+ * count map `{geforce: 43, nvidia: 0, radeon: 20, amd: 0, intel: 5, core: 19}` and fails the
+ * moment it stops being true, which puts the decision in front of a human instead of into an
+ * aggregate.
  */
-const OPTIONAL_LEADING = new Set(["geforce", "nvidia", "radeon", "amd", "intel"]);
+const OPTIONAL_LEADING = new Set(["geforce", "nvidia", "radeon", "amd", "intel", "core"]);
 
 /**
  * Tokens that turn an otherwise-complete model name into a DIFFERENT vendor SKU. G2 refuses a

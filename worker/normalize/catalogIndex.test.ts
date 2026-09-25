@@ -6,17 +6,41 @@
  * `normalizeListing` deliberately: asserting them at the matcher alone would pass while a
  * classification rule threw every match away.
  *
- * READ THE GUARD-ABLATION TABLE BEFORE DELETING ANYTHING HERE. Measured over 5,808 generated
- * titles (176 names x (1 + 16 suffixes x 2 concatenation forms)), removing one guard and keeping
- * the rest changes: W 84 results, G1 5, B2 518, G2 1,580. T29 is the SOLE killer of G1 and T25
- * the SOLE killer of B2 -- T1 and T27 are each covered by two guards and discriminate neither,
- * so deleting T25 or T29 as "redundant with T1" leaves a guard with no test at all.
+ * READ THE GUARD-ABLATION TABLE BEFORE DELETING ANYTHING HERE. SCOPED, BECAUSE IT COULD NOT BE
+ * RE-DERIVED: the per-guard figures below were measured over 5,808 generated titles against THE
+ * 176-NAME CATALOG AS OF PR #14 (176 names x (1 + 16 suffixes x 2 concatenation forms)) --
+ * removing one guard and keeping the rest changed W 84 results, G1 5, B2 518, G2 1,580. The
+ * catalog now holds 336 names, so the title count is 11,088 and those four numbers no longer
+ * describe this repo. A faithful reconstruction of the generator gave W 44, G1 0, B2 171,
+ * G2 2,284 against the same 176 names, so the construction that produced them is not recoverable
+ * and the post-change figures were NOT invented to replace them.
+ *
+ * WHAT SURVIVES THE RESCOPING IS THE PART THAT MATTERS, and it was re-measured against the 336:
+ * T29 is the SOLE PRE-EXISTING killer of G1 and T25 the SOLE PRE-EXISTING killer of B2 -- T1 and
+ * T27 are each covered by two guards and discriminate neither, so deleting T25 or T29 as
+ * "redundant with T1" leaves a guard with one test (G1x in normalizeListing.test.ts) instead of
+ * two, not with none.
  */
 
 import { componentCatalog } from "../../src/data/catalog";
 import type { Listing } from "../storage/types";
-import { CATALOG_COMPONENT_ID, MAX_TOKENS, MODEL_INDEXES, matchCatalogModels, tokenize } from "./catalogIndex";
-import { normalizeListing } from "./normalizeListing";
+import {
+  CATALOG_COMPONENT_ID,
+  MAX_TOKENS,
+  MODEL_INDEXES,
+  matchCatalogModels,
+  phraseSpans,
+  tokenValues,
+  tokenize,
+} from "./catalogIndex";
+import {
+  MARKERS,
+  MULTIPLE,
+  MULTI_UNIT,
+  SYSTEM_PHRASES,
+  WHOLE_UNIT,
+  normalizeListing,
+} from "./normalizeListing";
 
 /**
  * The 15 titles a real GPU search returned in production, copied as literals. The suite READS
@@ -107,7 +131,8 @@ describe("catalog index -- the match and its guards", () => {
  * Intel Arc listing that omits the word "Intel".
  *
  * Named limitation: these pin removals and changes, NOT additions. A new entry in either set is
- * caught only where it breaks T11's 176 self-resolutions or T13's overlap audit.
+ * caught only where it breaks T11's 336 self-resolutions, T13's overlap audit, or -- for a
+ * catalog name rather than a vocabulary entry -- T47 and T48 below.
  */
 describe("catalog index -- every vocabulary element, one at a time", () => {
   /**
@@ -121,19 +146,21 @@ describe("catalog index -- every vocabulary element, one at a time", () => {
    * "NVIDIA RTX ..." name, this map changes and that decision comes back into view.
    */
   it("T14: each vendor prefix that a catalog name actually carries is droppable", () => {
-    const leading: Record<string, number> = { geforce: 0, nvidia: 0, radeon: 0, amd: 0, intel: 0 };
+    const leading: Record<string, number> = { geforce: 0, nvidia: 0, radeon: 0, amd: 0, intel: 0, core: 0 };
     for (const componentType of WORKER_TYPES) {
       for (const model of catalogModels(componentType)) {
         const first = tokenize(model)[0].value;
         if (first in leading) leading[first] += 1;
       }
     }
-    expect(leading).toEqual({ geforce: 13, nvidia: 0, radeon: 7, amd: 0, intel: 3 });
+    expect(leading).toEqual({ geforce: 43, nvidia: 0, radeon: 20, amd: 0, intel: 5, core: 19 });
 
     expect(match("gpu", "RTX 5080 graphics card")).toBe("GeForce RTX 5080");
     expect(match("gpu", "RX 7800 XT graphics card")).toBe("Radeon RX 7800 XT");
     // The one the whole sweep exists for: an Arc listing that omits the word "Intel".
     expect(match("gpu", "Arc B580 graphics card")).toBe("Intel Arc B580");
+    // And the one `core` exists for: a seller writes "i7 12700K", never "Core i7-12700K".
+    expect(match("cpu", "i7 12700K processor")).toBe("Core i7-12700K");
   });
 
   /**
@@ -153,6 +180,29 @@ describe("catalog index -- every vocabulary element, one at a time", () => {
     },
   );
 
+  /**
+   * T15t. THE ROLE T15 USED TO PLAY, MOVED TO THE LAYER THE GUARD LIVES AT.
+   *
+   * `catalogIndex.ts`'s tokenizer comment names T15 in normalizeListing.test.ts as the test that
+   * goes red if `normalize("NFKD")` is moved BEFORE `toLowerCase()`. MEASURED: that stopped being
+   * true the moment `Radeon RX 6800 XT` entered the catalog. Under the mutation T15's title
+   * tokenizes `radeontm` and loses its `radeon` marker -- but `rx 6800 xt` is an OPTIONAL_LEADING
+   * entry point, so the model resolves either way and the whole 220-test suite stayed green.
+   *
+   * THAT IS A CLASS OF DEFECT, NOT ONE INSTANCE: a guard whose only test asserts an END-TO-END
+   * outcome can be disarmed by a pure DATA change, with no code touched and nothing going red.
+   * The defence is to test a token-layer guard AT THE TOKEN LAYER, which nothing else here does.
+   */
+  it("T15t: the trademark sign is a separator, not a token (SOLE killer of the split order)", () => {
+    expect(tokenValues(tokenize("AMD Radeon\u2122 RX 6800 XT"))).toEqual([
+      "amd",
+      "radeon",
+      "rx",
+      "6800",
+      "xt",
+    ]);
+  });
+
   it("T20 control: an unlisted trailing word does NOT refuse the match", () => {
     expect(match("gpu", "GeForce RTX 5080 oc")).toBe("GeForce RTX 5080");
   });
@@ -160,16 +210,16 @@ describe("catalog index -- every vocabulary element, one at a time", () => {
 
 describe("catalog index -- exhaustive properties", () => {
   /**
-   * T11. The ANCHOR of the whole suite: a normalizer that always returns null fails 176 times
+   * T11. The ANCHOR of the whole suite: a normalizer that always returns null fails 336 times
    * here. The two counts are asserted FIRST so an empty or failed catalog import cannot pass
    * this vacuously.
    */
-  it("T11: all 176 catalog names, declared as their own type, resolve to themselves", () => {
+  it("T11: all 336 catalog names, declared as their own type, resolve to themselves", () => {
     const names = WORKER_TYPES.flatMap((componentType) =>
       catalogModels(componentType).map((model) => [componentType, model] as const),
     );
-    expect(names).toHaveLength(176);
-    expect(catalogModels("gpu")).toHaveLength(23);
+    expect(names).toHaveLength(336);
+    expect(catalogModels("gpu")).toHaveLength(68);
 
     for (const [componentType, model] of names) {
       expect(
@@ -183,7 +233,7 @@ describe("catalog index -- exhaustive properties", () => {
    * T12. Every catalog name declared as each of the eight OTHER component types. A VALID result
    * carrying a model key would mean a listing entered another type's benchmark.
    */
-  it("T12: none of the 1,408 cross-type pairs produces a VALID result with a model", () => {
+  it("T12: none of the 2,688 cross-type pairs produces a VALID result with a model", () => {
     const pairs = WORKER_TYPES.flatMap((componentType) =>
       catalogModels(componentType).flatMap((model) =>
         WORKER_TYPES.filter((other) => other !== componentType).map(
@@ -191,13 +241,157 @@ describe("catalog index -- exhaustive properties", () => {
         ),
       ),
     );
-    expect(pairs).toHaveLength(1_408);
+    expect(pairs).toHaveLength(2_688);
 
     const leaks = pairs.filter(([declared, model]) => {
       const result = normalizeListing({ title: model, priceCents: 6300, componentType: declared });
       return result.validity === "VALID" && result.modelKey !== null;
     });
     expect(leaks.map(([declared, model]) => `${declared} <- ${model}`)).toEqual([]);
+  });
+
+  /**
+   * T47. EVERY SAME-TYPE TOKEN-PREFIX PAIR WHOSE FIRST EXTRA TOKEN IS NOT A SUFFIX WORD.
+   *
+   * `variantKey` is null by design, so two products sharing one catalog name pool into ONE
+   * average. A shorter catalog name whose token sequence is a strict PREFIX of a longer one is
+   * the shape that creates that pooling: G2 refuses the pair when the extra token is in
+   * SUFFIX_WORDS, and every OTHER pair is protected by nothing except which siblings happen to
+   * be listed. This asserts the exact remainder BY NAME, so each is a reviewed decision.
+   *
+   * A NEW ROW IS NOT AUTOMATICALLY A DEFECT -- `Ryzen 5 5600 < Ryzen 5 5600X` is correct and
+   * wanted. It is a row that has to be looked at, priced, and either kept or closed by shipping
+   * the sibling. That is the whole point: 27 reviewed decisions instead of 27 accidents.
+   *
+   * THE SUFFIX SET IS MIRRORED AS A LITERAL, NOT IMPORTED. This file's own rule (see the
+   * vocabulary block above): a test that iterates the production list cannot detect a deletion
+   * FROM that list, because the exclusion disappears with the element.
+   */
+  it("T47: every unguarded token-prefix pair is one of these 27", () => {
+    const SUFFIX_MIRROR = new Set([
+      "ti",
+      "super",
+      "xt",
+      "xtx",
+      "gre",
+      "redux",
+      "le",
+      "chromax",
+      "rgb",
+      "d",
+      "ii",
+      "touch",
+      "argb",
+    ]);
+
+    const pairs: string[] = [];
+    for (const componentType of WORKER_TYPES) {
+      const sequences = catalogModels(componentType).map(
+        (model) => [model, tokenValues(tokenize(model))] as const,
+      );
+      for (const [shorter, shorterTokens] of sequences) {
+        for (const [longer, longerTokens] of sequences) {
+          if (shorter === longer || shorterTokens.length >= longerTokens.length) continue;
+          if (!shorterTokens.every((value, index) => value === longerTokens[index])) continue;
+          if (SUFFIX_MIRROR.has(longerTokens[shorterTokens.length])) continue;
+          pairs.push(`${componentType}: ${shorter} < ${longer}`);
+        }
+      }
+    }
+
+    expect(pairs.sort()).toEqual([
+      "case: Cooler Master NR200 < Cooler Master NR200P",
+      "case: Corsair 4000D < Corsair 4000D Airflow",
+      "case: Corsair 5000D < Corsair 5000D Airflow",
+      "case: Fractal Meshify 2 < Fractal Meshify 2 Compact",
+      "case: Fractal Meshify 2 < Fractal Meshify 2 XL",
+      "case: Fractal North < Fractal North XL",
+      "case: Lian Li O11 Dynamic EVO < Lian Li O11 Dynamic EVO XL",
+      "case: NZXT H510 < NZXT H510 Elite",
+      "case: NZXT H510 < NZXT H510 Flow",
+      "case: NZXT H510 < NZXT H510i",
+      "case: NZXT H710 < NZXT H710i",
+      "case_fan: Arctic P12 PWM < Arctic P12 PWM PST",
+      "case_fan: Lian Li UNI FAN SL120 < Lian Li UNI FAN SL120 V2",
+      "cpu: Core i5-12400 < Core i5-12400F",
+      "cpu: Ryzen 5 3600 < Ryzen 5 3600X",
+      "cpu: Ryzen 5 5600 < Ryzen 5 5600X",
+      "cpu: Ryzen 7 5700X < Ryzen 7 5700X3D",
+      "cpu: Ryzen 7 5800X < Ryzen 7 5800X3D",
+      "cpu: Ryzen 9 9900X < Ryzen 9 9900X3D",
+      "cpu: Ryzen 9 9950X < Ryzen 9 9950X3D",
+      "cpu_cooler: Noctua NH-D15 < Noctua NH-D15 G2",
+      "motherboard: ASUS ROG Strix X570-E Gaming < ASUS ROG Strix X570-E Gaming WiFi II",
+      "motherboard: ASUS TUF Gaming B550-Plus < ASUS TUF Gaming B550-Plus WiFi II",
+      "motherboard: MSI MAG B550 Tomahawk < MSI MAG B550 Tomahawk MAX WiFi",
+      "psu: Corsair RM1000x < Corsair RM1000x Shift",
+      "psu: Corsair RM750x < Corsair RM750x Shift",
+      "psu: Corsair RM850x < Corsair RM850x Shift",
+    ]);
+  });
+
+  /**
+   * T48. THE GUARD THE BRIEF BELIEVED T13 ALREADY WAS.
+   *
+   * T13 audits the rule vocabularies against EACH OTHER. It never looks at a catalog name, and
+   * neither does anything else -- so NOTHING checked catalog names against the vocabularies at
+   * all. A name can be harmless alone and, joined to a marker phrase of its own type, spell a
+   * phrase that disqualifies the listing: `Lian Li O11 Dynamic Mini` + `pc case` is
+   * `"... mini pc case"`, and `mini pc` is a SYSTEM_PHRASE. That name was drafted, caught here,
+   * and is deliberately not in the catalog.
+   *
+   * ONLY SPANS THAT STRADDLE THE JOIN COUNT, AND THE NARROWING IS THE GUARD RATHER THAN A TEST
+   * TRIMMED UNTIL IT WENT GREEN. The obvious formulation -- "name + marker must still resolve to
+   * the name" -- FAILS 17 TIMES ON THE UNTOUCHED 176-NAME CATALOG, all of them
+   * `<fan name> + "fan pack"`, which is ruling 2's deliberate choice that a fan pack really is a
+   * pack. Flagging those would re-litigate a settled ruling, and the `pc case` -> `pc`
+   * neutralisation with it. `pc case` contains `pc` WITHIN the marker and `fan pack` contains
+   * `pack` WITHIN the marker; neither straddles, and a phrase spelled by the JOIN is exactly
+   * what neither mechanism intends.
+   *
+   * MEASURED ON THREE CATALOGS: the untouched 176 -> 0 straddles, the 337-name draft -> exactly
+   * 1 (the O11 Dynamic Mini, and nothing else), the shipped 336 -> 0. Zero on the untouched
+   * catalog is what says this is a NEW guard rather than a pre-existing failure smuggled in
+   * under a new name.
+   *
+   * ASSERTED BY NAME, NOT BY COUNT, so a straddle that appears is readable without re-deriving.
+   */
+  it("T48: no catalog name joined to its own type's marker spells a disqualifying phrase", () => {
+    const vocabulary: [string, string][] = [
+      ...SYSTEM_PHRASES.map((phrase) => ["SYSTEM_PHRASES", phrase] as [string, string]),
+      ...MULTIPLE.map((phrase) => ["MULTIPLE", phrase] as [string, string]),
+      ...[...WHOLE_UNIT].map((token) => ["WHOLE_UNIT", token] as [string, string]),
+      ...[...MULTI_UNIT].map((token) => ["MULTI_UNIT", token] as [string, string]),
+    ];
+
+    const straddles: string[] = [];
+    for (const componentType of WORKER_TYPES) {
+      for (const model of catalogModels(componentType)) {
+        const modelLength = tokenize(model).length;
+        for (const marker of MARKERS[componentType]) {
+          const markerLength = tokenize(marker).length;
+          const joins: [string, string, number][] = [
+            ["name+marker", `${model} ${marker}`, modelLength],
+            ["marker+name", `${marker} ${model}`, markerLength],
+          ];
+          for (const [order, title, boundary] of joins) {
+            const values = tokenValues(tokenize(title));
+            for (const [set, phrase] of vocabulary) {
+              for (const [from, to] of phraseSpans(values, tokenValues(tokenize(phrase)))) {
+                // STRADDLES: starts before the join and ends after it.
+                if (from < boundary && to > boundary) {
+                  straddles.push(
+                    `${componentType}: "${model}" ${order} "${marker}" spells ${set}:"${phrase}"`,
+                  );
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    expect([...new Set(straddles)].sort()).toEqual([]);
   });
 
   /**

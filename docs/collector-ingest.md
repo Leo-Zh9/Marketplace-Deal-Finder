@@ -94,8 +94,19 @@ unvalidated `0.4` would reject the whole call as a 503 instead of a 400.
 
 Copied from a real `npm run e2e:local` run over the committed four-listing fixture, not composed
 by hand. One of those four is a standalone catalog GPU at a positive price; the others are a
-trade-only ad, a whole gaming PC whose title names a real GPU, and a GTX 1080 Ti the catalog does
+trade-only ad, a whole gaming PC whose title names a real GPU, and a GTX 980 Ti the catalog does
 not list.
+
+**That last title is load-bearing, and it has already been changed once.** It was a GTX 1080 Ti
+until `src/data/catalog.ts` was extended two generations back, at which point it matched a
+catalog model and took seven `npm run e2e:local` assertions down with it — including the removal
+control, whose seed `INSERT` then collided with the row the listing writes for itself, so the
+control could not be seeded at all rather than merely reporting a different number. It is the
+only fixture listing that is `VALID` with a null model key, so the control has nowhere else to
+live. Maxwell (GTX 900) is now the only generation left that keeps it uncatalogued: **do not add
+GTX 900 cards to the catalog without rewriting that block of `scripts/e2e-local.sh` first.**
+`GENERATION_TITLES` in `worker/normalize/normalizeListing.test.ts` pins the same title, so the
+13-second suite says so before the expensive gate does.
 
 Every key is always present, at 0 when it did not happen. `received` counts what was sent and
 `stored` counts what `recordSightings` returned, so its last-wins de-duplication of a repeated

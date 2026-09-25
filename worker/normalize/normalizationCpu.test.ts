@@ -111,7 +111,7 @@ describe("normalization CPU", () => {
       if (definition === undefined) throw new Error(`no catalog component for ${componentType}`);
       return definition.models;
     });
-    expect(modelLists.flat()).toHaveLength(176);
+    expect(modelLists.flat()).toHaveLength(336);
 
     const work = (): number => {
       let consumed = 0;
@@ -121,7 +121,7 @@ describe("normalization CPU", () => {
 
     const { p50, p95 } = measure(work, 20);
     console.log(
-      `buildModelIndex x9 (all 176 models): p50 ${p50.toFixed(4)} ms, p95 ${p95.toFixed(4)} ms [sink ${sink}]`,
+      `buildModelIndex x9 (all 336 models): p50 ${p50.toFixed(4)} ms, p95 ${p95.toFixed(4)} ms [sink ${sink}]`,
     );
     expect(p95).toBeLessThan(8);
   });
