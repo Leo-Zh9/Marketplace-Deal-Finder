@@ -133,7 +133,20 @@ const CASES: Case[] = [
   ["T5 (rule 9): live -- no brand, no series word", "Selling My 4070 TI", 100000, "gpu", "NEEDS_REVIEW", null, "component-unconfirmed"],
 
   // Rule 10: real, standalone, and the catalog does not list it.
-  ["T15 (rule 10): live -- a genuine uncatalogued GPU", "AMD Radeon™ RX 6800 XT Phantom Gaming D 16G OC", 49900, "gpu", "VALID", null, "model-unmatched"],
+  // T15 MOVED FROM RULE 10 TO RULE 11, AND IT IS RECORDED RATHER THAN RE-BASELINED. This is the
+  // exact card the live sample is selling and the catalog now lists it, so the row that used to
+  // pin "a genuine uncatalogued GPU" stopped pinning that. T15n below takes over rule 10's duty
+  // with a card that is deliberately still out of catalog (RX 500 / Polaris).
+  //
+  // THE DANGEROUS HALF, AND IT IS A CLASS OF DEFECT. catalogIndex.ts's tokenizer comment named
+  // T15 as the test that goes red if `normalize("NFKD")` moves before `toLowerCase()`. MEASURED:
+  // once `Radeon RX 6800 XT` is catalogued that is no longer true -- the mutated tokenizer gives
+  // `radeontm`, but `rx 6800 xt` is still an entry point, so the model resolves either way and
+  // the mutation kills NOTHING. A guard whose only test asserts an END-TO-END outcome can be
+  // disarmed by a pure DATA change, with no code touched and no test going red. T15t in
+  // catalogIndex.test.ts is the replacement, and it asserts the token stream itself.
+  ["T15r (rule 11): live -- the RX 6800 XT the catalog now lists", "AMD Radeon™ RX 6800 XT Phantom Gaming D 16G OC", 49900, "gpu", "VALID", "Radeon RX 6800 XT", "matched"],
+  ["T15n (rule 10): a genuine uncatalogued GPU, one generation older still", "XFX Speedster RX 580 8GB graphics card", 12900, "gpu", "VALID", null, "model-unmatched"],
   ["T22b (rule 10): live -- 217 is not 216", "Lian Li lancool 217 White PC Case", 12000, "case", "VALID", null, "model-unmatched"],
   ["T29r (rule 10): a cooler revision the catalog lacks", "Noctua NH-D15 G3 cpu cooler", 14900, "cpu_cooler", "VALID", null, "model-unmatched"],
 
@@ -177,7 +190,33 @@ const ACCEPTED_EXPOSURE: Case[] = [
   ["T36e: a truncated model name reads as a count", "G.Skill Flare X5", 17500, "ram", "NEEDS_REVIEW", null, "unknown-quantity"],
   // B1's own named cost: with no catalog match there is no model span for the marker to trail,
   // so a real CPU the catalog does not list is refused rather than stored with a null key.
-  ["T36f: retail box wording on an uncatalogued model", "AMD Ryzen 5 5600 Desktop Processor", 22000, "cpu", "INVALID_REFERENCE", null, "whole-system"],
+  // THE INPUT MOVED, AND BOTH HALVES ARE ASSERTED. `Ryzen 5 5600` is now catalogued, so it no
+  // longer exercises this residual; `Ryzen 5 4500` is a real CPU that is deliberately still out
+  // of catalog. The half that CLOSED is RESIDUAL_CLOSED below -- swapping the input and saying
+  // nothing would keep the suite green while a real improvement went unrecorded.
+  ["T36f: retail box wording on an uncatalogued model", "AMD Ryzen 5 4500 Desktop Processor", 22000, "cpu", "INVALID_REFERENCE", null, "whole-system"],
+];
+
+/**
+ * THE OTHER HALF OF T36f, AND IT IS AN IMPROVEMENT THIS SLICE CAUSED RATHER THAN A COST.
+ *
+ * PR #14 left the `desktop <component>` retail family as a named residual: with no catalog match
+ * there is no model span for the `desktop processor` marker to TRAIL, so `desktop` stays an
+ * uncovered whole-unit token and the listing is refused as a whole system. THE RULE DID NOT
+ * CHANGE -- the SET it applies to shrank by 160 models. `AMD Ryzen 5 5600 Desktop Processor` is
+ * the literal title T36f used to carry, and it is now a match.
+ *
+ * ASSERTING BOTH HALVES IS THE POINT. T36f pins the residual that REMAINS for a model the
+ * catalog does not list; these two pin the part that CLOSED, so the residual can neither close
+ * further nor re-open unnoticed. Either fails if `Ryzen 5 5600` leaves the catalog or if
+ * COVERED_ONLY_WHEN_TRAILING is emptied.
+ *
+ * Prices 22100 and 11800 are distinct from every other fixture price, per the file's own
+ * fixture-correlation rule at the top.
+ */
+const RESIDUAL_CLOSED: Case[] = [
+  ["T36g: retail box wording on a cpu the catalog NOW lists", "AMD Ryzen 5 5600 Desktop Processor", 22100, "cpu", "VALID", "Ryzen 5 5600", "matched"],
+  ["T36h: the ram half of the same residual", "Corsair Vengeance LPX 16GB DDR4 desktop memory", 11800, "ram", "VALID", "Corsair Vengeance LPX 16GB DDR4", "matched"],
 ];
 
 const assertCase = ([, title, priceCents, componentType, validity, modelKey, reason]: Case): void => {
@@ -195,6 +234,10 @@ describe("normalizeListing -- the classification rules", () => {
   });
 
   it.each(ACCEPTED_EXPOSURE)("%s", (...testCase) => {
+    assertCase(testCase);
+  });
+
+  it.each(RESIDUAL_CLOSED)("%s", (...testCase) => {
     assertCase(testCase);
   });
 });
@@ -459,7 +502,7 @@ const WHOLE_MACHINES: string[] = [
 
 /**
  * Real board-partner component titles. The catalog stores GENERIC model names and holds no
- * board-partner brands at all, so "0 collisions against the 176" says nothing about these. This
+ * board-partner brands at all, so "0 collisions against the 336" says nothing about these. This
  * corpus is what says something about them, and it is why `nitro`, `aorus` and `predator` were
  * refused as SYSTEM_PHRASES.
  */
@@ -548,8 +591,10 @@ const FREE_PHRASINGS: [string, "usable" | "refused"][] = [
  *
  * ITS JOB IS TO MAKE THE RESIDUAL KNOWN, NOT TO FINISH AN OPEN-ENDED LIST. Written cold it found
  * TEN mis-pools in twenty titles. Three were closed by adding `ii`, `touch` and `argb`, each
- * measured free against the 176 names, the 15 live titles and every title this suite pins as a
- * match. Six remain ACCEPTED EXPOSURE, pinned below with the reason each word was refused, and a
+ * measured free against the 176 names AS OF PR #14, the 15 live titles and every title this
+ * suite pins as a match. Removing any one of them today turns THIS test (R6) red, together with
+ * T20's per-element sweep and, for `argb`, G1x -- not T11 or T12, which stay green even with
+ * every guard in catalogIndex.ts deleted. Six remain ACCEPTED EXPOSURE, pinned below with the reason each word was refused, and a
  * seventh -- the year suffix -- was already a standing decision. An unmeasured residual is what
  * `Corsair RM850x 2021` was before anyone looked.
  */
@@ -584,6 +629,86 @@ const SKU_SUFFIX_PHRASINGS: [Listing["componentType"], string, "refused" | "pool
   // the word `founders` instead. Also correct: the catalog stores generic names, so every
   // board-partner variant already pools into them and an FE is no different.
   ["gpu", "GeForce RTX 5080 FE", "pooled"],
+];
+
+/**
+ * THE GENERATIONS THIS SLICE ADDED, WRITTEN FROM HOW A SELLER TYPES AN AD.
+ *
+ * WHY IT EXISTS AT ALL, AND IT IS A MEASUREMENT RATHER THAN AN OPINION. The catalog grew from
+ * 176 names to 336. An ablation of 20 guards and vocabulary elements against BOTH catalogs
+ * returned BYTE-IDENTICAL killer sets: doubling the data moved test coverage by exactly ZERO,
+ * because every pre-existing test in this repo names a current-generation product. With this
+ * corpus, G1x is the SOLE NEW KILLER of ten distinct mutations -- W-first-not-deepest,
+ * G1-allow-walk-past, B2-ignore-endsRun, G2-ignore-suffix, TOK-no-letterdigit-split, the
+ * OPTIONAL_LEADING drops of `geforce`, `radeon`, `intel` and `core`, and the SUFFIX_WORDS drops
+ * of `xt` and `argb`. That is the evidence these rows are load-bearing rather than ballast.
+ *
+ * WRITTEN BEFORE ANY RESULT WAS KNOWN AND NOT DERIVED FROM THE MODEL LIST, which is the only
+ * reason the six corpora above are worth anything. It earned that description in the writing:
+ * the `Lian Li O11 Dynamic Razer Edition` row was PREDICTED as `refused` and MEASURED as
+ * `no-key`, so the corpus corrected the plan rather than the other way round. Rows that MISS and
+ * rows that POOL are kept deliberately -- a corpus that agreed with the catalog everywhere would
+ * be evidence about the catalog, not about the matcher.
+ *
+ * HONEST SCOPE, SO NOBODY OVERCLAIMS IT: this pins the 30 titles it names, not all 160 added
+ * models. Any deletion is still caught by T11's `toHaveLength(336)`; what the corpus adds is
+ * that the CONSEQUENCE is named for what it covers. MEASURED: dropping `GeForce RTX 3060 8GB`
+ * turns this red. A 160-row corpus would be ballast and was rejected as such.
+ *
+ * Shape: `[componentType, title, expected, why]`, where `expected` is the exact model key, or
+ * `"no-key"` for VALID with none, or `"refused"` for anything else.
+ */
+const GENERATION_TITLES: [Listing["componentType"], string, string, string][] = [
+  // --- THE FOUR GUARDS AND THE TWO VOCABULARIES, exercised against the NEW generations. Before
+  // these rows every killer of each named a current-generation product.
+  ["cpu", "AMD Ryzen 5 5600G processor", "no-key", "B2: the APU is a different die from the 5600"],
+  ["cpu", "AMD Ryzen 5 3600 XT processor", "no-key", "G2: the XT is a different SKU from the 3600"],
+  ["cpu", "Ryzen 7 5700X3D cpu", "Ryzen 7 5700X3D", "B2+W: the X3D is not the 5700X"],
+  ["motherboard", "ASUS TUF Gaming B550-Plus WiFi motherboard", "no-key", "G1: the walk passes the base name, so refuse"],
+  ["psu", "Corsair RM750x Shift PSU", "Corsair RM750x Shift", "W: the deeper name, not RM750x"],
+  ["case", "NZXT H510 Elite tempered glass", "NZXT H510 Elite", "W: the +40% sibling, not the bare H510"],
+  ["case_fan", "Arctic P12 PWM case fan", "Arctic P12 PWM", "W: the base, not the PST"],
+  ["case", "Lian Li O11 Dynamic EVO ARGB computer case", "no-key", "G2: argb marks a SKU the catalog lacks"],
+  ["cpu", "i5 12400F cpu only", "Core i5-12400F", "OPTIONAL_LEADING: sellers never type the word Core"],
+  ["gpu", "Arc A750 8GB graphics card", "Intel Arc A750", "OPTIONAL_LEADING: `intel` dropped -- coverage, not a defect closed"],
+  // --- THE LIVE PRODUCTION SAMPLE'S OWN CARDS, which is what this slice exists for.
+  ["gpu", "XFX Speedster RX 6800 XT Merc 319 16GB", "Radeon RX 6800 XT", "in the 15 live titles"],
+  ["gpu", "ASUS ROG Strix GTX 1080 Ti OC 11GB", "GeForce GTX 1080 Ti", "in the 15 live titles"],
+  ["gpu", "RTX 2080ti 11gb blower", "GeForce RTX 2080 Ti", "B2+W on a concatenated alias"],
+  // --- THE VRAM AXIS, BOTH SIDES AND BOTH OF ITS COSTS. Encoding a capacity split costs every
+  // bare-name listing, and the second cost is the larger one.
+  ["gpu", "Zotac GTX 1060 6gb mini", "GeForce GTX 1060 6GB", "encoded: ~40% from the 3GB"],
+  ["gpu", "GTX 1060 3gb", "GeForce GTX 1060 3GB", "encoded: the other side"],
+  ["gpu", "Nvidia GTX 1060", "no-key", "THE COST of encoding it: the bare name matches neither"],
+  ["gpu", "RTX 3060 8GB graphics card", "GeForce RTX 3060 8GB", "encoded: ~30% from the 12GB, when the capacity follows the model"],
+  ["gpu", "Gigabyte RTX 3060 Gaming OC 8GB", "no-key", "THE OTHER COST: a board-partner word between model and capacity breaks contiguity"],
+  // --- ACCEPTED POOLS, each carrying its measured price gap. G2 inspects exactly ONE token past
+  // the match, so a differentiator whose first token is benign (`a rgb`, `v 2`, `ac`, `wifi`) is
+  // not seen at all. TWO of these sit above the ~20% encode threshold and each has its own named
+  // volume argument; neither is precedent for a third.
+  ["motherboard", "MSI MAG B550 Tomahawk WiFi motherboard", "MSI MAG B550 Tomahawk", "POOL ~23%: `wifi` is benign and the catalogued sibling is `MAX WiFi`"],
+  ["cpu_cooler", "Arctic Liquid Freezer II 240 A-RGB cpu cooler", "Arctic Liquid Freezer II 240", "POOL ~15%: `a rgb` -- G2 sees only `a`"],
+  ["cpu_cooler", "Cooler Master Hyper 212 EVO V2 cpu cooler", "Cooler Master Hyper 212 EVO", "POOL ~15%: `v 2` -- G2 sees only `v`"],
+  ["motherboard", "ASRock B550M Pro4 AC motherboard", "ASRock B550M Pro4", "POOL ~15%: `ac` is benign"],
+  // THE TWO POOLS THIS SLICE ITSELF CREATED, by shipping a bare stem. The plan's own rule is
+  // that a bare short name ships with its priced-apart siblings or not at all; these two stems
+  // shipped without the sibling, and the differentiator (`lite`, `performance`) is a benign word
+  // G2 cannot see. Both are at or above the ~20% encode threshold, so they are named here rather
+  // than left to an aggregate -- closing either means shipping the sibling, as X570-E did.
+  ["case", "Fractal Meshify 2 Lite ATX case", "Fractal Meshify 2", "POOL ~25-30%: the Lite is a cheaper steel-panel SKU; `lite` is benign to G2"],
+  ["case", "Lian Li Lancool II Mesh Performance computer case", "Lian Li Lancool II Mesh", "POOL ~20%: the Performance adds fans; `performance` is benign to G2"],
+  ["gpu", "Sapphire Radeon RX 6500 XT 8GB graphics card", "Radeon RX 6500 XT", "POOL ~18-20%: the 4GB/8GB split is NOT encoded"],
+  ["gpu", "EVGA GeForce RTX 3080 12GB FTW3 graphics card", "GeForce RTX 3080", "POOL ~12%: below the encode threshold, by decision"],
+  ["gpu", "NVIDIA GeForce RTX 2060 12GB graphics card", "GeForce RTX 2060", "POOL ~25%: negligible volume, by decision"],
+  // --- POOLS THAT WERE CLOSED, pinned so a later edit cannot silently re-open them. One was
+  // closed by SHIPPING the sibling, the other by NOT shipping the bare name.
+  ["motherboard", "ASUS ROG Strix X570-E Gaming WiFi II motherboard", "ASUS ROG Strix X570-E Gaming WiFi II", "CLOSED (~25%) by shipping the sibling"],
+  ["case", "Lian Li O11 Dynamic Razer Edition pc case", "no-key", "CLOSED (~40%) by NOT shipping the bare O11 Dynamic -- a clean miss, not a refusal"],
+  // --- THE e2e FIXTURE'S OWN TITLE. `scripts/e2e-local.sh` depends on this listing being a real
+  // standalone GPU the catalog does NOT list; cataloguing Maxwell breaks that gate in seven ways,
+  // one of which is an un-seedable INSERT rather than a wrong number. This row says so in 13
+  // seconds instead of leaving it to the expensive gate.
+  ["gpu", "Nvidia GeForce GTX 980 Ti Graphics Card with MSI Cooler", "no-key", "PINS scripts/e2e-local.sh -- do not catalogue GTX 900"],
 ];
 
 describe("normalizeListing -- the measured cost and the measured residual", () => {
@@ -697,6 +822,29 @@ describe("normalizeListing -- the measured cost and the measured residual", () =
     // abbreviated -- are the correct answer, because the catalog stores generic names and every
     // board-partner variant already pools into them.
     expect(SKU_SUFFIX_PHRASINGS.filter(([, , e]) => e === "pooled")).toHaveLength(9);
+  });
+
+  /**
+   * G1x. THE NEW GENERATIONS, ROW BY ROW, WITH THE `why` IN THE ASSERTION MESSAGE. Asserted per
+   * row so that deleting an added model surfaces as the one title that changed rather than as a
+   * count. The three totals underneath stop it being satisfiable by refusing everything or by
+   * matching everything.
+   */
+  it("G1x: every new-generation seller title lands exactly where the measurement says", () => {
+    expect(GENERATION_TITLES).toHaveLength(30);
+    for (const [componentType, title, expected, why] of GENERATION_TITLES) {
+      const result = normalizeListing({ title, priceCents: 6300, componentType });
+      const actual =
+        result.modelKey !== null
+          ? result.modelKey
+          : result.validity === "VALID"
+            ? "no-key"
+            : "refused";
+      expect(actual, `${title} -- ${why}`).toBe(expected);
+    }
+    // Not satisfiable by refusing everything, nor by matching everything.
+    expect(GENERATION_TITLES.filter(([, , expected]) => expected !== "no-key")).toHaveLength(22);
+    expect(GENERATION_TITLES.filter(([, , expected]) => expected === "no-key")).toHaveLength(8);
   });
 
   it("F5c: no board-partner brand word refuses a real component listing", () => {

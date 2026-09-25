@@ -190,9 +190,19 @@ is "  ...and the title verbatim, pipes and all" 'GeForce RTX 3070 | Intel Core i
 is "  ...and four evaluation tasks queued"     4 "$(val "SELECT COUNT(*) FROM evaluation_tasks WHERE status='PENDING'")"
 # NORMALIZATION IS WHAT MAKES THESE NON-ZERO. Of the four fixture edges exactly one -- the ASUS
 # ROG Astral RTX 5080 at CA$3,000 -- is a standalone catalog GPU at a positive price. The other
-# three are a trade-only ad, a whole gaming PC whose title names a real GPU, and a GTX 1080 Ti
-# the catalog does not list. Before this slice all four reported skipped-no-model and BOTH of
-# these counts were 0.
+# three are a trade-only ad, a whole gaming PC whose title names a real GPU, and a GTX 980 Ti
+# the catalog does not list. Before normalization existed all four reported skipped-no-model and
+# BOTH of these counts were 0.
+#
+# THE FIXTURE TITLE IS LOAD-BEARING AND IT CHANGED ONCE ALREADY. It was a GTX 1080 Ti until
+# src/data/catalog.ts was extended two generations back, at which point it MATCHED a catalog
+# model and took SEVEN assertions in this file down with it: the two counts just below, the
+# model_stats contents, `"recorded":1`, `"skipped-no-model":1`, the removal control's seed and
+# the two assertions that hang off it. Maxwell (GTX 900) is now the ONLY generation left that
+# keeps this listing uncatalogued. DO NOT ADD GTX 900 CARDS TO src/data/catalog.ts without
+# rewriting this block and the control below; `GENERATION_TITLES` in
+# worker/normalize/normalizeListing.test.ts pins the same title so the 13-second suite says so
+# before this gate does.
 is "  ...and ONE observation reached price_observations" 1 "$(val 'SELECT COUNT(*) FROM price_observations')"
 is "  ...and ONE aggregate row reached model_stats"      1 "$(val 'SELECT COUNT(*) FROM model_stats')"
 # The CONTENTS, not just the count: a rule that resolved every title to one wrong key would pass
@@ -235,10 +245,17 @@ is "  ...and queued no new tasks"              4 "$(val 'SELECT COUNT(*) FROM ev
 #
 # THE CONTROL MOVED, AND THIS IS WHY. It used to hang off 915010494744438, which is the ASUS ROG
 # Astral RTX 5080 -- that listing now CONTRIBUTES ON ITS OWN, so it can no longer stand in for a
-# listing whose contribution must disappear. 1812246723463464 is `Nvidia GeForce GTX 1080 Ti
+# listing whose contribution must disappear. 1812246723463464 is `Nvidia GeForce GTX 980 Ti
 # Graphics Card with MSI Cooler` at CA$80: a real, standalone GPU the catalog does not list, so
 # the rule answers VALID with a NULL model key and the sighting still takes recordSightings'
 # `removed` path. price_cents 8000 is that listing's own price.
+#
+# IT IS THE SAME DEPENDENCY AS THE BLOCK AT THE TOP OF THIS FILE, AND IT IS THE SHARPER HALF.
+# The moment that listing carries a model key of its own, the seed INSERT below collides with
+# the row the listing writes for itself and the control cannot be seeded AT ALL -- an empty
+# control rather than a wrong number, which no count bump can repair. It is also the ONLY
+# fixture listing that is VALID with a null key, so there is nowhere to move the control to.
+# DO NOT CATALOGUE GTX 900 without rewriting this control first.
 #
 # THE TWO SEEDED ROWS MUST SHARE market_key / model_key / variant_key EXACTLY. SUBTRACT_OLD's
 # correlated EXISTS matches price_observations against model_stats on all three; if they differ,

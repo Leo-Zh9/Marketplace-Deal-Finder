@@ -51,7 +51,7 @@ describe("Marketplace Deal Finder", () => {
     await user.click(screen.getByText("GPU models"));
 
     const selectAll = screen.getByRole("checkbox", {
-      name: /Select all 23 models/i,
+      name: /Select all 68 models/i,
     });
     const excludedModel = screen.getByRole("checkbox", {
       name: "GeForce RTX 5090",
@@ -61,7 +61,7 @@ describe("Marketplace Deal Finder", () => {
     expect(excludedModel).toBeChecked();
     await user.click(excludedModel);
     expect(selectAll).not.toBeChecked();
-    expect(screen.getByText("22 of 23 models")).toBeInTheDocument();
+    expect(screen.getByText("67 of 68 models")).toBeInTheDocument();
   });
 
   it("infers the combined deal rule from two checked criteria", async () => {

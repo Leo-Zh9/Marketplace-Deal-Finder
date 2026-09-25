@@ -15,7 +15,7 @@
  *
  * NORMALIZATION RUNS HERE, NOT IN THE COLLECTOR, AND THAT IS THE WHOLE SECURITY ARGUMENT. A
  * leaked `COLLECTOR_TOKEN` can choose a title; it cannot choose a model key. `model_key` is one
- * of the 176 names in `src/data/catalog.ts` or NULL, and only a title this server's own rule
+ * of the 336 names in `src/data/catalog.ts` or NULL, and only a title this server's own rule
  * resolves to that model produces it. L3's `modelKey` case is the guard on that and must not be
  * tidied away as redundant.
  *

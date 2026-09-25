@@ -94,8 +94,19 @@ unvalidated `0.4` would reject the whole call as a 503 instead of a 400.
 
 Copied from a real `npm run e2e:local` run over the committed four-listing fixture, not composed
 by hand. One of those four is a standalone catalog GPU at a positive price; the others are a
-trade-only ad, a whole gaming PC whose title names a real GPU, and a GTX 1080 Ti the catalog does
+trade-only ad, a whole gaming PC whose title names a real GPU, and a GTX 980 Ti the catalog does
 not list.
+
+**That last title is load-bearing, and it has already been changed once.** It was a GTX 1080 Ti
+until `src/data/catalog.ts` was extended two generations back, at which point it matched a
+catalog model and took seven `npm run e2e:local` assertions down with it — including the removal
+control, whose seed `INSERT` then collided with the row the listing writes for itself, so the
+control could not be seeded at all rather than merely reporting a different number. It is the
+only fixture listing that is `VALID` with a null model key, so the control has nowhere else to
+live. Maxwell (GTX 900) is now the only generation left that keeps it uncatalogued: **do not add
+GTX 900 cards to the catalog without rewriting that block of `scripts/e2e-local.sh` first.**
+`GENERATION_TITLES` in `worker/normalize/normalizeListing.test.ts` pins the same title, so the
+13-second suite says so before the expensive gate does.
 
 Every key is always present, at 0 when it did not happen. `received` counts what was sent and
 `stored` counts what `recordSightings` returned, so its last-wins de-duplication of a repeated
@@ -118,13 +129,18 @@ price:
 | `skipped-no-model` | the rule accepted it as the right component and could not name it — a real component the catalog does not list |
 | `skipped-no-price` | **newly reachable in this slice.** A listing that resolved to a catalog model and whose `priceText` did not parse. It was structurally unreachable only while `modelKey` was always null |
 
-**`skipped-no-model` DOES NOT MEASURE CATALOG COVERAGE, and reading it that way undercounts by
-about 3x.** Measured over the 15 live listings from one real GPU search:
-`{skipped-invalid: 13, skipped-no-model: 1, recorded: 1}`. Three real, standalone, working GPUs
-the catalog lacks are in that set, and only one of them (`AMD Radeon™ RX 6800 XT …`) reaches
-`skipped-no-model`. `Gigabyte vision 3060ti (white)` and `Selling My 4070 TI` carry no
-`rtx`/`gtx`/`geforce`/`radeon` token and no catalog match, so the rule declines to guess and they
-land in `component-unconfirmed` → `NEEDS_REVIEW` → `skipped-invalid`.
+**`skipped-no-model` DOES NOT MEASURE CATALOG COVERAGE, and the catalog slice made that sharper
+rather than softer.** Re-measured over the same 15 live listings from one real GPU search, now
+against the 336-name catalog: `{skipped-invalid: 13, recorded: 2}` — **`skipped-no-model` is
+now 0**. It was `{skipped-invalid: 13, skipped-no-model: 1, recorded: 1}` when the catalog held
+176 names, and the single row that used to sit in `skipped-no-model` was `AMD Radeon™ RX 6800
+XT …`, which is now catalogued and recorded.
+
+A counter that reads 0 while real, standalone, uncatalogued GPUs are in the batch is exactly why
+it is not a coverage meter. Two of them are still there: `Gigabyte vision 3060ti (white)` and
+`Selling My 4070 TI` carry no `rtx`/`gtx`/`geforce`/`radeon` token and no catalog match, so the
+rule declines to guess and they land in `component-unconfirmed` → `NEEDS_REVIEW` →
+`skipped-invalid`, never in `skipped-no-model`.
 
 **How the coverage number IS obtained, since no counter is being added for it.** The response
 shape is not this slice's to grow. The number stays obtainable without one, because `validity`,
@@ -239,7 +255,7 @@ owns what a listing *is*. Both are pure functions of `(title, priceCents, compon
 Lower-case, split on every non-alphanumeric character, then split each run at its letter/digit
 boundaries — so `"rtx5080"`, `"RTX 5080"` and `"RTX-5080"` tokenize alike. There is deliberately
 **no `normalize("NFKD")`**: measured, `"RTX™".toLowerCase().normalize("NFKD")` is `"rtxTM"`,
-because U+2122 decomposes to an upper-case `TM`, and 0 of the 176 catalog names contain a
+because U+2122 decomposes to an upper-case `TM`, and 0 of the 336 catalog names contain a
 non-ASCII character anyway.
 
 The tokenizer stops at **64 tokens**. A title that reaches that bound *may* have been truncated,
@@ -252,8 +268,9 @@ the 15 live titles is 18, so nothing real is near the bound.
 ### The match: a prefix trie per component type, and three guards
 
 Each component type gets a trie built once at module load from its catalog names, plus every
-suffix obtained by dropping a leading `geforce`/`nvidia`/`radeon`/`amd`/`intel` — 176 models,
-199 entry points. Series words (`rtx`, `rx`, `gtx`, `arc`) are **not** droppable: a bare `5080`
+suffix obtained by dropping a leading `geforce`/`nvidia`/`radeon`/`amd`/`intel`/`core` — 336
+models, 423 entry points (the names plus 87 vendor-stripped cores: geforce 43, radeon 20,
+intel 5, core 19). Series words (`rtx`, `rx`, `gtx`, `arc`) are **not** droppable: a bare `5080`
 in the trie would match Dell's OptiPlex 5080. The cost is that `"Selling my 4070 Super"` is a
 miss, and a miss is safe.
 
@@ -326,8 +343,8 @@ North"`, where `pc case` leads and the model follows, which is ordinary case phr
 
 **The named cost has two halves, because word order is the only signal available.** A title that
 LEADS with the retail category is refused whether or not the catalog knows the model:
-`"AMD Ryzen 5 5600 Desktop Processor"` (uncatalogued, so there is no span for the marker to
-trail) and `"Desktop Processor Core i9-14900K"` or `"Desktop Memory Corsair Vengeance 32GB DDR5"`
+`"AMD Ryzen 5 4500 Desktop Processor"` (uncatalogued, so there is no span for the marker to
+trail — the 5600 this example used to name is catalogued now, and T36g asserts that it matches) and `"Desktop Processor Core i9-14900K"` or `"Desktop Memory Corsair Vengeance 32GB DDR5"`
 (catalogued, but the category leads). The second half is inherent: `"Desktop Processor: Core
 i9-14900K"` is token-identical in shape to `"Desktop | Processor: Core i9-14900K"`, which is the
 prebuilt the rule exists to refuse. Lost references, never wrong ones.
@@ -348,7 +365,7 @@ which a marker cannot dissolve by construction.
 **Eight system-only product lines** (`razer blade`, `legion`, `omen`, `victus`, `zephyrus`,
 `xps`, `ideapad`, `pavilion`) are the second detector for a machine whose title names no
 whole-unit word at all, such as `"Razer Blade 16 RTX 5080"`. **Four brand candidates were refused
-on measured collisions:** `aorus` (5 catalog motherboards, and Gigabyte's GPU line), `nitro`
+on measured collisions:** `aorus` (8 catalog motherboards, and Gigabyte's GPU line), `nitro`
 (`Sapphire Nitro+` is a mainstream AMD board-partner GPU line), `predator` (Acer sells Predator
 RAM and NVMe drives) and `katana` (`Scythe Katana` is a mainstream tower CPU cooler) — the last
 of these was **admitted for a round and caught on re-review**, because the corpus guarding these
@@ -378,8 +395,10 @@ live 5080 is CA$3,000. Any threshold would be a fabricated number.
 
 ### What is proven, and what is not
 
-- **176/176** catalog names, declared as their own component type, resolve to themselves.
-- **0 of 1,408** cross-type pairs produce a `VALID` result carrying a model key.
+- **336/336** catalog names, declared as their own component type, resolve to themselves.
+- **0 of 2,688** cross-type pairs produce a `VALID` result carrying a model key.
+- **Every one of the nine per-type counts** is pinned, not just the total: a name typed into the
+  wrong component block keeps the total at 336 and is invisible to everything else.
 - **10** sub-phrase overlaps exist across the eighteen vocabularies, all of them known and
   pinned; an eleventh fails the suite.
 - CPU, measured in Node on a development machine rather than in workerd — the same caveat
@@ -491,7 +510,7 @@ discovered in an aggregate.
 > own rule resolves to a catalog model together with a positive price.
 >
 > What the server still decides: `model_key` is not a wire field and cannot be chosen directly —
-> it is one of the 176 names in `src/data/catalog.ts` or `NULL`, and only a title the rule
+> it is one of the 336 names in `src/data/catalog.ts` or `NULL`, and only a title the rule
 > resolves to that model produces it. `variant_key` is written as `''` by `recordSightings`'
 > `normalizeVariantKey`. `validity` comes from the same rule, so a listing the rule refuses
 > cannot be marked `VALID`, and `model_key IS NOT NULL` implies `validity = 'VALID'`.
@@ -688,9 +707,13 @@ an explicitly free one is still `VALID` at `0`. Rows 3 and 4 are the two ways a 
 still comes out of a zero or a low price on no benchmark evidence.
 
 **Leave the evaluation mode on `DISCOUNT` or `BOTH`, not `MAXIMUM_PRICE`.** The instruction
-stands, and rows 3 and 4 are why: the catalog is current-generation only and most real supply is
-older, so a genuine but uncatalogued card under the maximum still reads as a deal on no evidence
-at all, and a free listing reads as the best deal in the database. Alerting is deferred, so today
+stands, and rows 3 and 4 are why — but its original reason no longer holds and is replaced
+rather than repeated. It used to be that the catalog was current-generation only while most real
+supply is older; the catalog now carries 336 names two generations back, so that premise is
+gone. What survives is the part that was never about coverage: an uncatalogued card under the
+maximum still reads as a deal on no evidence at all, and no catalog can be complete — GTX 900,
+RX 500 and Intel 10th gen are deliberately out, and a seller can always name something older or
+rarer. A free listing still reads as the best deal in the database. Alerting is deferred, so today
 a `DEAL` verdict changes a database column and nothing else — but the notification channel is the
 next thing being built, and the free listing is the row PR #6 exists because of.
 
