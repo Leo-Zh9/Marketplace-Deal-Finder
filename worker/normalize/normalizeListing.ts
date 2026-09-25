@@ -205,7 +205,8 @@ export const MULTI_UNIT = new Set(["pack"]);
  *
  * The anchor is the ITEM: `free` leading the title, or a phrase that can only describe the item.
  * The leading token is refused when the next word is the thing being given away instead --
- * `"Free shipping on this GeForce RTX 5080"` is not a free graphics card.
+ * `"Free shipping on this GeForce RTX 5080"` is not a free graphics card. That second clause is
+ * not an extra: without it the same defect returns by word order, which is not a fix.
  */
 export const FREE_ITEM_PHRASES = ["free to a good home", "free item"];
 export const FREE_IS_NOT_THE_ITEM = new Set(["shipping", "delivery", "postage"]);
@@ -216,12 +217,22 @@ const LETTERS = /^[a-z]+$/;
 /**
  * A LEADING multiplier: `"3x Arctic P14 Max case fans"` is three fans, not one.
  *
- * INDEX 0 ONLY, and that term is load-bearing. MEASURED: an `Nx`-anywhere form fires on
+ * INDEX 0 OR 1, because one verb before the quantity is this marketplace's house style rather
+ * than a constructed shape: `"Selling My 4070 TI"` is one of the 15 real listings, and
+ * `"Selling 2x GeForce RTX 5080"` at CA$4,000 was storing twice the unit price as one 5080's
+ * price -- the INFLATING direction. MEASURED at index <= 1: 0 collisions across the 176 catalog
+ * names, the 1,408 cross-type pairs, the 15 live titles, and all three committed corpora.
+ *
+ * THE RESIDUAL THE SECOND INDEX DOES NOT REACH, NAMED: two words before the quantity
+ * (`"Selling my 2x RTX 5080"`) is still uncaught, and is pinned in ACCEPTED_EXPOSURE.
+ *
+ * THE BOUND IS WHAT IS LOAD-BEARING. MEASURED: an `Nx`-anywhere form fires on
  * `"Ryzen 5 9600X processor"` and 5 other X-suffixed CPUs as soon as any word follows the model
  * name, on all four X-suffixed Corsair PSUs the same way (`RM850x`, `RM850x Shift`,
  * `RM1000x Shift`, `RM1200x Shift` -- T11 goes red naming `Corsair RM1200x Shift`), and on
- * `"MSI RTX 5080 Ventus 3X OC"`, a real cooler designation. Restricted to index 0 it moves 0 of
- * 176 catalog self-resolutions and 0 of the 15 live titles.
+ * `"MSI RTX 5080 Ventus 3X OC"`, a real cooler designation. Every one of those triples sits at
+ * index 2 or beyond, which is exactly why the bound stops at 1 and why widening it further is
+ * not free.
  *
  * THESE ARE NOT THE SAME COLLISIONS AS THE ONES THAT REJECTED `x 2` AND `x 3` AS `MULTIPLE`
  * PHRASES. Those are `WD Black SN850X 2TB` and the 8 X3D CPUs; these are the X-suffixed CPUs and
@@ -233,16 +244,25 @@ const LETTERS = /^[a-z]+$/;
  * which the LETTERS test already refuses. Both were measured unkillable and deleted, the same
  * discipline applied to the two guards deleted from catalogIndex.ts.
  */
+export const MULTIPLIER_MAX_START = 1;
+
 export const multiplierPrefix = (tokens: readonly Token[]): boolean => {
-  const [count, times, next] = tokens;
-  return (
-    count !== undefined &&
-    DIGITS.test(count.value) &&
-    times !== undefined &&
-    times.value === "x" &&
-    next !== undefined &&
-    LETTERS.test(next.value)
-  );
+  for (let start = 0; start <= MULTIPLIER_MAX_START; start += 1) {
+    const count = tokens[start];
+    const times = tokens[start + 1];
+    const next = tokens[start + 2];
+    if (
+      count !== undefined &&
+      DIGITS.test(count.value) &&
+      times !== undefined &&
+      times.value === "x" &&
+      next !== undefined &&
+      LETTERS.test(next.value)
+    ) {
+      return true;
+    }
+  }
+  return false;
 };
 
 /**

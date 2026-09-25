@@ -96,6 +96,7 @@ const CASES: Case[] = [
   // F2: the INFLATING direction -- N units at one price makes a genuine listing look like a deal.
   ["F2a (rule 7): the count word 'two'", "Two GeForce RTX 5080 cards", 403000, "gpu", "NEEDS_REVIEW", null, "unknown-quantity"],
   ["F2b (rule 7): a TRAILING multiplier", "GeForce RTX 5080 x2", 401000, "gpu", "NEEDS_REVIEW", null, "unknown-quantity"],
+  ["F2c (rule 7): a multiplier one word in -- the marketplace's house style", "Selling 2x GeForce RTX 5080", 400000, "gpu", "NEEDS_REVIEW", null, "unknown-quantity"],
 
   // Rule 8: a placeholder zero is not a price; an explicit free one is a real zero.
   ["T22 (rule 8): CA$0 with nothing saying free", "ASUS ROG RTX 5070 graphics card", 0, "gpu", "NEEDS_REVIEW", null, "ambiguous-zero-price"],
@@ -135,10 +136,14 @@ const ACCEPTED_EXPOSURE: Case[] = [
   ["T36a: a year-suffixed revision pools into the base model", "Corsair RM850x 2021 power supply", 17900, "psu", "VALID", "Corsair RM850x", "matched"],
   ["T36b: a laptop with every detector stripped reads as a GPU", "MINT custom x17 R2 Flagship Ecosystem - RTX 5080 (16GB)", 350000, "gpu", "VALID", "GeForce RTX 5080", "matched"],
   // F2's remainder, pinned rather than left to be discovered. Both are the INFLATING direction.
-  // `Selling 2x ...` is uncaught because the multiplier predicate is index-0 only and `Selling`
-  // takes index 0; widening it is what fires on `Ryzen 5 9600X processor`. `Dual ...` is uncaught
-  // because `dual` collides with the real `ASUS Dual` board-partner line, which T1 and T3 pin.
-  ["T36c: a multiplier that does not lead the title", "Selling 2x GeForce RTX 5080", 400000, "gpu", "VALID", "GeForce RTX 5080", "matched"],
+  //
+  // The multiplier predicate reaches index 0 and index 1, which covers one verb before the count
+  // -- this marketplace's house style, as the live `"Selling My 4070 TI"` shows. TWO words before
+  // it is still uncaught, and widening further is not free: every collision that rejected an
+  // `Nx`-anywhere form sits at index 2 or beyond. `Dual ...` is a PERMANENT residual, not an
+  // oversight -- `dual` collides with the real `ASUS Dual` board-partner line, which T1 and T3
+  // pin as matches, so it can never be a count word here.
+  ["T36c: a multiplier two words into the title", "Selling my 2x RTX 5080", 404000, "gpu", "VALID", "GeForce RTX 5080", "matched"],
   ["T36d: the count word 'dual', which collides with a real product line", "Dual GeForce RTX 5080", 402000, "gpu", "VALID", "GeForce RTX 5080", "matched"],
   // The trailing multiplier's own residual, in the SAFE direction: a model name truncated to
   // exactly `<letters> x <digits>` reads as a count. A lost reference, never a wrong one.

@@ -280,7 +280,8 @@ Two or more distinct models in one title is a refusal, not a choice.
 5.  foreign parts     another component type is evidenced                   -> INVALID_REFERENCE
 6.  multiple models   two catalog models of the declared type               -> INVALID_REFERENCE
 7.  unknown quantity  lot of / bundle / pcs / two / three / both, a `pack`
-                      token, or a LEADING `3x` or TRAILING `x2` multiplier  -> NEEDS_REVIEW
+                      token, or an `Nx` multiplier in the first two tokens
+                      or the last two                                       -> NEEDS_REVIEW
 8.  placeholder zero  price 0 and nothing says the ITEM is free (a leading
                       `free`, or `free to a good home` / `free item`)       -> NEEDS_REVIEW
 9.  unconfirmed       no catalog match and no marker for the declared type  -> NEEDS_REVIEW
@@ -303,14 +304,19 @@ refused on measured collisions:** `aorus` (5 catalog motherboards, and Gigabyte'
 `nitro` (`Sapphire Nitro+` is a mainstream AMD board-partner GPU line) and `predator` (Acer sells
 Predator RAM and NVMe drives).
 
-**Rule 7's multiplier has two positional forms and no third.** A `3x` **leading** the title and an
-`x2` **trailing** it are both counts; an `Nx`-anywhere form is not shippable, and the two
-rejections have different evidence that must not be quoted for each other. As a *phrase*, `x 2`
-matches the catalog name `WD Black SN850X 2TB` and `x 3` matches 8 X3D CPUs. As a *predicate
-without the index-0 restriction*, it fires on `"Ryzen 5 9600X processor"` and five other
-X-suffixed CPUs, on all four X-suffixed Corsair PSUs once any word follows, and on
-`"MSI RTX 5080 Ventus 3X OC"`, a real cooler designation. `dual` was refused too: `ASUS Dual` is
-a real board-partner cooler line.
+**Rule 7's multiplier is POSITIONAL, at both ends, and the bound is the whole design.** An `Nx`
+within the **first two** tokens and an `x2` in the **last two** are counts. The first two rather
+than the first one because a single verb before the quantity is this marketplace's house style —
+`"Selling My 4070 TI"` is one of the 15 real listings, and `"Selling 2x GeForce RTX 5080"` was
+storing twice the unit price as one card's price.
+
+An `Nx`-**anywhere** form is not shippable, and the two rejections behind that have **different
+evidence that must not be quoted for each other**. As a *phrase*, `x 2` matches the catalog name
+`WD Black SN850X 2TB` and `x 3` matches 8 X3D CPUs. As an *unbounded predicate*, it fires on
+`"Ryzen 5 9600X processor"` and five other X-suffixed CPUs, on all four X-suffixed Corsair PSUs
+once any word follows, and on `"MSI RTX 5080 Ventus 3X OC"`, a real cooler designation — every one
+of those at index 2 or beyond, which is exactly where the bound stops. `dual` was refused too:
+`ASUS Dual` is a real board-partner cooler line.
 
 **Quantity needs no schema change and gets none.** `recordSightings` computes its aggregates with
 an implicit quantity of 1, so a `quantity` column nothing reads would be a lie in the schema.
@@ -335,21 +341,28 @@ live 5080 is CA$3,000. Any threshold would be a fabricated number.
 
 **Every figure below is measured from a corpus committed in
 `worker/normalize/normalizeListing.test.ts`** — `STANDALONE_COMPONENTS` (24 titles),
-`WHOLE_MACHINES` (30) and `BOARD_PARTNER_TITLES` (5). Earlier versions of these numbers were
-quoted from corpora that lived only in a scratch directory and could not be re-derived by anyone
-reading the repo; one of them was also not representative, which is how a laptop's whole price
-reached a GPU's benchmark.
+`WHOLE_MACHINES` (30) and `BOARD_PARTNER_TITLES` (5).
+
+**These are not the corpora the earlier figures came from, and the numbers are not continuous
+with them.** The previous "3 of 24" and "1 of 29" were quoted from sets that lived only in a
+scratch directory and could not be re-derived by anyone reading the repo. The 24-title set was
+recoverable and is committed verbatim — its true figure is **4**, because the earlier count
+omitted one decline. **The 29-title set was not recoverable, so "29 of 30" below is measured
+against a NEW corpus built for this pass**, covering the machine shapes the old set missed:
+titles carrying only a laptop word, or only a product line. Do not read it as the old number
+having improved by one. That old set's gap is how a laptop's whole price reached a GPU benchmark.
 
 1. **`"Corsair RM850x 2021"` still pools into `Corsair RM850x`.** Year-suffixed revisions are an
    unbounded class; enumerating years would prove the suffix list open-ended rather than close it.
 2. **One machine in thirty still reads as a standalone GPU.** `"MINT custom x17 R2 Flagship
    Ecosystem - RTX 5080 (16GB)"` — a laptop with the whole-unit word, the system brand and the
    foreign-component marker all stripped out. Its live counterpart is caught twice over.
-3. **Two multi-unit forms are still uncaught, both in the INFLATING direction.** `"Selling 2x
-   GeForce RTX 5080"` (the multiplier does not lead the title, and widening that predicate fires
-   on six real CPUs) and `"Dual GeForce RTX 5080"` (`dual` collides with the `ASUS Dual` product
-   line). Both put N units' price into a one-unit benchmark, which makes genuine listings look
-   like deals.
+3. **Two multi-unit forms are still uncaught, both in the INFLATING direction.**
+   `"Selling my 2x RTX 5080"` — **two** words before the count, where the predicate reaches one —
+   and `"Dual GeForce RTX 5080"`, where `dual` collides with the `ASUS Dual` product line and so
+   can never be a count word here. Both put N units' price into a one-unit benchmark, which makes
+   genuine listings look like deals. The second is a **permanent** residual rather than an
+   oversight; the first would cost the collisions listed above to close.
 4. **4 of 24 realistic standalone-component titles are declined** that a human would accept:
    three from the token `build` or the phrase `gaming PC`, and one — `"Arctic P12 Max fan pack"` —
    from the deliberate choice that a fan pack really is a pack. Every one costs a lost reference,
