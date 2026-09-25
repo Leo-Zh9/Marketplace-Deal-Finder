@@ -188,8 +188,37 @@ is "  ...with the comma price parsed"          300000 "$(val "SELECT price_cents
 is "  ...and CA\$0 stored as ZERO, not NULL"    0 "$(val "SELECT price_cents FROM listings WHERE listing_id='1807946430653887'")"
 is "  ...and the title verbatim, pipes and all" 'GeForce RTX 3070 | Intel Core i9 | 1TB SSD | 16GB RAM | Gaming PC' "$(val "SELECT title FROM listings WHERE listing_id='913388811629562'")"
 is "  ...and four evaluation tasks queued"     4 "$(val "SELECT COUNT(*) FROM evaluation_tasks WHERE status='PENDING'")"
-is "  ...and NOTHING reached price_observations" 0 "$(val 'SELECT COUNT(*) FROM price_observations')"
-is "  ...and NOTHING reached model_stats"      0 "$(val 'SELECT COUNT(*) FROM model_stats')"
+# NORMALIZATION IS WHAT MAKES THESE NON-ZERO. Of the four fixture edges exactly one -- the ASUS
+# ROG Astral RTX 5080 at CA$3,000 -- is a standalone catalog GPU at a positive price. The other
+# three are a trade-only ad, a whole gaming PC whose title names a real GPU, and a GTX 1080 Ti
+# the catalog does not list. Before this slice all four reported skipped-no-model and BOTH of
+# these counts were 0.
+is "  ...and ONE observation reached price_observations" 1 "$(val 'SELECT COUNT(*) FROM price_observations')"
+is "  ...and ONE aggregate row reached model_stats"      1 "$(val 'SELECT COUNT(*) FROM model_stats')"
+# The CONTENTS, not just the count: a rule that resolved every title to one wrong key would pass
+# a count-only check. count=1 and total=300000 also pin that the CA$3,000 comma price is the
+# amount that entered the average.
+is "  ...holding exactly the 5080 at its asking price" 'GeForce RTX 5080|1|300000' \
+   "$(val "SELECT model_key || '|' || count || '|' || total_price_cents FROM model_stats")"
+# THE DANGEROUS CASE, excluded over real HTTP into real D1: a CA$1,000 whole PC whose title
+# contains 'GeForce RTX 3070'. It must never be the 3070's price. MEASURED, AND SAID PLAINLY:
+# TWO rules refuse this title -- emptying the whole-unit table leaves it INVALID_REFERENCE with a
+# null key via mixed-components -- so this line is a REGRESSION assertion and discriminates
+# neither rule. T9 in worker/normalize/normalizeListing.test.ts asserts WHICH rule fired and is
+# the one that goes red.
+is "  ...and the whole-PC listing is refused outright" 'INVALID_REFERENCE|NULL' \
+   "$(val "SELECT validity || '|' || COALESCE(model_key,'NULL') FROM listings WHERE listing_id='913388811629562'")"
+# THE CROSS-INVARIANT. modelKey and validity come from ONE rule, so a stored model key implies a
+# VALID row; the reverse (VALID with a null key) is the normal uncatalogued case.
+# IT IS ALSO 0 IF NO KEY IS EVER PRODUCED. Its anchor is the model_stats content line above,
+# which requires 'GeForce RTX 5080|1|300000'. Deleting that line leaves this one passing on an
+# inert pipeline; the two must be read, and kept, together.
+is "  ...and no listing carries a key while not VALID" 0 \
+   "$(val "SELECT COUNT(*) FROM listings WHERE model_key IS NOT NULL AND validity <> 'VALID'")"
+# The route's own report of the same two facts. `recorded` and `skipped-no-model` were both
+# structurally unreachable in one direction before this slice: every listing reported the latter.
+has "  ...and the collector reports one recorded"      '"recorded":1' "$(cat /tmp/e2e-collector.out)"
+has "  ...and one skipped-no-model"                    '"skipped-no-model":1' "$(cat /tmp/e2e-collector.out)"
 
 collect
 is "a second run exits 0"                      0 "$COLLECTOR_EXIT"
@@ -200,8 +229,16 @@ has "  ...and reports UNCHANGED for all four"  '"UNCHANGED":4' "$(cat /tmp/e2e-c
 is "  ...and wrote no new listing rows"        4 "$(val 'SELECT COUNT(*) FROM listings')"
 is "  ...and queued no new tasks"              4 "$(val 'SELECT COUNT(*) FROM evaluation_tasks')"
 
-# THE CONTROL. #44/#45 assert ZERO, and zero is also what a completely inert path produces. So
-# seed a REAL contribution, run the collector over the same listing, and watch it go to zero.
+# THE CONTROL. The removal path is the one contribution outcome the fixture cannot reach on its
+# own, and "it went to zero" is also what a completely inert path produces. So seed a REAL
+# contribution, run the collector over the same listing, and watch it go to zero.
+#
+# THE CONTROL MOVED, AND THIS IS WHY. It used to hang off 915010494744438, which is the ASUS ROG
+# Astral RTX 5080 -- that listing now CONTRIBUTES ON ITS OWN, so it can no longer stand in for a
+# listing whose contribution must disappear. 1812246723463464 is `Nvidia GeForce GTX 1080 Ti
+# Graphics Card with MSI Cooler` at CA$80: a real, standalone GPU the catalog does not list, so
+# the rule answers VALID with a NULL model key and the sighting still takes recordSightings'
+# `removed` path. price_cents 8000 is that listing's own price.
 #
 # THE TWO SEEDED ROWS MUST SHARE market_key / model_key / variant_key EXACTLY. SUBTRACT_OLD's
 # correlated EXISTS matches price_observations against model_stats on all three; if they differ,
@@ -209,15 +246,18 @@ is "  ...and queued no new tasks"              4 "$(val 'SELECT COUNT(*) FROM ev
 # half of the check PASSES while the model_stats half FAILS. THE FIX FOR A RED CONTROL IS TO FIX
 # THE SEED, NEVER TO RELAX THE ASSERTION. variant_key is '' on both rows, never NULL.
 sql "INSERT INTO price_observations (source, listing_id, market_key, model_key, variant_key, price_cents, last_seen_at)
-     VALUES ('facebook-marketplace', '915010494744438', '43.5123,-79.8765|18km', 'control-model', '', 300000, 1);
+     VALUES ('facebook-marketplace', '1812246723463464', '43.5123,-79.8765|18km', 'control-model', '', 8000, 1);
      INSERT INTO model_stats (market_key, model_key, variant_key, count, total_price_cents)
-     VALUES ('43.5123,-79.8765|18km', 'control-model', '', 1, 300000);" >/dev/null
+     VALUES ('43.5123,-79.8765|18km', 'control-model', '', 1, 8000);" >/dev/null
 is "the control aggregate is seeded"           1 "$(val "SELECT count FROM model_stats WHERE model_key='control-model'")"
 
 collect
 is "a third run exits 0"                       0 "$COLLECTOR_EXIT"
 is "  ...and the ingest REMOVED the contribution" 0 "$(val "SELECT count FROM model_stats WHERE model_key='control-model'")"
-is "  ...and deleted the observation"          0 "$(val 'SELECT COUNT(*) FROM price_observations')"
+is "  ...and deleted the control observation"  0 "$(val "SELECT COUNT(*) FROM price_observations WHERE model_key='control-model'")"
+# SCOPED, and the other half of the same claim: the removal took the control and NOTHING ELSE.
+# A rule that deleted every observation would pass the line above and fail this one.
+is "  ...leaving the 5080's own observation"   1 "$(val 'SELECT COUNT(*) FROM price_observations')"
 
 ingest_tables
 

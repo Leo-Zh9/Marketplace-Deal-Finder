@@ -60,8 +60,8 @@ until it aged off. An empty string is still refused: the parser emits `null`, ne
 | `locationText` | the wire, validated, **nullable** |
 | `componentType` | the envelope, checked against an exhaustive set with `Object.hasOwn` |
 | `priceCents` | **the server**, from `priceText` (see the grammar below), which is **nullable** |
-| `modelKey`, `variantKey` | **the server**, hardcoded `null` |
-| `validity` | **the server**, hardcoded `"VALID"` |
+| `modelKey`, `variantKey` | **the server**, derived from the title against `src/data/catalog.ts` (`variantKey` is `null` for every component type in this slice) |
+| `validity` | **the server**, from the same rule |
 | `observedAt` | **the server**, from the request clock |
 
 There is no field on this wire for `priceCents`, `modelKey`, `variantKey`, `validity` or
@@ -86,11 +86,16 @@ unvalidated `0.4` would reject the whole call as a 503 instead of a 400.
 ```json
 { "received": 4, "stored": 4,
   "outcomes":      { "NEW": 4, "CHANGED": 0, "UNCHANGED": 0, "FAILED": 0 },
-  "contributions": { "recorded": 0, "restored": 0, "removed": 0, "none": 0,
-                     "skipped-no-price": 0, "skipped-no-model": 4, "skipped-invalid": 0 },
+  "contributions": { "recorded": 1, "restored": 0, "removed": 0, "none": 0,
+                     "skipped-no-price": 0, "skipped-no-model": 1, "skipped-invalid": 2 },
   "pricesUnparsed": 0,
-  "usage": { "rowsRead": 8, "rowsWritten": 12 } }
+  "usage": { "rowsRead": 3, "rowsWritten": 33 } }
 ```
+
+Copied from a real `npm run e2e:local` run over the committed four-listing fixture, not composed
+by hand. One of those four is a standalone catalog GPU at a positive price; the others are a
+trade-only ad, a whole gaming PC whose title names a real GPU, and a GTX 1080 Ti the catalog does
+not list.
 
 Every key is always present, at 0 when it did not happen. `received` counts what was sent and
 `stored` counts what `recordSightings` returned, so its last-wins de-duplication of a repeated
@@ -100,10 +105,52 @@ Every key is always present, at 0 when it did not happen. `received` counts what
 listing id for `wrangler tail`; a caller holding only a bearer secret must not learn the schema
 from a failure.
 
-**`skipped-no-model` is the signal to watch.** While `modelKey` is hardcoded null, every
-non-contributing listing reports it — `skipped-no-price` is structurally unreachable, because
-`recordSightings` tests the model key first. When normalization lands, `skipped-no-model` going
-to zero is how you will know it works.
+**What each contribution key means now that normalization runs.** `recordSightings` reports
+exactly one per stored listing, and it tests `validity` first, then the model key, then the
+price:
+
+| key | means |
+|---|---|
+| `recorded` / `restored` | the listing entered the benchmark; `restored` means its observation had been deleted and was recreated |
+| `removed` | it used to contribute and no longer does — a re-sighting whose model key, market or price changed, or whose validity stopped being `VALID` |
+| `none` | `UNCHANGED`: nothing about it moved |
+| `skipped-invalid` | the rule refused it: wrong component, whole system, trade-only, for parts, a wanted ad, an unknown quantity, an ambiguous `CA$0`, or a title at the token cap |
+| `skipped-no-model` | the rule accepted it as the right component and could not name it — a real component the catalog does not list |
+| `skipped-no-price` | **newly reachable in this slice.** A listing that resolved to a catalog model and whose `priceText` did not parse. It was structurally unreachable only while `modelKey` was always null |
+
+**`skipped-no-model` DOES NOT MEASURE CATALOG COVERAGE, and reading it that way undercounts by
+about 3x.** Measured over the 15 live listings from one real GPU search:
+`{skipped-invalid: 13, skipped-no-model: 1, recorded: 1}`. Three real, standalone, working GPUs
+the catalog lacks are in that set, and only one of them (`AMD Radeon™ RX 6800 XT …`) reaches
+`skipped-no-model`. `Gigabyte vision 3060ti (white)` and `Selling My 4070 TI` carry no
+`rtx`/`gtx`/`geforce`/`radeon` token and no catalog match, so the rule declines to guess and they
+land in `component-unconfirmed` → `NEEDS_REVIEW` → `skipped-invalid`.
+
+**How the coverage number IS obtained, since no counter is being added for it.** The response
+shape is not this slice's to grow. The number stays obtainable without one, because `validity`,
+`title`, `price_cents` and `component_type` are all stored columns on `listings`:
+
+```sql
+-- lower bound: listings the rule accepted as the right component but could not identify
+SELECT COUNT(*) FROM listings WHERE validity = 'VALID' AND model_key IS NULL;
+
+-- upper bound: everything the rule declined but did not reject outright
+-- (component-unconfirmed + unknown-quantity + ambiguous-zero-price + title-too-long, which SQL
+--  cannot separate because the rule's `reason` is deliberately not stored)
+SELECT COUNT(*) FROM listings WHERE validity = 'NEEDS_REVIEW';
+```
+
+**Neither single query is the number.** The exact figure needs the reason, and the reason is
+recomputable rather than stored: `normalizeListing` is a pure function of `(title, priceCents,
+componentType)` and all three are columns, so
+
+```sql
+SELECT title, price_cents, component_type FROM listings WHERE validity <> 'INVALID_REFERENCE';
+```
+
+replayed through that function offline yields the per-reason breakdown exactly. That is a read
+plus a script, not a production code change, and it is the instrument whoever answers the catalog
+question should use.
 
 ### Status codes
 
@@ -176,48 +223,315 @@ An unparseable price is `null`, not a rejection: the listing is real and is stor
 
 ---
 
+## How a title becomes a model key
+
+Normalization runs **in the Worker**, inside `handlePostListings`, not in the collector. If the
+collector sent `modelKey`, a leaked token would set it to *any string* and `validity` to `VALID`
+directly, minting `model_stats` rows under keys no catalog model has. Server-side, the attacker's
+levers reduce to `title` and `priceText` — which they already control — and the rule is one rule
+for every client, testable offline.
+
+`worker/normalize/catalogIndex.ts` owns the tokens and the match; `worker/normalize/normalizeListing.ts`
+owns what a listing *is*. Both are pure functions of `(title, priceCents, componentType)`.
+
+### Tokens, and a cap that fails closed
+
+Lower-case, split on every non-alphanumeric character, then split each run at its letter/digit
+boundaries — so `"rtx5080"`, `"RTX 5080"` and `"RTX-5080"` tokenize alike. There is deliberately
+**no `normalize("NFKD")`**: measured, `"RTX™".toLowerCase().normalize("NFKD")` is `"rtxTM"`,
+because U+2122 decomposes to an upper-case `TM`, and 0 of the 176 catalog names contain a
+non-ASCII character anyway.
+
+The tokenizer stops at **64 tokens**. A title that reaches that bound *may* have been truncated,
+so it is answered `NEEDS_REVIEW` with a null key **before any other rule runs** — it is not
+silently shortened. Every one of the six disqualifier classes lives in the title text a
+truncation would discard, and a legal 146-character title can carry a catalog model with its
+`gaming pc` beyond the cut. Measured: the longest catalog model is 11 tokens and the longest of
+the 15 live titles is 18, so nothing real is near the bound.
+
+### The match: a prefix trie per component type, and three guards
+
+Each component type gets a trie built once at module load from its catalog names, plus every
+suffix obtained by dropping a leading `geforce`/`nvidia`/`radeon`/`amd`/`intel` — 176 models,
+199 entry points. Series words (`rtx`, `rx`, `gtx`, `arc`) are **not** droppable: a bare `5080`
+in the trie would match Dell's OptiPlex 5080. The cost is that `"Selling my 4070 Super"` is a
+miss, and a miss is safe.
+
+Each start position is walked greedily, and a hit is admissible only if all three guards pass:
+
+**Rule 8 asks what the word `free` is attached to, and that is deliberate rather than a list.** A
+denylist of the other thing — shipping, pickup, delivery — was built and replaced: it needed
+patching twice inside one review round, because the tokenizer splits `pick up` into two tokens,
+and a word list cannot tell `"free … pick up only"` — a free card collected in person — from
+`"free pick up"`. Requiring the token after `free` to be the item closes the family with nothing
+to maintain. Its errors land in the safe direction by construction: a free listing cannot reach a
+benchmark at all (`recordSightings` requires `priceCents > 0`), so refusing one costs no reference
+and only removes a spurious `DEAL`.
+
+| guard | rule | what it prevents |
+|---|---|---|
+| deepest terminal | take the deepest complete name, not the first | `RM850x Shift` collapsing into `RM850x` |
+| no extension | the walk must not continue past the last complete name | `"Noctua NH-D15 G3"` → `NH-D15` |
+| end of run | the last matched token must end its character run | `"Ryzen 7 7700X3D"` → `Ryzen 7 7700X` |
+| no SKU suffix | the next token is not one of thirteen variant words (`ti`, `super`, `xt`, `xtx`, `gre`, `redux`, `le`, `chromax`, `rgb`, `d`, `ii`, `touch`, `argb`) | `"RTX 5070 Ti Super"` → `RTX 5070 Ti` |
+
+Two or more distinct models in one title is a refusal, not a choice.
+
+### The twelve rules, in order — first match wins
+
+```
+0.  capped title      the tokenizer returned 64 tokens                      -> NEEDS_REVIEW
+1.  wanted ad         wtb, want to buy, wanted, looking for, iso, ...       -> INVALID_REFERENCE
+2.  trade only        for trade, trade only, swap, trading, ...             -> INVALID_REFERENCE
+3.  broken / parts    for parts, not working, damaged, as is, ...           -> INVALID_REFERENCE
+4.  whole system      a system brand or product line, or an uncovered whole-unit
+                      token (pc, tower, build, rig, laptop, notebook,
+                      desktop, ...)                                         -> INVALID_REFERENCE
+5.  foreign parts     another component type is evidenced                   -> INVALID_REFERENCE
+6.  multiple models   two catalog models of the declared type               -> INVALID_REFERENCE
+7.  unknown quantity  lot of / bundle / pcs / two / three / both, a `pack`
+                      token, or an `Nx` multiplier in the first two tokens
+                      or the last two                                       -> NEEDS_REVIEW
+8.  placeholder zero  price 0 and nothing says the ITEM is free: `free` must
+                      LEAD the title and the NEXT token must belong to the
+                      item -- a marker phrase, or the matched model itself   -> NEEDS_REVIEW
+9.  unconfirmed       no catalog match and no marker for the declared type  -> NEEDS_REVIEW
+10. unmatched         the right component, not in the catalog   -> VALID, modelKey null
+11. matched           exactly one catalog model                 -> VALID, that model
+```
+
+Rule 4 is neutralised by a marker of the **declared** type, so `"Lian Li Lancool 216 PC Case"`
+under a `case` search is a case and not a PC. Rule 7's `pack` is **not**: a fan pack really is a
+pack, on the one component type where Arctic, Noctua and Corsair all sell in 3- and 5-packs.
+
+**Rule 4's whole-unit tokens include `laptop`, `notebook` and `desktop`.** `desktop` was
+excluded at first because the bare token fires on the catalog's own product wording —
+`"AMD Ryzen 7 9800X3D Desktop Processor"`, `"Kingston Fury Beast 32GB DDR4 desktop memory"` —
+and that argument stopped being true once `MARKERS.cpu` gained `desktop processor` and
+`MARKERS.ram` gained `desktop memory`: those phrases **cover** the word exactly as `pc case`
+already covers `pc`. Both titles resolve to their catalog models, and `"Dell Desktop GeForce RTX
+4060"` — a CA$1,100 prebuilt that was writing itself into the 4060 benchmark — is refused.
+
+**And coverage for `desktop` must TRAIL the model name, which is a second lesson from the same
+repair.** Punctuation is stripped before matching, so a prebuilt's spec list tokenizes `desktop`
+and `processor` adjacent — `"Dell Desktop | Processor: Core i9-14900K | 32GB | 1TB"` — and the
+marker that exists to neutralise retail box wording was neutralising the very token that says the
+listing is a whole machine. Measured, that title was stored `VALID / Core i9-14900K` at CA$1,500:
+a whole prebuilt as the CPU benchmark, roughly 2× the real price, in the inflating direction. The
+same shape reached RAM, and **pipe-delimited spec lists are the live data's own house style** — 2
+of the 15 production listings are one. So `desktop` is neutralised only by a marker phrase that
+starts at or after the end of a matched model's span: retail wording trails the product, a spec
+list leads it. **Scoped to `desktop` alone** — the general rule regresses `"PC Case - Fractal
+North"`, where `pc case` leads and the model follows, which is ordinary case phrasing.
+
+**The named cost has two halves, because word order is the only signal available.** A title that
+LEADS with the retail category is refused whether or not the catalog knows the model:
+`"AMD Ryzen 5 5600 Desktop Processor"` (uncatalogued, so there is no span for the marker to
+trail) and `"Desktop Processor Core i9-14900K"` or `"Desktop Memory Corsair Vengeance 32GB DDR5"`
+(catalogued, but the category leads). The second half is inherent: `"Desktop Processor: Core
+i9-14900K"` is token-identical in shape to `"Desktop | Processor: Core i9-14900K"`, which is the
+prebuilt the rule exists to refuse. Lost references, never wrong ones.
+
+**The measurement that accompanied the `desktop` repair was blind to word order**, because every
+collision title it tested puts the retail wording after the model. The corpora caught what the
+targeted measurement could not; that has now happened three times in this slice.
+
+**That question has a general answer, so it is not re-asked each round.** A marker can only
+neutralise a **whole-unit token**: `systemEvidence` is the single place coverage is consulted,
+while `SYSTEM_PHRASES`, `MULTIPLE`, `MULTI_UNIT` and both multiplier predicates are checked
+unconditionally. Measured over the other seven words excluded on a collision argument — `dual`,
+`x 2`, `x 3`, `aorus`, `nitro`, `predator`, `katana` — **none is marker-dissolvable**, on two
+independent grounds: none sits in a marker-neutralised vocabulary, and no marker phrase contains
+any of them. Their collisions are with catalog model names and with component product lines,
+which a marker cannot dissolve by construction.
+
+**Eight system-only product lines** (`razer blade`, `legion`, `omen`, `victus`, `zephyrus`,
+`xps`, `ideapad`, `pavilion`) are the second detector for a machine whose title names no
+whole-unit word at all, such as `"Razer Blade 16 RTX 5080"`. **Four brand candidates were refused
+on measured collisions:** `aorus` (5 catalog motherboards, and Gigabyte's GPU line), `nitro`
+(`Sapphire Nitro+` is a mainstream AMD board-partner GPU line), `predator` (Acer sells Predator
+RAM and NVMe drives) and `katana` (`Scythe Katana` is a mainstream tower CPU cooler) — the last
+of these was **admitted for a round and caught on re-review**, because the corpus guarding these
+words held a title for every *rejected* word and none for any *accepted* one, so it could only
+ever confirm a refusal. It now carries a row for each accepted word too.
+
+**Rule 7's multiplier is POSITIONAL, at both ends, and the bound is the whole design.** An `Nx`
+within the **first two** tokens and an `x2` in the **last two** are counts. The first two rather
+than the first one because a single verb before the quantity is this marketplace's house style —
+`"Selling My 4070 TI"` is one of the 15 real listings, and `"Selling 2x GeForce RTX 5080"` was
+storing twice the unit price as one card's price.
+
+An `Nx`-**anywhere** form is not shippable, and the two rejections behind that have **different
+evidence that must not be quoted for each other**. As a *phrase*, `x 2` matches the catalog name
+`WD Black SN850X 2TB` and `x 3` matches 8 X3D CPUs. As an *unbounded predicate*, it fires on
+`"Ryzen 5 9600X processor"` and five other X-suffixed CPUs, on all four X-suffixed Corsair PSUs
+once any word follows, and on `"MSI RTX 5080 Ventus 3X OC"`, a real cooler designation — every one
+of those at index 2 or beyond, which is exactly where the bound stops. `dual` was refused too:
+`ASUS Dual` is a real board-partner cooler line.
+
+**Quantity needs no schema change and gets none.** `recordSightings` computes its aggregates with
+an implicit quantity of 1, so a `quantity` column nothing reads would be a lie in the schema.
+Rule 7 handles it by refusing to contribute.
+
+**Price is never a classification signal.** A CA$2,000 listing may be a PC or an RTX 5090; the
+live 5080 is CA$3,000. Any threshold would be a fabricated number.
+
+### What is proven, and what is not
+
+- **176/176** catalog names, declared as their own component type, resolve to themselves.
+- **0 of 1,408** cross-type pairs produce a `VALID` result carrying a model key.
+- **10** sub-phrase overlaps exist across the eighteen vocabularies, all of them known and
+  pinned; an eleventh fails the suite.
+- CPU, measured in Node on a development machine rather than in workerd — the same caveat
+  `worker/evaluation/evaluationCpu.test.ts` carries, and re-measured after the vocabularies grew:
+  **p95 0.21–0.23 ms** for a 15-listing window, and **p95 3.2–3.9 ms** (3.25–3.38 over four
+  consecutive runs on one machine, 3.52 and 3.88 measured independently on another and on an adversarial
+  title) for the worst legal batch — 100 listings × 300-character titles one token under the cap,
+  which is the expensive side of it, since a title that *hits* the cap short-circuits at rule 0
+  and costs 0.21 ms. **Read the spread, not the midpoint: 3.2–3.9 ms is dev-machine variance
+  across two machines and two title shapes, not a precision this measurement supports.** The
+  repo's own invariant is p95 < 8 ms and the test asserts against that, never against these
+  figures.
+
+### The residuals, named — and the corpora they are measured from
+
+**Every figure below is measured from a corpus committed in
+`worker/normalize/normalizeListing.test.ts`** — `STANDALONE_COMPONENTS` (31 titles),
+`WHOLE_MACHINES` (30), `BOARD_PARTNER_TITLES` (6), `ACCEPTED_BRAND_WORD_TITLES` (8),
+`FREE_PHRASINGS` (19) and `SKU_SUFFIX_PHRASINGS` (21).
+
+**These are not the corpora the earlier figures came from, and the numbers are not continuous
+with them.** The previous "3 of 24" and "1 of 29" were quoted from sets that lived only in a
+scratch directory and could not be re-derived by anyone reading the repo. The 24-title set was
+recoverable and is committed verbatim — its true figure is **4**, because the earlier count
+omitted one decline. **The 29-title set was not recoverable, so "29 of 30" below is measured
+against a NEW corpus built for this pass**, covering the machine shapes the old set missed:
+titles carrying only a laptop word, or only a product line. Do not read it as the old number
+having improved by one. That old set's gap is how a laptop's whole price reached a GPU benchmark.
+
+1. **`"Corsair RM850x 2021"` still pools into `Corsair RM850x`.** Year-suffixed revisions are an
+   unbounded class; enumerating years would prove the suffix list open-ended rather than close it.
+2. **One machine in thirty still reads as a standalone GPU.** `"MINT custom x17 R2 Flagship
+   Ecosystem - RTX 5080 (16GB)"` — a laptop with the whole-unit word, the system brand and the
+   foreign-component marker all stripped out. Its live counterpart is caught twice over.
+3. **Two multi-unit forms are still uncaught, both in the INFLATING direction.**
+   `"Selling my 2x RTX 5080"` — **two** words before the count, where the predicate reaches one —
+   and `"Dual GeForce RTX 5080"`, where `dual` collides with the `ASUS Dual` product line and so
+   can never be a count word here. Both put N units' price into a one-unit benchmark, which makes
+   genuine listings look like deals. The second is a **permanent** residual rather than an
+   oversight; the first would cost the collisions listed above to close.
+4. **11 of 31 realistic standalone-component titles are declined** that a human would accept:
+   three from the token `build` or the phrase `gaming PC`; one from the deliberate choice that a
+   fan pack really is a pack; three from the quantity words (`"two months old"`,
+   `"fits both AM4 and AM5"`, and `"32GB 2x16"`, which PLAN.md:54 calls one kit); and one from the
+   multiplier bound (`"AMD 9600X processor"` — a bare SKU with one word in front of it); and three
+   from the `desktop <component>` retail phrasing in residual 8. Every one costs a lost reference,
+   never a wrong one. **The figure has moved twice and both moves are the
+   point:** it was reported as 3 when it was 4, and the four quantity shapes were simply not in
+   the corpus until the vocabulary that declines them was reviewed.
+5. **A model name truncated to `<letters> x <digits>`** — `"G.Skill Flare X5"` with nothing after
+   it — reads as a trailing count. A lost reference, in the safe direction.
+6. **A genuinely free item is `NEEDS_REVIEW` whenever anything sits between `free` and the item**
+   — `"Free to a good home GeForce RTX 5080"`, or the same phrase written tail-first. Rule 8
+   requires the token after a leading `free` to be the item. A free listing cannot reach a
+   benchmark in any case, so this costs a `DEAL` verdict rather than a reference.
+   `FREE_PHRASINGS` (19 real phrasings) is the committed corpus that keeps the family
+   re-measurable; it found two live defects on its first run. It also bounds the **free-accessory**
+   family: when the free thing is an accessory whose own word is a marker of the declared type
+   (`"Free graphics card box with GeForce RTX 5080"`), the predicate reads it as the item and the
+   listing stays `VALID` at CA$0. No benchmark impact — a zero price cannot contribute — so the
+   cost is a spurious `DEAL` under `MAXIMUM_PRICE`, which is the square row 3 of the evaluation
+   table already documents and accepts.
+7. **Seven real SKU-variant phrasings still pool into their base model** — a year suffix
+   (`RM850x 2021`), a form factor (`Focus GX-850 ATX 3.0`), an `A-RGB` that tokenizes as two
+   words, `North XL TG`, a `DDR5 EXPO` kit, `SF1000 Platinum` and `4000D Airflow Core`. Each is a
+   word deliberately NOT added to the suffix list, for a reason stated per row in
+   `SKU_SUFFIX_PHRASINGS`: it is a form factor, or a feature the catalog entry already has, or a
+   word that may name the catalog entry itself rather than a variant of it. **This is the
+   money-losing direction** — two different products averaged together — and it is the residual
+   that is measured rather than closed. The corpus found ten mis-pools in twenty titles when it
+   was written cold; three were closed by adding `ii`, `touch` and `argb`.
+8. **Ordinary `desktop <component>` retail phrasing is refused on seven of the nine types.**
+   `"GeForce RTX 5080 desktop graphics card"`, `"Corsair RM850x desktop power supply"`,
+   `"Samsung 990 Pro 2TB desktop SSD"` and the same shape on case, case_fan, cpu_cooler and
+   motherboard. `desktop` is a whole-unit token on all nine types while the markers that
+   neutralise it exist only on `cpu` and `ram`; `"desktop graphics card"` is how retail
+   distinguishes a desktop GPU from a laptop one. This arrived with the `desktop` admission, not
+   with the trailing rule, and `STANDALONE_COMPONENTS` held no instance of the family — so the
+   cost figure could not see it and nothing went red. It now carries three.
+
+   **Cheap and safe to close, measured rather than assumed:** adding `"desktop graphics card"` to
+   `MARKERS.gpu` recovers the match while `"Dell Desktop | Graphics card: RTX 5080"` stays
+   refused, because the trailing rule protects any future `desktop *` marker globally. The price
+   is one marker phrase per type plus the overlap rows it adds to the vocabulary audit. Left
+   undone deliberately: seven types' worth of new vocabulary is not a merge-time change.
+9. **A component pulled from a machine of an admitted brand line** — `"RTX 4070 pulled from a
+   Razer Blade 16"` — is refused as a whole system. Correct for a laptop part, which is a
+   different product from its desktop namesake; a lost reference for a desktop part.
+   `ACCEPTED_BRAND_WORD_TITLES` carries one row per admitted word.
+
+Residuals 1, 2, 3 and 5 are pinned as expected-to-behave-this-way rows in `ACCEPTED_EXPOSURE`,
+and 4, 6, 7, 8 and 9 are pinned by the corpora named above, so the next one is visible rather than
+discovered in an aggregate.
+
+---
+
 ## What a leak of the collector token would let an attacker do
 
 > A leaked `COLLECTOR_TOKEN` lets an attacker insert rows into `listings` and enqueue
 > `evaluation_tasks` under any `source`, `market` and `componentType` they choose, and — for any
-> `(source, listingId)` they can guess — **overwrite every mutable column of an existing listing
-> row**: `title`, `url`, `location_text`, `price_cents`, `component_type`, `market_key`,
-> `content_hash`, **`model_key` (to NULL)**, **`variant_key` (to `''`)**, **`validity` (to
-> `VALID`)** and **`last_seen_at` (to now)**. Measured, all eleven on one request.
-> `first_seen_at` is the one column that survives.
+> `(source, listingId)` they can guess — overwrite every mutable column of an existing listing
+> row. `first_seen_at` is the one column that survives.
 >
-> Three of those matter more than the rest. **`last_seen_at` defeats staleness**, so a leaked
-> token can keep any row alive past `cleanupStaleObservations` indefinitely. **`market_key` is
-> the column `model_stats` is partitioned by.** And **`validity` is the mirror of `model_key`**:
-> `dealRules.decide` sends `INVALID_REFERENCE` straight to `NOT_DEAL / COMPLETE`, so flipping it
-> back to `VALID` returns a permanently-rejected row to the evaluation path — and once
-> normalization lands, `validity === "VALID"` is one of the three conjuncts that let a listing
-> contribute to the benchmark, where `model_key → NULL` removes one. It also lets them burn D1
-> write quota.
+> **The structural protection this paragraph used to claim is gone, and this is the slice that
+> spent it.** PR #13's plan predicted it: "no request to this route can insert a row into
+> `price_observations` or increase a `model_stats` row" was true only while `model_key` was
+> hardcoded `NULL`. Normalization now derives it, so **a leaked token can create a
+> `price_observations` row and increase a `model_stats` row**, by posting a title the server's
+> own rule resolves to a catalog model together with a positive price.
 >
-> It lets them read **no settings, no evaluation results, no aggregates and no user identity**,
-> and not even the error text of a failed write. What it CAN read is narrow and worth stating
-> exactly, because an absolute claim here would be false: the response tells a caller **whether a
-> `(source, listingId)` it guesses already exists** — an unknown id answers `NEW` with
-> `usage.rowsRead: 0`, a known one answers `CHANGED` with `rowsRead: 2` — and **whether a guess
-> at that row's contents is exact**, because `UNCHANGED` is returned only when the content hash
-> matches, and that probe is non-destructive. Measured. The marginal harm is small, since the
-> same token can already overwrite those rows outright. It cannot reach
-> `/api/settings` or `/api/auth/session` — those routes never look at the header it carries.
-> It cannot be used from a browser, from any origin, even a permitted one. And because the route
-> sets `modelKey: null` itself and the wire format has no field for a model key, **no request to
-> this route can insert a row into `price_observations` or increase a `model_stats` row**: in
-> this slice the price benchmark is structurally out of reach.
+> What the server still decides: `model_key` is not a wire field and cannot be chosen directly —
+> it is one of the 176 names in `src/data/catalog.ts` or `NULL`, and only a title the rule
+> resolves to that model produces it. `variant_key` is written as `''` by `recordSightings`'
+> `normalizeVariantKey`. `validity` comes from the same rule, so a listing the rule refuses
+> cannot be marked `VALID`, and `model_key IS NOT NULL` implies `validity = 'VALID'`.
+> `price_cents` is still computed by the server from `priceText`.
+>
+> **What that leaves is the real exposure, stated plainly: a leaked token can move a model's
+> benchmark.** `model_stats` holds only `(count, total_price_cents)` — **an untrimmed running
+> mean. There is no outlier filter anywhere in the Worker; PLAN.md section 4 specifies an IQR
+> trim and it is not built.** One fabricated row added to a pool of `count` genuine ones shifts
+> the average by **`1/(count + 1)`** of the gap between the fabricated price and the current
+> mean, and `MINIMUM_REFERENCE_COUNT = 5` is the only bar. The route can also still *decrease* a
+> contribution by re-posting a known id, which the e2e exercises as its control.
+>
+> It still reads no settings, no evaluation results, no user identity, and not even the error
+> text of a failed write. **What it can read has grown, and an absolute claim here would be
+> false.** As before, the response tells a caller whether a `(source, listingId)` it guesses
+> already exists, and whether a guess at that row's contents is exact, because `UNCHANGED` is
+> returned only on a content-hash match. **New in this slice: `contributions` now distinguishes
+> `recorded` / `restored` / `removed`, which were structurally unreachable while every row
+> reported `skipped-no-model` — so the response now also tells a caller whether a guessed
+> `(source, listingId)` is currently contributing to a benchmark.** The `rowsRead` figures the
+> previous version of this paragraph quoted are not carried over: once a listing contributes, the
+> CHANGED path runs three more statements, and no one has measured what `usage.rowsRead` reports
+> then. It cannot reach `/api/settings` or `/api/auth/session`, and cannot be used from a
+> browser, from any origin.
+>
+> The mitigation is now the token's secrecy, rotation and `wrangler tail` visibility — not the
+> shape of the route.
 
-Two riders:
+One rider:
 
-- **The structural-benchmark property expires** the moment normalization makes ingest produce a
-  non-null `modelKey`. That mitigation belongs to the normalization slice and must not be
-  assumed to exist.
 - **The route can already *decrease* a contribution.** Re-posting a known `(source, listingId)`
-  that currently contributes takes `recordSightings`' `removed` path. That is unreachable
-  today and is deliberately exercised as the end-to-end control, so the next slice cannot change
-  it without noticing.
+  that currently contributes takes `recordSightings`' `removed` path. It is deliberately
+  exercised as the end-to-end control, which **moved to listing `1812246723463464`** — a real
+  GPU the catalog does not list, so the rule answers `VALID` with a null key — because
+  `915010494744438` now contributes on its own and can no longer stand in for a listing whose
+  contribution must disappear.
+
+The rider this block used to carry first — that the structural-benchmark property *expires* when
+normalization lands — is spent, not deleted: the paragraph above is what replaced it.
 
 ### The credential boundary
 
@@ -357,20 +671,28 @@ abort a scan" is a property this route must not undo.
 
 This is the first thing that ever puts rows into `evaluation_tasks` in production, and the
 existing 30-minute monitoring cron drains them immediately. `dealRules.decide` runs the
-maximum-price leg **before** the evidence gate, so it needs no model key:
+maximum-price leg **before** the evidence gate, so it needs no model key — and normalization
+narrows what that leg can see, without closing it:
 
-| settings mode | what the drain emits for un-normalized listings |
-|---|---|
-| `DISCOUNT` | all `NEEDS_REVIEW / insufficient-evidence` — safe |
-| **`MAXIMUM_PRICE`** | **`DEAL / within-maximum / COMPLETE` for every listing at or below the maximum — including a `CA$0` listing** |
-| `BOTH` | `NOT_DEAL` above the maximum, `NEEDS_REVIEW / insufficient-evidence` below it — safe |
+| the listing | before normalization | now |
+|---|---|---|
+| wrong component, whole system, trade-only, for parts, a wanted ad | reached the drain as `VALID` | `INVALID_REFERENCE` → `NOT_DEAL / COMPLETE`, before any rule runs |
+| an **ambiguous** `CA$0` — nothing in the title says the item is free | `DEAL / within-maximum` under `MAXIMUM_PRICE` | `NEEDS_REVIEW`, so it is not a `DEAL` |
+| an **explicitly free** `CA$0` — the title leads with `free`, or says `free to a good home` | `DEAL / within-maximum` | **unchanged: still `DEAL / within-maximum`.** It is `VALID` at a zero price, and `decide` runs the maximum-price leg before the evidence gate |
+| a real component **the catalog does not list**, priced under the maximum | `DEAL / within-maximum` | **unchanged: still `DEAL / within-maximum`** — it is `VALID` with a null model key |
 
-All three rows measured against the real `evaluateBatch` and the real `dealRules`.
+**Do not read row 2 as "a `CA$0` listing can no longer be a `DEAL`".** It cannot be one *while
+the title is ambiguous*. `parsePriceText` returns `0` for `"CA$0"` — which is how Facebook renders
+a genuinely free item — and `null` for the word `"Free"`, so a real zero does reach the rule, and
+an explicitly free one is still `VALID` at `0`. Rows 3 and 4 are the two ways a `DEAL` verdict
+still comes out of a zero or a low price on no benchmark evidence.
 
-**Until normalization lands, leave the evaluation mode on `DISCOUNT` or `BOTH`, not
-`MAXIMUM_PRICE`.** Alerting is deferred, so today a `DEAL` verdict changes a database column and
-nothing else — but the notification channel is the next thing being built, and the most
-DEAL-looking row in the database would be the free listing this project was already bitten by.
+**Leave the evaluation mode on `DISCOUNT` or `BOTH`, not `MAXIMUM_PRICE`.** The instruction
+stands, and rows 3 and 4 are why: the catalog is current-generation only and most real supply is
+older, so a genuine but uncatalogued card under the maximum still reads as a deal on no evidence
+at all, and a free listing reads as the best deal in the database. Alerting is deferred, so today
+a `DEAL` verdict changes a database column and nothing else — but the notification channel is the
+next thing being built, and the free listing is the row PR #6 exists because of.
 
 `decide`'s ordering is **not** changed here. Gating the maximum-price leg on a non-null model key
 is the evaluation layer's contract and needs its own adversarial pass.
