@@ -74,11 +74,26 @@ export const BROKEN = [
 ];
 
 /**
- * Whole systems named by BRAND or by a two-word phrase. `desktop`, `laptop` and `notebook` are
- * PHRASES HERE AND NEVER TOKENS: MEASURED, as bare tokens they fire on the catalog's own product
- * wording -- `"AMD Ryzen 7 9800X3D Desktop Processor"` and `"Kingston Fury Beast 32GB DDR4
- * desktop memory"` both became `whole-system`, and `src/data/catalog.ts` literally describes cpu
- * as "Desktop processors" and ram as "Desktop memory kits".
+ * Whole systems named by BRAND or by a two-word phrase.
+ *
+ * `desktop` IS A PHRASE HERE AND NEVER A TOKEN, and that is a measurement about `desktop` ALONE:
+ * as a bare token it fires on the catalog's own product wording -- `"AMD Ryzen 7 9800X3D Desktop
+ * Processor"` and `"Kingston Fury Beast 32GB DDR4 desktop memory"` both become `whole-system`,
+ * and `src/data/catalog.ts` literally describes cpu as "Desktop processors" and ram as "Desktop
+ * memory kits". `laptop` and `notebook` carry no such collision and ARE tokens; see WHOLE_UNIT.
+ *
+ * THE BRAND LINES ARE THE SECOND DETECTOR FOR A MACHINE WITH NO WHOLE-UNIT WORD IN ITS TITLE --
+ * `"Razer Blade 16 RTX 5080"` names no `pc`, no `laptop` and no system phrase otherwise.
+ * MEASURED against all 176 catalog names and the 15 live titles; three candidates were REJECTED
+ * on collisions and are named here so they are not "tidied" back in:
+ *   `aorus`   -- 5 catalog motherboards (`Gigabyte X870E Aorus Master`, ...) AND Gigabyte's GPU
+ *                line. A catalog collision: T11 goes red.
+ *   `nitro`   -- `Sapphire Nitro+` is a mainstream AMD GPU board partner line. THE 0/176
+ *                MEASUREMENT CANNOT SEE THIS: the catalog stores generic names (`Radeon RX 7800
+ *                XT`) and holds no board-partner brands at all, so "0 collisions in the catalog"
+ *                is a claim about the catalog, not about real listings.
+ *   `predator` -- Acer sells Predator RAM and Predator NVMe drives, not only Predator machines.
+ * The nine that ship are system-only product lines with no component line behind them.
  */
 export const SYSTEM_PHRASES = [
   "thinkcentre",
@@ -98,11 +113,34 @@ export const SYSTEM_PHRASES = [
   "mini pc",
   "gaming laptop",
   "laptop computer",
+  "razer blade",
+  "legion",
+  "omen",
+  "victus",
+  "zephyrus",
+  "xps",
+  "ideapad",
+  "pavilion",
+  "katana",
 ];
 
 /**
  * Whole-unit TOKENS, neutralised when a marker phrase of the DECLARED type covers the position.
  * `"Lian Li Lancool 216 PC Case"` under a `case` search is a case, not a PC.
+ *
+ * `laptop` AND `notebook` ARE TOKENS HERE, AND THEY CLOSE A BLOCKING DEFECT. Without them a
+ * whole machine that names no `pc`/`rig`/`build` contributed its whole price to a component's
+ * benchmark: MEASURED, `"ASUS TUF Gaming A15 laptop RTX 4060"` at CA$1,200 wrote
+ * `model_stats: GeForce RTX 4060 count=1 total=120000` -- the benchmark for a 4060 was a laptop.
+ * The two-word `SYSTEM_PHRASES` entries could not catch it because they need adjacency.
+ * MEASURED after adding them: 0 of 176 self-resolutions move, 0 of 1,408 cross-type pairs leak,
+ * and no live listing changes its stored validity or model key.
+ *
+ * THE ONE COST, NAMED: `laptop` fires on the live `"Timetec 16GB DDR4 3200MHz SODIMM Laptop
+ * RAM"`. Under a gpu search that listing was already refused, so nothing stored changes; declared
+ * as `ram` it moves from `VALID`-with-no-key to `INVALID_REFERENCE`, because no `ram` marker
+ * covers the word `laptop`. That is a lost reference, not a wrong one, and laptop memory is a
+ * different product from the desktop kits this catalog lists.
  *
  * THE COST, STATED ABSOLUTELY RATHER THAN AS A DELTA. MEASURED over 24 realistic standalone
  * component titles, this table declines 3 a human would accept -- `"GeForce RTX 5060 - pulled
@@ -122,10 +160,27 @@ export const WHOLE_UNIT = new Set([
   "battlestation",
   "machine",
   "system",
+  "laptop",
+  "notebook",
 ]);
 
-/** Phrases that state a multiplicity outright. */
-export const MULTIPLE = ["lot of", "bundle", "pair of", "set of", "pcs", "pieces"];
+/**
+ * Phrases that state a multiplicity outright.
+ *
+ * `two`, `three` and `both` close the INFLATING direction of a blocking defect: MEASURED,
+ * `"Two GeForce RTX 5080 cards"` at CA$4,000 was stored `VALID / GeForce RTX 5080`, which puts
+ * twice the unit price into that model's benchmark and makes every genuine 5080 look like a
+ * deal. MEASURED: 0 collisions across the 176 catalog names, the 15 live titles and every title
+ * this suite asserts must stay matched.
+ *
+ * THREE CANDIDATES WERE REJECTED ON MEASURED COLLISIONS, named so they are not added later:
+ *   `dual`  -- `ASUS Dual` is a real board-partner cooler line. It collides with three titles
+ *              this suite pins as matches, T1 and T3 among them.
+ *   `x 2`   -- as an anywhere-phrase it matches the catalog name `WD Black SN850X 2TB`.
+ *   `x 3`   -- matches 8 X3D CPUs (`Ryzen 9 9950X3D`, ...).
+ * The trailing form of `x N` ships instead, as `multiplierSuffix` below.
+ */
+export const MULTIPLE = ["lot of", "bundle", "pair of", "set of", "pcs", "pieces", "two", "three", "both"];
 
 /**
  * Multiplicity TOKENS, checked UNCONDITIONALLY -- NOT through `hasUncovered`.
@@ -141,6 +196,20 @@ export const MULTIPLE = ["lot of", "bundle", "pair of", "set of", "pcs", "pieces
  */
 export const MULTI_UNIT = new Set(["pack"]);
 
+/**
+ * WHAT COUNTS AS EVIDENCE THAT THE ITEM IS FREE, as opposed to the word `free` appearing
+ * somewhere in the title. Rule 8 used to test the bare token anywhere, so
+ * `"GeForce RTX 5080 - free shipping"` at CA$0 was stored `VALID` WITH a catalog model key --
+ * and `dealRules.decide` reads `VALID` plus a zero price under `MAXIMUM_PRICE` as
+ * `DEAL / within-maximum`. That is the verdict PR #6 exists to prevent.
+ *
+ * The anchor is the ITEM: `free` leading the title, or a phrase that can only describe the item.
+ * The leading token is refused when the next word is the thing being given away instead --
+ * `"Free shipping on this GeForce RTX 5080"` is not a free graphics card.
+ */
+export const FREE_ITEM_PHRASES = ["free to a good home", "free item"];
+export const FREE_IS_NOT_THE_ITEM = new Set(["shipping", "delivery", "postage"]);
+
 const DIGITS = /^[0-9]+$/;
 const LETTERS = /^[a-z]+$/;
 
@@ -149,8 +218,15 @@ const LETTERS = /^[a-z]+$/;
  *
  * INDEX 0 ONLY, and that term is load-bearing. MEASURED: an `Nx`-anywhere form fires on
  * `"Ryzen 5 9600X processor"` and 5 other X-suffixed CPUs as soon as any word follows the model
- * name, and on `"MSI RTX 5080 Ventus 3X OC"`, a real cooler designation. Restricted to index 0
- * it moves 0 of 176 catalog self-resolutions and 0 of the 15 live titles.
+ * name, on all four X-suffixed Corsair PSUs the same way (`RM850x`, `RM850x Shift`,
+ * `RM1000x Shift`, `RM1200x Shift` -- T11 goes red naming `Corsair RM1200x Shift`), and on
+ * `"MSI RTX 5080 Ventus 3X OC"`, a real cooler designation. Restricted to index 0 it moves 0 of
+ * 176 catalog self-resolutions and 0 of the 15 live titles.
+ *
+ * THESE ARE NOT THE SAME COLLISIONS AS THE ONES THAT REJECTED `x 2` AND `x 3` AS `MULTIPLE`
+ * PHRASES. Those are `WD Black SN850X 2TB` and the 8 X3D CPUs; these are the X-suffixed CPUs and
+ * PSUs followed by a word. Quoting one list as evidence for the other is how that justification
+ * went wrong once already.
  *
  * No `startsRun` term and no `endsRun` term: at index 0 a digit token always starts its run, and
  * because runs alternate letter and digit blocks a mid-run `x` is always followed by DIGITS,
@@ -177,6 +253,28 @@ export const multiplierPrefix = (tokens: readonly Token[]): boolean => {
  *
  * Bare `"cpu"` is deliberately absent -- see T13, the bidirectional vocabulary audit.
  */
+/**
+ * A TRAILING multiplier: `"GeForce RTX 5080 x2"` is two cards, not one.
+ *
+ * The last two tokens only. MEASURED: 0 collisions across the 176 catalog names, the 15 live
+ * titles and every title this suite pins as a match -- no catalog name ENDS in `x` followed by
+ * digits, because the capacity or generation always follows (`SN850X 2TB`, `NF-A12x25 PWM`).
+ *
+ * THE RESIDUAL, NAMED: a title TRUNCATED to exactly that shape does fire -- `"G.Skill Flare X5"`
+ * and `"Noctua NF-A12x25"` with nothing after them. That is a lost reference, not a wrong one,
+ * and it is the same direction every other tie in this file breaks.
+ */
+export const multiplierSuffix = (tokens: readonly Token[]): boolean => {
+  const count = tokens[tokens.length - 1];
+  const times = tokens[tokens.length - 2];
+  return (
+    count !== undefined &&
+    DIGITS.test(count.value) &&
+    times !== undefined &&
+    times.value === "x"
+  );
+};
+
 export const MARKERS: Record<Listing["componentType"], readonly string[]> = {
   cpu: [
     "processor",
@@ -226,6 +324,11 @@ const hasUncovered = (
   const covered = markerCoverage(values, declared);
   return values.some((value, index) => vocabulary.has(value) && !covered.has(index));
 };
+
+/** True when the TITLE says the item itself is free -- not that the shipping is. */
+export const freeItemEvidence = (values: readonly string[]): boolean =>
+  (values[0] === "free" && !FREE_IS_NOT_THE_ITEM.has(values[1] ?? "")) ||
+  containsAnyPhrase(values, FREE_ITEM_PHRASES);
 
 export const systemEvidence = (
   values: readonly string[],
@@ -309,15 +412,20 @@ export const normalizeListing = (input: {
   if (
     containsAnyPhrase(values, MULTIPLE) ||
     values.some((value) => MULTI_UNIT.has(value)) ||
-    multiplierPrefix(tokens)
+    multiplierPrefix(tokens) ||
+    multiplierSuffix(tokens)
   ) {
     return refuse("NEEDS_REVIEW", "unknown-quantity");
   }
 
-  // 8: CA$0 with no "free" in the title is a placeholder, not a price. `parsePriceText` maps
-  // "Free" to null, so an explicitly free listing never reaches this rule with 0 either -- it is
-  // the AMBIGUOUS zero this refuses.
-  if (input.priceCents === 0 && !containsPhrase(values, "free")) {
+  // 8: CA$0 with nothing saying the ITEM is free is a placeholder, not a price.
+  //
+  // MEASURED, because the two comments that used to describe this disagreed: `parsePriceText`
+  // returns NULL for the word "Free" and ZERO for "CA$0" -- and Facebook renders a genuinely free
+  // item as "CA$0", which is exactly why a real zero can reach this rule and why the exemption
+  // below exists at all. The claim that an explicitly free listing never arrives here with 0 was
+  // false; worker/api/priceText.ts had it right.
+  if (input.priceCents === 0 && !freeItemEvidence(values)) {
     return refuse("NEEDS_REVIEW", "ambiguous-zero-price");
   }
 

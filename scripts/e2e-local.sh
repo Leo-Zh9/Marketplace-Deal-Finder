@@ -210,6 +210,9 @@ is "  ...and the whole-PC listing is refused outright" 'INVALID_REFERENCE|NULL' 
    "$(val "SELECT validity || '|' || COALESCE(model_key,'NULL') FROM listings WHERE listing_id='913388811629562'")"
 # THE CROSS-INVARIANT. modelKey and validity come from ONE rule, so a stored model key implies a
 # VALID row; the reverse (VALID with a null key) is the normal uncatalogued case.
+# IT IS ALSO 0 IF NO KEY IS EVER PRODUCED. Its anchor is the model_stats content line above,
+# which requires 'GeForce RTX 5080|1|300000'. Deleting that line leaves this one passing on an
+# inert pipeline; the two must be read, and kept, together.
 is "  ...and no listing carries a key while not VALID" 0 \
    "$(val "SELECT COUNT(*) FROM listings WHERE model_key IS NOT NULL AND validity <> 'VALID'")"
 # The route's own report of the same two facts. `recorded` and `skipped-no-model` were both

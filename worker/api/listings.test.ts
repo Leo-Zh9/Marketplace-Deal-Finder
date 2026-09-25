@@ -842,6 +842,11 @@ describe("POST /api/listings", () => {
    * the key its title happened to name would store `model_key = 'Corsair AX1600i'` for a PSU
    * nobody is selling -- and `dealRules` would then judge against it the moment `validity` were
    * ever flipped back.
+   *
+   * THIS COUNT IS 0 UNDER A NORMALIZER THAT NEVER RETURNS A KEY AT ALL. Its anchor is T41r
+   * directly above, whose three-row `toEqual` requires `L-904` to carry `Corsair RM850x Shift`.
+   * DO NOT DELETE T41r AND LEAVE THIS STANDING ALONE -- together they say "keys are produced,
+   * and only on VALID rows"; this one alone says only the second half.
    */
   it("T43r: no stored listing has a model key without being VALID", async () => {
     await post(psuDomainBatch());

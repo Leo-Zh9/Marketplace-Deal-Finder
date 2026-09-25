@@ -275,13 +275,14 @@ Two or more distinct models in one title is a refusal, not a choice.
 1.  wanted ad         wtb, want to buy, wanted, looking for, iso, ...       -> INVALID_REFERENCE
 2.  trade only        for trade, trade only, swap, trading, ...             -> INVALID_REFERENCE
 3.  broken / parts    for parts, not working, damaged, as is, ...           -> INVALID_REFERENCE
-4.  whole system      a system brand or phrase, or an uncovered whole-unit
-                      token (pc, tower, build, rig, ...)                    -> INVALID_REFERENCE
+4.  whole system      a system brand or product line, or an uncovered whole-unit
+                      token (pc, tower, build, rig, laptop, notebook, ...)  -> INVALID_REFERENCE
 5.  foreign parts     another component type is evidenced                   -> INVALID_REFERENCE
 6.  multiple models   two catalog models of the declared type               -> INVALID_REFERENCE
-7.  unknown quantity  lot of / bundle / pcs, a `pack` token, or a LEADING
-                      `3x` multiplier                                       -> NEEDS_REVIEW
-8.  placeholder zero  price 0 and the title does not say "free"             -> NEEDS_REVIEW
+7.  unknown quantity  lot of / bundle / pcs / two / three / both, a `pack`
+                      token, or a LEADING `3x` or TRAILING `x2` multiplier  -> NEEDS_REVIEW
+8.  placeholder zero  price 0 and nothing says the ITEM is free (a leading
+                      `free`, or `free to a good home` / `free item`)       -> NEEDS_REVIEW
 9.  unconfirmed       no catalog match and no marker for the declared type  -> NEEDS_REVIEW
 10. unmatched         the right component, not in the catalog   -> VALID, modelKey null
 11. matched           exactly one catalog model                 -> VALID, that model
@@ -290,8 +291,26 @@ Two or more distinct models in one title is a refusal, not a choice.
 Rule 4 is neutralised by a marker of the **declared** type, so `"Lian Li Lancool 216 PC Case"`
 under a `case` search is a case and not a PC. Rule 7's `pack` is **not**: a fan pack really is a
 pack, on the one component type where Arctic, Noctua and Corsair all sell in 3- and 5-packs.
-Rule 7's multiplier is **leading only** — an `Nx`-anywhere form collides with 8 X3D CPUs,
-`SN850X 2TB/4TB` and `Flare X5`.
+
+**Rule 4's whole-unit tokens include `laptop` and `notebook` but not `desktop`**, and those are
+two different measurements rather than one. `desktop` fires on the catalog's own product wording
+— `"AMD Ryzen 7 9800X3D Desktop Processor"`, `"Kingston Fury Beast 32GB DDR4 desktop memory"` —
+so it is a phrase, never a token. `laptop` and `notebook` carry no such collision. Nine
+system-only product lines (`razer blade`, `legion`, `omen`, `victus`, `zephyrus`, `xps`,
+`ideapad`, `pavilion`, `katana`) are the second detector for a machine whose title names no
+whole-unit word at all, such as `"Razer Blade 16 RTX 5080"`. **Three brand candidates were
+refused on measured collisions:** `aorus` (5 catalog motherboards, and Gigabyte's GPU line),
+`nitro` (`Sapphire Nitro+` is a mainstream AMD board-partner GPU line) and `predator` (Acer sells
+Predator RAM and NVMe drives).
+
+**Rule 7's multiplier has two positional forms and no third.** A `3x` **leading** the title and an
+`x2` **trailing** it are both counts; an `Nx`-anywhere form is not shippable, and the two
+rejections have different evidence that must not be quoted for each other. As a *phrase*, `x 2`
+matches the catalog name `WD Black SN850X 2TB` and `x 3` matches 8 X3D CPUs. As a *predicate
+without the index-0 restriction*, it fires on `"Ryzen 5 9600X processor"` and five other
+X-suffixed CPUs, on all four X-suffixed Corsair PSUs once any word follows, and on
+`"MSI RTX 5080 Ventus 3X OC"`, a real cooler designation. `dual` was refused too: `ASUS Dual` is
+a real board-partner cooler line.
 
 **Quantity needs no schema change and gets none.** `recordSightings` computes its aggregates with
 an implicit quantity of 1, so a `quantity` column nothing reads would be a lie in the schema.
@@ -304,29 +323,42 @@ live 5080 is CA$3,000. Any threshold would be a fabricated number.
 
 - **176/176** catalog names, declared as their own component type, resolve to themselves.
 - **0 of 1,408** cross-type pairs produce a `VALID` result carrying a model key.
-- **8** sub-phrase overlaps exist across the sixteen vocabularies, all of them known and pinned;
-  a ninth fails the suite.
+- **10** sub-phrase overlaps exist across the eighteen vocabularies, all of them known and
+  pinned; an eleventh fails the suite.
 - CPU, measured in Node on a development machine rather than in workerd — the same caveat
   `worker/evaluation/evaluationCpu.test.ts` carries: **p95 0.20 ms** for a 15-listing window, and
   **p95 2.95 ms** for the worst legal batch (100 listings × 300-character titles one token under
   the cap, which is the expensive side of it — a title that *hits* the cap short-circuits at rule
   0 and costs 0.22 ms). The repo's own invariant is p95 < 8 ms.
 
-### The residuals, named
+### The residuals, named — and the corpora they are measured from
+
+**Every figure below is measured from a corpus committed in
+`worker/normalize/normalizeListing.test.ts`** — `STANDALONE_COMPONENTS` (24 titles),
+`WHOLE_MACHINES` (30) and `BOARD_PARTNER_TITLES` (5). Earlier versions of these numbers were
+quoted from corpora that lived only in a scratch directory and could not be re-derived by anyone
+reading the repo; one of them was also not representative, which is how a laptop's whole price
+reached a GPU's benchmark.
 
 1. **`"Corsair RM850x 2021"` still pools into `Corsair RM850x`.** Year-suffixed revisions are an
    unbounded class; enumerating years would prove the suffix list open-ended rather than close it.
-2. **A laptop with every detector stripped still reads as a GPU.** Measured, 1 of 29 constructed
-   whole-machine titles: `"MINT custom x17 R2 Flagship Ecosystem - RTX 5080 (16GB)"` carries no
-   whole-unit token, no system brand and no foreign-component marker. Its live counterpart is
-   caught twice over.
-3. **3 of 24 realistic standalone-component titles are declined** that a human would accept, all
-   from the token `build` or the phrase `gaming PC`. Every one costs a lost reference, never a
-   wrong one.
+2. **One machine in thirty still reads as a standalone GPU.** `"MINT custom x17 R2 Flagship
+   Ecosystem - RTX 5080 (16GB)"` — a laptop with the whole-unit word, the system brand and the
+   foreign-component marker all stripped out. Its live counterpart is caught twice over.
+3. **Two multi-unit forms are still uncaught, both in the INFLATING direction.** `"Selling 2x
+   GeForce RTX 5080"` (the multiplier does not lead the title, and widening that predicate fires
+   on six real CPUs) and `"Dual GeForce RTX 5080"` (`dual` collides with the `ASUS Dual` product
+   line). Both put N units' price into a one-unit benchmark, which makes genuine listings look
+   like deals.
+4. **4 of 24 realistic standalone-component titles are declined** that a human would accept:
+   three from the token `build` or the phrase `gaming PC`, and one — `"Arctic P12 Max fan pack"` —
+   from the deliberate choice that a fan pack really is a pack. Every one costs a lost reference,
+   never a wrong one. *(The figure was previously reported as 3; that count omitted the fourth.)*
+5. **A model name truncated to `<letters> x <digits>`** — `"G.Skill Flare X5"` with nothing after
+   it — reads as a trailing count. A lost reference, in the safe direction.
 
-Both of the first two are pinned as expected-to-fail-this-way rows in
-`worker/normalize/normalizeListing.test.ts`, so the next one is visible rather than discovered in
-an aggregate.
+Residuals 1, 2, 3 and 5 are pinned as expected-to-behave-this-way rows in
+`ACCEPTED_EXPOSURE`, so the next one is visible rather than discovered in an aggregate.
 
 ---
 
@@ -531,14 +563,22 @@ narrows what that leg can see, without closing it:
 | the listing | before normalization | now |
 |---|---|---|
 | wrong component, whole system, trade-only, for parts, a wanted ad | reached the drain as `VALID` | `INVALID_REFERENCE` → `NOT_DEAL / COMPLETE`, before any rule runs |
-| an ambiguous `CA$0` | `DEAL / within-maximum` under `MAXIMUM_PRICE` | `NEEDS_REVIEW`, so it cannot be a `DEAL` |
+| an **ambiguous** `CA$0` — nothing in the title says the item is free | `DEAL / within-maximum` under `MAXIMUM_PRICE` | `NEEDS_REVIEW`, so it is not a `DEAL` |
+| an **explicitly free** `CA$0` — the title leads with `free`, or says `free to a good home` | `DEAL / within-maximum` | **unchanged: still `DEAL / within-maximum`.** It is `VALID` at a zero price, and `decide` runs the maximum-price leg before the evidence gate |
 | a real component **the catalog does not list**, priced under the maximum | `DEAL / within-maximum` | **unchanged: still `DEAL / within-maximum`** — it is `VALID` with a null model key |
 
+**Do not read row 2 as "a `CA$0` listing can no longer be a `DEAL`".** It cannot be one *while
+the title is ambiguous*. `parsePriceText` returns `0` for `"CA$0"` — which is how Facebook renders
+a genuinely free item — and `null` for the word `"Free"`, so a real zero does reach the rule, and
+an explicitly free one is still `VALID` at `0`. Rows 3 and 4 are the two ways a `DEAL` verdict
+still comes out of a zero or a low price on no benchmark evidence.
+
 **Leave the evaluation mode on `DISCOUNT` or `BOTH`, not `MAXIMUM_PRICE`.** The instruction
-stands. The third row is why: the catalog is current-generation only and most real supply is
+stands, and rows 3 and 4 are why: the catalog is current-generation only and most real supply is
 older, so a genuine but uncatalogued card under the maximum still reads as a deal on no evidence
-at all. Alerting is deferred, so today a `DEAL` verdict changes a database column and nothing
-else — but the notification channel is the next thing being built.
+at all, and a free listing reads as the best deal in the database. Alerting is deferred, so today
+a `DEAL` verdict changes a database column and nothing else — but the notification channel is the
+next thing being built, and the free listing is the row PR #6 exists because of.
 
 `decide`'s ordering is **not** changed here. Gating the maximum-price leg on a non-null model key
 is the evaluation layer's contract and needs its own adversarial pass.

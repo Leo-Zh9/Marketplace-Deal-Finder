@@ -17,6 +17,8 @@ import type { Listing } from "../storage/types";
 import { tokenValues, tokenize } from "./catalogIndex";
 import {
   BROKEN,
+  FREE_IS_NOT_THE_ITEM,
+  FREE_ITEM_PHRASES,
   MARKERS,
   MULTIPLE,
   MULTI_UNIT,
@@ -54,9 +56,22 @@ const CASES: Case[] = [
   ["T9f (rule 4): 'PC case' under a case search is a case", "Lian Li Lancool 216 PC Case", 13900, "case", "VALID", "Lian Li Lancool 216", "matched"],
   ["T9g (rule 4): 'tower case' under a case search is a case", "NZXT H7 Flow tower case white", 15900, "case", "VALID", "NZXT H7 Flow", "matched"],
   ["T9h (rule 4): 'computer case' under a case search is a case", "Fractal North computer case", 16900, "case", "VALID", "Fractal North", "matched"],
+  // F1: a whole machine whose title names no `pc`, `rig` or `build`. Before this vocabulary,
+  // "ASUS TUF Gaming A15 laptop RTX 4060" wrote the laptop's whole price into the 4060's
+  // benchmark. Each row below is refused by exactly ONE of the four new words.
+  ["F1a (rule 4): the whole-unit token 'laptop'", "ASUS TUF Gaming A15 laptop RTX 4060", 121000, "gpu", "INVALID_REFERENCE", null, "whole-system"],
+  ["F1b (rule 4): the whole-unit token 'notebook'", "Dell G15 notebook RTX 4060", 125000, "gpu", "INVALID_REFERENCE", null, "whole-system"],
+  ["F1c (rule 4): a brand line with NO whole-unit word at all", "Razer Blade 16 RTX 5080", 351000, "gpu", "INVALID_REFERENCE", null, "whole-system"],
+  ["F1d (rule 4): a second brand line, same shape", "HP Omen 16 with RTX 4060", 130000, "gpu", "INVALID_REFERENCE", null, "whole-system"],
 
   // Rule 5: the majority case in the live data -- the wrong component entirely.
-  ["T16 (rule 5): live -- RAM in a GPU search", "Timetec 16GB DDR4 3200MHz SODIMM Laptop RAM", 5000, "gpu", "INVALID_REFERENCE", null, "wrong-component"],
+  //
+  // T16 MOVED FROM rule 5 TO rule 4 WHEN `laptop` BECAME A WHOLE-UNIT TOKEN, and it is recorded
+  // here rather than hidden: the stored result is identical (INVALID_REFERENCE, null key), only
+  // the rule that refused it changed, because rule 4 runs first. T16b is therefore the case that
+  // actually kills rule 5 -- it is live RAM in a gpu search with no whole-unit word in it.
+  ["T16 (rule 4): live -- laptop RAM in a GPU search", "Timetec 16GB DDR4 3200MHz SODIMM Laptop RAM", 5000, "gpu", "INVALID_REFERENCE", null, "whole-system"],
+  ["T16b (rule 5): live -- a desktop RAM kit in a GPU search", "XPG Gammix D10 32GB (2x16GB) DDR4 3200MHz RAM", 15000, "gpu", "INVALID_REFERENCE", null, "wrong-component"],
 
   // Rule 6: two models of the DECLARED type; no way to say which price is which.
   ["T8 (rule 6): two cards in one title", "RTX 5080 graphics card and RX 7800 XT", 380000, "gpu", "INVALID_REFERENCE", null, "multiple-models"],
@@ -78,10 +93,18 @@ const CASES: Case[] = [
   ["T44 (rule 7): a 2x16GB kit is ONE kit -- regression only", "Corsair Vengeance 32GB DDR5 (2x16GB)", 18900, "ram", "VALID", "Corsair Vengeance 32GB DDR5", "matched"],
   ["T45 (rule 7): 'SN850X 2TB' is a model, not a count -- regression only", "WD Black SN850X 2TB nvme ssd", 21900, "storage", "VALID", "WD Black SN850X 2TB", "matched"],
   ["T46 (rule 7): a LEADING kit spec is still one kit -- SOLE killer of the letter test", "2x16GB Corsair Vengeance 32GB DDR5", 19900, "ram", "VALID", "Corsair Vengeance 32GB DDR5", "matched"],
+  // F2: the INFLATING direction -- N units at one price makes a genuine listing look like a deal.
+  ["F2a (rule 7): the count word 'two'", "Two GeForce RTX 5080 cards", 403000, "gpu", "NEEDS_REVIEW", null, "unknown-quantity"],
+  ["F2b (rule 7): a TRAILING multiplier", "GeForce RTX 5080 x2", 401000, "gpu", "NEEDS_REVIEW", null, "unknown-quantity"],
 
   // Rule 8: a placeholder zero is not a price; an explicit free one is a real zero.
   ["T22 (rule 8): CA$0 with nothing saying free", "ASUS ROG RTX 5070 graphics card", 0, "gpu", "NEEDS_REVIEW", null, "ambiguous-zero-price"],
   ["T23 (rule 8): explicitly free", "Free RTX 5070 graphics card", 0, "gpu", "VALID", "GeForce RTX 5070", "matched"],
+  // F3: `free` anywhere in the title used to re-admit a CA$0 listing as VALID WITH a model key,
+  // which `dealRules.decide` reads as DEAL / within-maximum under MAXIMUM_PRICE. Four cases in
+  // this table now carry priceCents 0; in every one of them the zero IS the subject.
+  ["F3a (rule 8): free SHIPPING is not a free item", "GeForce RTX 5080 - free shipping", 0, "gpu", "NEEDS_REVIEW", null, "ambiguous-zero-price"],
+  ["F3b (rule 8): nor is it when it leads the title", "Free shipping on this GeForce RTX 5080", 0, "gpu", "NEEDS_REVIEW", null, "ambiguous-zero-price"],
 
   // Rule 9: nothing says this is even the declared component. Do not guess.
   ["T5 (rule 9): live -- no brand, no series word", "Selling My 4070 TI", 100000, "gpu", "NEEDS_REVIEW", null, "component-unconfirmed"],
@@ -111,6 +134,15 @@ const CASES: Case[] = [
 const ACCEPTED_EXPOSURE: Case[] = [
   ["T36a: a year-suffixed revision pools into the base model", "Corsair RM850x 2021 power supply", 17900, "psu", "VALID", "Corsair RM850x", "matched"],
   ["T36b: a laptop with every detector stripped reads as a GPU", "MINT custom x17 R2 Flagship Ecosystem - RTX 5080 (16GB)", 350000, "gpu", "VALID", "GeForce RTX 5080", "matched"],
+  // F2's remainder, pinned rather than left to be discovered. Both are the INFLATING direction.
+  // `Selling 2x ...` is uncaught because the multiplier predicate is index-0 only and `Selling`
+  // takes index 0; widening it is what fires on `Ryzen 5 9600X processor`. `Dual ...` is uncaught
+  // because `dual` collides with the real `ASUS Dual` board-partner line, which T1 and T3 pin.
+  ["T36c: a multiplier that does not lead the title", "Selling 2x GeForce RTX 5080", 400000, "gpu", "VALID", "GeForce RTX 5080", "matched"],
+  ["T36d: the count word 'dual', which collides with a real product line", "Dual GeForce RTX 5080", 402000, "gpu", "VALID", "GeForce RTX 5080", "matched"],
+  // The trailing multiplier's own residual, in the SAFE direction: a model name truncated to
+  // exactly `<letters> x <digits>` reads as a count. A lost reference, never a wrong one.
+  ["T36e: a truncated model name reads as a count", "G.Skill Flare X5", 17500, "ram", "NEEDS_REVIEW", null, "unknown-quantity"],
 ];
 
 const assertCase = ([, title, priceCents, componentType, validity, modelKey, reason]: Case): void => {
@@ -178,6 +210,9 @@ describe("normalizeListing -- every vocabulary element, one at a time", () => {
     ["set of", "unknown-quantity"],
     ["pcs", "unknown-quantity"],
     ["pieces", "unknown-quantity"],
+    ["two", "unknown-quantity"],
+    ["three", "unknown-quantity"],
+    ["both", "unknown-quantity"],
   ])("T21: %s refuses the listing as %s", (phrase, reason) => {
     const result = normalizeListing({ title: GPU_FRAME(phrase), priceCents: 299000, componentType: "gpu" });
     expect(result.reason).toBe(reason);
@@ -191,6 +226,8 @@ describe("normalizeListing -- every vocabulary element, one at a time", () => {
     ["thinkcentre"], ["thinkpad"], ["alienware"], ["optiplex"], ["elitedesk"], ["prodesk"],
     ["macbook"], ["imac"], ["nuc"], ["all in one"], ["workstation"], ["gaming desktop"],
     ["desktop pc"], ["desktop computer"], ["mini pc"], ["gaming laptop"], ["laptop computer"],
+    ["razer blade"], ["legion"], ["omen"], ["victus"], ["zephyrus"], ["xps"], ["ideapad"],
+    ["pavilion"], ["katana"],
   ])("T21b: %s marks the listing a whole system", (phrase) => {
     expect(
       normalizeListing({ title: `NZXT H7 Flow ${phrase} case`, priceCents: 15800, componentType: "case" }),
@@ -206,7 +243,7 @@ describe("normalizeListing -- every vocabulary element, one at a time", () => {
   /** T21c: WHOLE_UNIT, element by element, uncovered by any gpu marker. */
   it.each([
     ["pc"], ["computer"], ["tower"], ["rig"], ["prebuilt"], ["build"], ["built"], ["setup"],
-    ["battlestation"], ["machine"], ["system"],
+    ["battlestation"], ["machine"], ["system"], ["laptop"], ["notebook"],
   ])("T21c: the whole-unit token %s marks the listing a whole system", (token) => {
     expect(
       normalizeListing({ title: `GeForce RTX 5080 ${token}`, priceCents: 289000, componentType: "gpu" }),
@@ -265,10 +302,178 @@ describe("normalizeListing -- every vocabulary element, one at a time", () => {
     },
   );
 
+  /** T23b: each phrase that can only describe the ITEM being free, at a real CA$0 price. */
+  it.each([["free to a good home"], ["free item"]])(
+    "T23b: %s keeps a CA$0 listing usable",
+    (phrase) => {
+      expect(
+        normalizeListing({ title: `GeForce RTX 5080 ${phrase}`, priceCents: 0, componentType: "gpu" }),
+      ).toEqual({ modelKey: "GeForce RTX 5080", variantKey: null, validity: "VALID", reason: "matched" });
+    },
+  );
+
+  /** T23c: each word that makes a LEADING `free` describe something other than the item. */
+  it.each([["shipping"], ["delivery"], ["postage"]])(
+    "T23c: a leading 'free %s' does not make the item free",
+    (word) => {
+      expect(
+        normalizeListing({ title: `Free ${word} on this GeForce RTX 5080`, priceCents: 0, componentType: "gpu" }),
+      ).toEqual({ modelKey: null, variantKey: null, validity: "NEEDS_REVIEW", reason: "ambiguous-zero-price" });
+    },
+  );
+
+  it("T23c control: a leading 'free' followed by the item itself still counts", () => {
+    expect(
+      normalizeListing({ title: "Free GeForce RTX 5080", priceCents: 0, componentType: "gpu" }),
+    ).toEqual({ modelKey: "GeForce RTX 5080", variantKey: null, validity: "VALID", reason: "matched" });
+  });
+
   it("T21e control: with no gpu marker at all the rule declines to guess", () => {
     expect(
       normalizeListing({ title: "widget for sale", priceCents: 45800, componentType: "gpu" }),
     ).toEqual({ modelKey: null, variantKey: null, validity: "NEEDS_REVIEW", reason: "component-unconfirmed" });
+  });
+});
+
+/**
+ * THE THREE CORPORA THE COST AND RESIDUAL FIGURES ARE MEASURED FROM.
+ *
+ * They are committed because the previous versions of those figures were quoted from corpora
+ * that lived only in a scratch directory -- "3 of 24" and "1 of 29" could not be re-derived by
+ * anyone reading the repo, and the 29-title set turned out not to cover machines whose titles
+ * carry no whole-unit word at all, which is how a laptop reached a GPU benchmark. A number
+ * nobody can re-measure is not a measurement.
+ */
+const STANDALONE_COMPONENTS: [Listing["componentType"], string][] = [
+  ["gpu", "ASUS ROG Astral GeForce RTX 5080 OC 16GB"],
+  ["gpu", "MSI Ventus 3X GeForce RTX 5070 Ti"],
+  ["gpu", "Radeon RX 9070 XT, boxed, receipt"],
+  ["gpu", "GeForce RTX 5060 - pulled from my build"],
+  ["gpu", "RTX 5080 graphics card for gaming PC"],
+  ["cpu", "AMD Ryzen 7 9800X3D Desktop Processor"],
+  ["cpu", "Core i9-14900K CPU boxed"],
+  ["cpu", "Ryzen 5 9600X processor, like new"],
+  ["case", "Lian Li Lancool 216 PC Case"],
+  ["case", "Fractal North XL computer case"],
+  ["case", "NZXT H7 Flow tower case white"],
+  ["case", "Corsair 4000D Airflow chassis"],
+  ["psu", "Corsair RM850x power supply 850W"],
+  ["psu", "Seasonic Focus GX-850 PSU for desktop build"],
+  ["ram", "Corsair Vengeance 32GB DDR5 6000 CL30"],
+  ["ram", "Kingston Fury Beast 32GB DDR4 desktop memory"],
+  ["storage", "Samsung 990 Pro 2TB NVMe SSD"],
+  ["storage", "WD Black SN850X 2TB m.2 drive"],
+  ["motherboard", "MSI MAG B650 Tomahawk WiFi motherboard"],
+  ["motherboard", "ASUS ROG Maximus Z890 Hero mobo"],
+  ["cpu_cooler", "Noctua NH-D15 G2 air cooler"],
+  ["cpu_cooler", "Arctic Liquid Freezer III 360 liquid cooler"],
+  ["case_fan", "Noctua NF-A12x25 PWM case fan"],
+  ["case_fan", "Arctic P12 Max fan pack"],
+];
+
+/**
+ * Whole machines. The first eight are the shapes the original corpus covered; the rest are the
+ * ones it did not -- machines named only by a laptop word or only by a product line, which is
+ * the class that was contributing whole-machine prices to component benchmarks.
+ */
+const WHOLE_MACHINES: string[] = [
+  "RTX 4070 super gaming pc | Ryzen 5 7600 | 32gb DDR4 RAM | 1tb nvme",
+  "Gaming+PC+",
+  "Custom Build RTX 5080",
+  "RTX 5070 Tower",
+  "Gaming Desktop RTX 5090",
+  "RTX 4070 super pc",
+  "Lenovo ThinkCentre M70q Gen 6 U5235T 16GB/256GB W11 Pro",
+  "MINT Alienware x17 R2 Flagship Ecosystem - i9 | RTX 3080 Ti (16GB)",
+  "Dell OptiPlex 7090 desktop pc i7 RTX 3060",
+  "HP EliteDesk 800 G6 with RTX 4060",
+  "Apple iMac 27 inch",
+  "Intel NUC 13 Extreme RTX 4070",
+  "Dell Precision workstation RTX 4000",
+  "All in one PC with RTX 3060",
+  "Prebuilt gaming rig RTX 5070 Ti",
+  "My whole battlestation - RTX 5080, 9800X3D, 64GB",
+  "ASUS TUF Gaming A15 laptop RTX 4060",
+  "Dell G15 notebook RTX 4060",
+  "Razer Blade 16 RTX 5080",
+  "HP Omen 16 with RTX 4060",
+  "Lenovo Legion 5 Pro RTX 4070",
+  "HP Victus 15 RTX 4050",
+  "ASUS ROG Zephyrus G14 RTX 4060",
+  "Dell XPS 15 with RTX 4070",
+  "Lenovo IdeaPad Gaming 3 RTX 3050",
+  "HP Pavilion Gaming RTX 3060",
+  "MSI Katana 15 RTX 4070",
+  "MacBook Pro 16 M3 Max",
+  "Gaming laptop RTX 4080 16GB",
+  "MINT custom x17 R2 Flagship Ecosystem - RTX 5080 (16GB)",
+];
+
+/**
+ * Real board-partner component titles. The catalog stores GENERIC model names and holds no
+ * board-partner brands at all, so "0 collisions against the 176" says nothing about these. This
+ * corpus is what says something about them, and it is why `nitro`, `aorus` and `predator` were
+ * refused as SYSTEM_PHRASES.
+ */
+const BOARD_PARTNER_TITLES: [Listing["componentType"], string][] = [
+  ["gpu", "Sapphire Nitro+ RX 7800 XT graphics card"],
+  ["gpu", "Gigabyte Aorus GeForce RTX 5080 Master graphics card"],
+  ["ram", "Acer Predator Apollo 32GB DDR5 memory kit"],
+  ["gpu", "PowerColor Red Devil Radeon RX 9070 XT"],
+  ["gpu", "ASUS ROG Strix GeForce RTX 5080 OC"],
+];
+
+describe("normalizeListing -- the measured cost and the measured residual", () => {
+  /**
+   * F5a. THE COST, ABSOLUTE AND RE-DERIVABLE. The declined set is asserted by name, not by
+   * count: a count alone would stay green while the four swapped for four different ones.
+   * Three are the whole-unit token `build` or the phrase `gaming PC`; the fourth is ruling 2's
+   * deliberate choice that a fan pack really is a pack. Every one is a LOST reference, never a
+   * wrong one. The previously reported figure of 3 counted only the whole-system declines.
+   */
+  it("F5a: exactly 4 of 24 realistic standalone titles are declined, and these are the four", () => {
+    expect(STANDALONE_COMPONENTS).toHaveLength(24);
+    const declined = STANDALONE_COMPONENTS.filter(([componentType, title]) => {
+      const result = normalizeListing({ title, priceCents: 6300, componentType });
+      return !(result.validity === "VALID" && result.modelKey !== null);
+    }).map(([, title]) => title);
+
+    expect(declined).toEqual([
+      "GeForce RTX 5060 - pulled from my build",
+      "RTX 5080 graphics card for gaming PC",
+      "Seasonic Focus GX-850 PSU for desktop build",
+      "Arctic P12 Max fan pack",
+    ]);
+  });
+
+  /**
+   * F5b. THE RESIDUAL, RESTATED AGAINST THE CORRECTED VOCABULARY. One machine in thirty still
+   * reads as a standalone GPU, and it is the same constructed title T36b pins: a laptop with the
+   * whole-unit word, the system brand AND the foreign-component marker all stripped out. Its
+   * live counterpart three rows above is caught.
+   */
+  it("F5b: 29 of 30 whole machines are refused, and the one that is not is named", () => {
+    expect(WHOLE_MACHINES).toHaveLength(30);
+    const missed = WHOLE_MACHINES.filter(
+      (title) => normalizeListing({ title, priceCents: 200000, componentType: "gpu" }).modelKey !== null,
+    );
+    expect(missed).toEqual(["MINT custom x17 R2 Flagship Ecosystem - RTX 5080 (16GB)"]);
+  });
+
+  /**
+   * F5c. THE GUARD ON THE THREE REJECTED BRAND WORDS. Adding `nitro`, `aorus` or `predator` to
+   * SYSTEM_PHRASES turns one of these real component listings into a whole system, and this test
+   * is what says so out loud.
+   */
+  it("F5c: no board-partner brand word refuses a real component listing", () => {
+    for (const [componentType, title] of BOARD_PARTNER_TITLES) {
+      const result = normalizeListing({ title, priceCents: 49900, componentType });
+      expect(result.validity, title).toBe("VALID");
+      expect(result.reason, title).not.toBe("whole-system");
+    }
+    // The two that carry a catalog model resolve to it, so this cannot pass by refusing nothing.
+    expect(normalizeListing({ title: BOARD_PARTNER_TITLES[0][1], priceCents: 49900, componentType: "gpu" }).modelKey).toBe("Radeon RX 7800 XT");
+    expect(normalizeListing({ title: BOARD_PARTNER_TITLES[1][1], priceCents: 49900, componentType: "gpu" }).modelKey).toBe("GeForce RTX 5080");
   });
 });
 
@@ -283,7 +488,7 @@ describe("normalizeListing -- properties of the vocabularies", () => {
    * here until it is removed, neutralised, or -- as with `pack` -- deliberately allowed to win.
    * The four SYSTEM_PHRASES rows are harmless: both paths give `whole-system`.
    */
-  it("T13: exactly eight sub-phrase overlaps exist across the sixteen vocabularies", () => {
+  it("T13: exactly ten sub-phrase overlaps exist across the eighteen vocabularies", () => {
     const vocabularies: [string, readonly string[]][] = [
       ...(Object.entries(MARKERS) as [string, readonly string[]][]).map(
         ([type, phrases]) => [`MARKERS.${type}`, phrases] as [string, readonly string[]],
@@ -295,8 +500,10 @@ describe("normalizeListing -- properties of the vocabularies", () => {
       ["MULTIPLE", MULTIPLE],
       ["WHOLE_UNIT", [...WHOLE_UNIT]],
       ["MULTI_UNIT", [...MULTI_UNIT]],
+      ["FREE_ITEM_PHRASES", FREE_ITEM_PHRASES],
+      ["FREE_IS_NOT_THE_ITEM", [...FREE_IS_NOT_THE_ITEM]],
     ];
-    expect(vocabularies).toHaveLength(16);
+    expect(vocabularies).toHaveLength(18);
 
     const sequence = (phrase: string): string[] => tokenValues(tokenize(phrase));
     const isSubPhrase = (inner: string[], outer: string[]): boolean => {
@@ -323,6 +530,10 @@ describe("normalizeListing -- properties of the vocabularies", () => {
 
     expect(overlaps.sort()).toEqual(
       [
+        // The two `laptop` rows arrived with F1's whole-unit tokens and are harmless in the same
+        // way the four SYSTEM_PHRASES rows are: both paths give `whole-system`.
+        "WHOLE_UNIT:laptop < SYSTEM_PHRASES:gaming laptop",
+        "WHOLE_UNIT:laptop < SYSTEM_PHRASES:laptop computer",
         "MULTI_UNIT:pack < MARKERS.case_fan:fan pack",
         "WHOLE_UNIT:computer < MARKERS.case:computer case",
         "WHOLE_UNIT:computer < SYSTEM_PHRASES:desktop computer",
