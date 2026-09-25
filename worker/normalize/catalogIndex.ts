@@ -140,6 +140,14 @@ export const containsPhrase = (values: readonly string[], phrase: string): boole
  * -- which is exactly the cost this slice has already learned that new vocabulary carries. It is
  * the first thing to try the next time that vocabulary is opened.
  *
+ * SO THE NEXT PERSON STARTS FROM THE MEASUREMENT RATHER THAN REPEATING IT: adding `combo` to
+ * MULTIPLE costs 0 failures across all 908 tests. THAT IS NOT A GREEN LIGHT, and reading it as
+ * one is the exact mistake this file documents elsewhere -- the suite is precisely the thing
+ * that cannot see real listings, which is why `nitro` passed it and had to be caught by a corpus
+ * written from product lines instead. It means only that the sweep starts from a clean sheet:
+ * what still has to be established is whether `combo` has a descriptive use that would refuse a
+ * genuine single-item listing on any of the nine types.
+ *
  * `nvidia` AND `amd` ARE MEASURED INERT, AND THEY ARE KEPT ON PURPOSE. MEASURED: 0 of the 336
  * catalog names begin with either word -- every name this set can reach today is `GeForce ...`
  * (43), `Radeon ...` (20), `Intel Arc ...` (5) or `Core ...` (19) -- so neither can produce an
@@ -189,12 +197,18 @@ const OPTIONAL_LEADING = new Set(["geforce", "nvidia", "radeon", "amd", "intel",
  * addition beyond the original four left all 176 self-resolutions intact and the 1,408
  * cross-type pairs at 0 leaks.
  *
- * WHAT ACTUALLY GOES RED IF AN ENTRY LEAVES THIS LIST -- and it is NOT T11 or T12. MEASURED,
- * deleting one element at a time: T20 in catalogIndex.test.ts (the per-element sweep, which
- * carries its own literal copy of this list), R6 over SKU_SUFFIX_PHRASINGS, G1x over
- * GENERATION_TITLES, and for four of them a named row in CASES (T26 `super`, T34 `redux`,
- * T35 `gre`, T25/T27 the concatenated forms). Deleting `redux` gives T20 + R6 + T34; deleting
- * `xt` gives T20 + G1x; deleting `ii` or `touch` gives T20 + R6.
+ * WHAT ACTUALLY GOES RED IF AN ENTRY LEAVES THIS LIST -- and it is NOT T11 or T12. MEASURED
+ * over ALL THIRTEEN elements, deleted one at a time: T20 in catalogIndex.test.ts (the
+ * per-element sweep, which carries its own literal copy of this list, and the only thing that
+ * catches all thirteen), R6 over SKU_SUFFIX_PHRASINGS (8 of them), G1x over GENERATION_TITLES
+ * (`xt` and `argb`), and for THREE of them a named row in the guard table in
+ * catalogIndex.test.ts -- T26 `super`, T34 `redux`, T35 `gre`.
+ *
+ * THERE IS NO FOURTH, AND T25/T27 ARE NOT REACHABLE THIS WAY. MEASURED: neither goes red for any
+ * of the thirteen. Each is covered by TWO guards and neither discriminates, exactly as the
+ * comment on those rows says -- they pin dangerous SHAPES, not this list. Deleting `redux` gives
+ * T20 + R6 + T34; `xt` gives T20 + G1x; `ii` or `touch` gives T20 + R6; and `ti`, `xtx`, `le`
+ * and `d` give T20 ALONE, which is the single-killer set no corpus row can move.
  *
  * T11 AND T12 PROVE SOMETHING NARROWER, AND CITING THEM HERE WOULD BE FALSE COMFORT. MEASURED:
  * deleting ALL THREE admissibility guards from `walkFrom` leaves T11 at 0 failures and T12 at 0

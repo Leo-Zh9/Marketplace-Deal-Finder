@@ -185,11 +185,13 @@ describe("catalog index -- every vocabulary element, one at a time", () => {
   /**
    * T15t. THE ROLE T15 USED TO PLAY, MOVED TO THE LAYER THE GUARD LIVES AT.
    *
-   * `catalogIndex.ts`'s tokenizer comment names T15 in normalizeListing.test.ts as the test that
-   * goes red if `normalize("NFKD")` is moved BEFORE `toLowerCase()`. MEASURED: that stopped being
-   * true the moment `Radeon RX 6800 XT` entered the catalog. Under the mutation T15's title
-   * tokenizes `radeontm` and loses its `radeon` marker -- but `rx 6800 xt` is an OPTIONAL_LEADING
-   * entry point, so the model resolves either way and the whole 220-test suite stayed green.
+   * `catalogIndex.ts`'s tokenizer comment USED TO NAME T15 in normalizeListing.test.ts as the
+   * test that goes red if `normalize("NFKD")` is moved BEFORE `toLowerCase()`; it now names this
+   * one. MEASURED: T15 stopped being that test the moment `Radeon RX 6800 XT` entered the
+   * catalog. Under the mutation T15's title tokenizes `radeontm` and loses its `radeon` marker
+   * -- but `rx 6800 xt` is an OPTIONAL_LEADING entry point, so the model resolves either way and
+   * the title still ends `VALID / matched`. MEASURED ON THIS TREE, with this test skipped: the
+   * mutation kills NOTHING -- 908 passed, 0 failed.
    *
    * THAT IS A CLASS OF DEFECT, NOT ONE INSTANCE: a guard whose only test asserts an END-TO-END
    * outcome can be disarmed by a pure DATA change, with no code touched and nothing going red.
