@@ -34,6 +34,9 @@ ok()   { PASS=$((PASS+1)); printf '  \033[32mPASS\033[0m  %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf '  \033[31mFAIL\033[0m  %s\n     expected: %s\n     actual:   %s\n' "$1" "$2" "$3"; }
 is()   { [ "$2" = "$3" ] && ok "$1" || bad "$1" "$2" "$3"; }
 has()  { case "$3" in *"$2"*) ok "$1";; *) bad "$1" "contains $2" "$3";; esac; }
+# A LOWER bound, never an upper one: a slow or loaded machine only makes it MORE true.
+atleast() { [ "$3" -ge "$2" ] && ok "$1" || bad "$1" ">= $2" "$3"; }
+now_ms() { python3 -c 'import time;print(int(time.time()*1000))'; }
 
 sql()  { npx --no-install wrangler d1 execute marketplace-deal-finder-db --local --command "$1" 2>/dev/null; }
 val()  { sql "$1" | python3 -c "
@@ -145,6 +148,34 @@ echo "== the collector ingest path =="
 ingest_tables() { sql "DELETE FROM listings; DELETE FROM price_observations; DELETE FROM model_stats; DELETE FROM evaluation_tasks;" >/dev/null; }
 ingest_tables
 
+# THE WATCH LIST IS RESET HERE, AND THE RESET IS LOAD-BEARING. THE FIX FOR A RED GATE BELOW IS TO
+# RESTORE THIS RESET, NEVER TO RELAX THE ASSERTION.
+#
+# migrations/0005 seeds TWO targets -- `gpu-toronto` ('gpu', 'graphics card') AND `cpu-toronto`
+# ('cpu', 'cpu') -- plus a market at 43.6532,-79.3832 / 25km. The collector now runs ONE SEARCH
+# PER TARGET from that server-side list, and every collector assertion in this section was
+# written against ONE gpu search into the market 43.5123,-79.8765|18km.
+#
+# Leave the seed in place and two independent things break at once, ~8 assertions going red
+# together in a way that reads like a data bug:
+#
+#   1. BOTH targets parse the SAME committed fixture -- COLLECTOR_HTML_FILE is process-level, not
+#      per-target -- so the `cpu` pass REWRITES the same six (source, listing_id) rows with
+#      component_type='cpu'. Every derived model_key changes with it: normalization resolves a
+#      title against the CPU trie instead of the GPU one, so 'GeForce RTX 5080' stops resolving,
+#      model_stats loses its only row, and the 5080 content assertion, the recorded/skipped
+#      counts and the whole-PC refusal all move.
+#   2. market_key would ALSO change, from 43.5123,-79.8765|18km to 43.6532,-79.3832|25km, which
+#      is the key the seeded control row below is written against -- so the control could not be
+#      seeded at all.
+#
+# So: point the market at the values the merged assertions already use, and keep exactly ONE
+# target. market_key stays 43.5123,-79.8765|18km and all 24 existing collector assertions survive
+# byte-for-byte.
+sql "UPDATE watch_market SET location='toronto', latitude=43.5123, longitude=-79.8765, radius_km=18 WHERE id=1;
+     DELETE FROM watch_targets;
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('e2e-gpu', 'gpu', 'graphics card');" >/dev/null
+
 ING="$BASE/api/listings"
 MINI='{"source":"facebook-marketplace","componentType":"gpu","market":{"latitude":43.5123,"longitude":-79.8765,"radiusKm":18},"listings":[]}'
 ct() { $CURL -s -o /tmp/e2e.body -w '%{http_code}' -X POST -H 'Content-Type: application/json' "$@" -d "$MINI" "$ING" --max-time 15; }
@@ -159,25 +190,45 @@ h=$($CURL -s -D- -o /dev/null -X POST -H 'Content-Type: application/json' -H "X-
 is "  ...and evil is never reflected"          0 "$h"
 is "an empty batch is refused"                 400 "$(ct -H "X-Collector-Token: $COLLECTOR_TOKEN")"
 
+echo "== the watch list the collector reads =="
+# The same three auth rows the ingest route carries, because it is the same credential on the
+# same terms: no browser channel, no Firebase identity, no Origin at all.
+wt() { $CURL -s -o /tmp/e2e.body -w '%{http_code}' "$@" "$BASE/api/watch-targets" --max-time 15; }
+is "the watch list with NO token is refused"   401 "$(wt)"
+is "  ...with a WRONG token too"               401 "$(wt -H 'X-Collector-Token: wrong-but-long-enough-to-be-a-token')"
+is "a valid token from the ALLOWED origin"     403 "$(wt -H "X-Collector-Token: $COLLECTOR_TOKEN" -H "Origin: $ORIGIN")"
+is "the watch-list preflight is refused"       403 "$(pf /api/watch-targets GET)"
+is "a valid token with no Origin reads it"     200 "$(wt -H "X-Collector-Token: $COLLECTOR_TOKEN")"
+has "  ...carrying the seeded target"          '"targetId":"e2e-gpu"' "$(body)"
+has "  ...and the market alongside it"         '"radiusKm":18' "$(body)"
+
 # The real thing: the collector process, against the committed fixture, over HTTP, into D1.
+#
+# COLLECTOR_COMPONENT_TYPE, COLLECTOR_LOCATION, COLLECTOR_QUERY, COLLECTOR_LATITUDE,
+# COLLECTOR_LONGITUDE and COLLECTOR_RADIUS_KM ARE GONE FROM HERE, AND THAT IS THE ASSERTION.
+# Those six values now come from `GET /api/watch-targets`, and the fact that this run still
+# collects the same four listings into the same market_key IS the proof that the collector read
+# its configuration out of D1 over HTTP rather than out of this file.
 COLLECTOR_EXIT=0
-collect() {
-  COLLECTOR_API_BASE="$BASE" \
-  COLLECTOR_TOKEN="$COLLECTOR_TOKEN" \
-  COLLECTOR_COMPONENT_TYPE=gpu \
-  COLLECTOR_LOCATION=toronto \
-  COLLECTOR_QUERY='graphics card' \
-  COLLECTOR_LATITUDE=43.5123 \
-  COLLECTOR_LONGITUDE=-79.8765 \
-  COLLECTOR_RADIUS_KM=18 \
-  COLLECTOR_LIMIT=4 \
-  COLLECTOR_HTML_FILE=collector/testing/fixtures/facebookSearchPage.html \
-  node collector/main.ts >/tmp/e2e-collector.out 2>&1
+run_collector() { # run_collector [EXTRA=VALUE ...]
+  env COLLECTOR_API_BASE="$BASE" \
+      COLLECTOR_TOKEN="$COLLECTOR_TOKEN" \
+      COLLECTOR_LIMIT=4 \
+      COLLECTOR_HTML_FILE=collector/testing/fixtures/facebookSearchPage.html \
+      "$@" \
+      node collector/main.ts >/tmp/e2e-collector.out 2>&1
   COLLECTOR_EXIT=$?
 }
+collect() { run_collector COLLECTOR_TARGET_DELAY_MS=0; }
 
 collect
 is "the collector run exits 0"                 0 "$COLLECTOR_EXIT"
+has "  ...emitting a run line"                 '"kind":"run"' "$(cat /tmp/e2e-collector.out)"
+has "  ...for the ONE server-side target"      '"targets":1,"complete":true,"exitCode":0,"exitCodes":{"0":1}' "$(cat /tmp/e2e-collector.out)"
+has "  ...naming that target"                  '"target":"e2e-gpu"' "$(cat /tmp/e2e-collector.out)"
+# NOT cosmetic: a launchd env file with COLLECTOR_DRY_RUN set reports complete:true, exitCode:0
+# forever while collecting nothing, and this is the one field that distinguishes that state.
+has "  ...and NOT a dry run"                   '"dryRun":false' "$(cat /tmp/e2e-collector.out)"
 has "  ...reporting SUCCESS"                   '"state":"SUCCESS"' "$(cat /tmp/e2e-collector.out)"
 # A total write outage answered 200 with FAILED:n and zero rows before this slice existed.
 has "  ...and ZERO failed listings"            '"FAILED":0' "$(cat /tmp/e2e-collector.out)"
@@ -276,7 +327,99 @@ is "  ...and deleted the control observation"  0 "$(val "SELECT COUNT(*) FROM pr
 # A rule that deleted every observation would pass the line above and fail this one.
 is "  ...leaving the 5080's own observation"   1 "$(val 'SELECT COUNT(*) FROM price_observations')"
 
+echo "== multi-target: a partial failure drops nothing =="
+# FULLY OFFLINE, NO SECOND FIXTURE. `a-bad` carries component_type='gpuu': storable (0005 puts no
+# CHECK on that column, deliberately) and refused LOUDLY by the ingest route as 400
+# INVALID_LISTINGS -> exit 6. It sorts FIRST, so the two good targets run AFTER a failure.
 ingest_tables
+sql "DELETE FROM watch_targets;
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('a-bad', 'gpuu', 'graphics card');
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('b-gpu', 'gpu', 'graphics card');
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('c-gpu', 'gpu', 'graphics card');" >/dev/null
+# THIS BLOCK RUNS AT A REAL, NON-ZERO DELAY, AND THE WALL-TIME ASSERTION BELOW IS WHY.
+#
+# MEASURED HOLE THIS CLOSES: every unit test injects `sleep` and asserts it was CALLED with the
+# right value, which is blind to whether the real one waits; the two throttle rows below assert
+# the REPORTED `delayMs`, not elapsed time; and at a delay of 0 a real `setTimeout(0)` and a
+# `Promise.resolve()` are behaviourally identical. So `collector/main.ts` supplied the one
+# dependency nothing observed: replacing its sleep with `() => Promise.resolve()` left 156 unit
+# tests AND all 79 assertions in this file green with the throttle between searches GONE. That is
+# nine back-to-back searches from the operator's residential IP -- the failure that already blocks
+# Cloudflare and would end the Facebook half of the product.
+#
+# THE NUMBERS, MEASURED ON THIS GATE: the whole 3-target run costs 97 ms of real work (node
+# start-up, the watch-list GET, three fixture parses and three POSTs to 127.0.0.1). Two sleeps at
+# 500 ms put the true floor at ~1,100 ms. The bound asserted is 750 ms, so the mutant would need a
+# 7.7x slowdown to sneak past it and a healthy run has 350 ms of slack below its own floor.
+# IT IS A LOWER BOUND, so load only helps; `setTimeout` guarantees "at least".
+# THE FIX FOR A RED ROW HERE IS TO RESTORE THE SLEEP, NEVER TO LOWER THE BOUND.
+MT_DELAY_MS=500
+MT_FLOOR_MS=750
+MT_T0=$(now_ms)
+run_collector COLLECTOR_TARGET_DELAY_MS=$MT_DELAY_MS
+MT_ELAPSED=$(( $(now_ms) - MT_T0 ))
+is "the multi-target run exits 6"              6 "$COLLECTOR_EXIT"
+is "  ...with one line per target"             3 "$(grep -c '"kind":"target"' /tmp/e2e-collector.out)"
+# THE LOAD-BEARING ASSERTION. One line pins the per-target outcomes, the partial/complete boolean,
+# the fold -- and, by summing to 3, that NO TARGET WAS DROPPED. `targets.filter(parseOk)` would
+# report targets:2, exitCodes:{"0":2}, complete:true and exit 0 while one search silently stopped.
+has "  ...pinning every per-target outcome"    '"targets":3,"complete":false,"exitCode":6,"exitCodes":{"0":2,"6":1}' "$(cat /tmp/e2e-collector.out)"
+# The half the counters cannot say: the two good targets' listings STILL REACHED D1 although the
+# failing target ran FIRST.
+is "  ...and the good targets still wrote"     4 "$(val "SELECT COUNT(*) FROM listings WHERE component_type='gpu'")"
+is "  ...and the bad target wrote nothing"     0 "$(val "SELECT COUNT(*) FROM listings WHERE component_type='gpuu'")"
+has "  ...at the delay it was given"           "\"delayMs\":$MT_DELAY_MS" "$(cat /tmp/e2e-collector.out)"
+# THE MECHANISM, not the reported value: three targets means TWO real sleeps.
+atleast "  ...and REALLY slept between them (${MT_ELAPSED}ms)" "$MT_FLOOR_MS" "$MT_ELAPSED"
+
+echo "== the throttle, pinned in BOTH directions =="
+# Two rows, and neither alone is enough. UNSET must report 60000: with the variable SET to 60000
+# a literal `0` fallback in main.ts would pass. And the 0 row is what catches a TYPO'D VARIABLE
+# NAME -- with the variable unset, COLLECTOR_TARGET_DELAY_MS and COLLECTOR_TARGET_DELY_MS both
+# take the fallback and both emit 60000.
+# THE FIRST ROW'S VARIABLE MUST BE LEFT UNSET. Do not "fix" it to COLLECTOR_TARGET_DELAY_MS=60000.
+# Both run at N = 1, where no sleep happens, so they cost one process each and no wall time.
+sql "DELETE FROM watch_targets;
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('e2e-gpu', 'gpu', 'graphics card');" >/dev/null
+run_collector
+is "an UNSET delay still exits 0"              0 "$COLLECTOR_EXIT"
+has "  ...and falls back to 60000"             '"delayMs":60000' "$(cat /tmp/e2e-collector.out)"
+collect
+is "a delay of 0 still exits 0"                0 "$COLLECTOR_EXIT"
+has "  ...and reports the 0 it was given"      '"delayMs":0' "$(cat /tmp/e2e-collector.out)"
+
+ingest_tables
+
+# THE WATCH LIST IS RESTORED TO THE SHIPPED SEED, AND THAT IS NOT TIDINESS -- IT IS WHAT KEEPS THE
+# RESET AT THE TOP OF THE COLLECTOR SECTION LOAD-BEARING ON EVERY RUN.
+#
+# MEASURED: with the local D1 left holding this file's own one-target list, DELETING the reset at
+# the top changes NOTHING -- the gate passes 79/79 against a database a previous run already
+# conditioned, so the reset silently stops being tested from the second run onward. Restoring the
+# seed here means every run starts from the state a FRESH `wrangler d1 migrations apply` produces,
+# which is the only state the reset exists to survive. With this line present, deleting the reset
+# turns the collector section red.
+sql "DELETE FROM watch_targets;
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('cpu-toronto', 'cpu', 'cpu');
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('gpu-toronto', 'gpu', 'graphics card');
+     UPDATE watch_market SET location='toronto', latitude=43.6532, longitude=-79.3832, radius_km=25 WHERE id=1;" >/dev/null
+# AND THE RESTORE IS ASSERTED, NOT ASSUMED -- which is the same defect one level in. `sql()`
+# discards stderr, this script has no `set -e`, and an unchecked restore that silently failed
+# would leave the gate green while the reset at the top of the collector section quietly stopped
+# being load-bearing all over again.
+#
+# WHAT THE TWO ROWS BELOW COVER, STATED AT THE WIDTH THEY ACTUALLY MEASURE: every column the
+# reset writes -- the target count, the location, both coordinates and the radius. They do NOT
+# cover a restore that writes the right values into the wrong DATABASE, or one that also mutates
+# a table nothing here reads. "Impossible" was the word here before and it was one notch too
+# wide, which is the same defect these rows exist to catch.
+is "the shipped seed is restored"              2 "$(val 'SELECT COUNT(*) FROM watch_targets')"
+# THE COORDINATES ARE IN THIS ASSERTION BECAUSE THEY ARE WHAT market_key IS BUILT FROM. Measured:
+# a PARTIAL restore that dropped only the latitude/longitude clause left both rows green with the
+# coordinates still at this file's own values -- an assertion one notch wider than its
+# measurement, on exactly the two columns the reset exists to control.
+is "  ...and the market with it"               'toronto|43.6532,-79.3832|25' \
+   "$(val "SELECT location || '|' || latitude || ',' || longitude || '|' || radius_km FROM watch_market")"
 
 printf '\n  %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

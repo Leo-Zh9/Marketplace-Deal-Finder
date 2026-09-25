@@ -2,16 +2,22 @@
  * One run: fetch one page, parse it, post at most one batch, exit. Every seam is injected, so
  * every line of logic here is reachable from a test with no network and no filesystem.
  *
- * IT IS A ONE-SHOT PROCESS, NOT A DAEMON. One request to the source, one POST, then it exits.
- * No pagination, no cursor following, no retry of either request, no internal loop -- there is
- * no code path here that can spin. That matters more than usual because this runs on a laptop,
- * where a bad loop is easy to start and hard to notice.
+ * IT IS ONE RUN, NOT THE PROCESS, AND THAT DISTINCTION IS NEW. One request to the source and one
+ * POST -- and this function is now called ONCE PER WATCH TARGET, up to MAX_TARGETS_PER_RUN times,
+ * by collector/runTargets.ts. The process-level claim lives there and nowhere else; a reader
+ * auditing how much this collector asks of the source must read that file, not this one.
+ *
+ * What is unchanged, and is the property that matters: no pagination, no cursor following, no
+ * retry of either request, no internal loop -- there is no code path HERE that can spin, and the
+ * loop above it is bounded by a list length the server returns and the cap refuses. That matters
+ * more than usual because this runs on a laptop, where a bad loop is easy to start and hard to
+ * notice.
  */
 
 import { classifyParsedPage, parseSearchPage } from "./parseSearchPage.ts";
 import { postListings, type IngestSummary, type PostResult } from "./postListings.ts";
 import { buildSearchUrl, SEARCH_HEADERS } from "./searchUrl.ts";
-import type { ProviderReason, ProviderResultState } from "./types.ts";
+import { REQUEST_TIMEOUT_MS, type ProviderReason, type ProviderResultState } from "./types.ts";
 
 export interface CollectorConfig {
   apiBase: string;
@@ -79,8 +85,6 @@ export const EXIT_PROVIDER_FAILURE = 4;
 export const EXIT_TRANSIENT = 5;
 export const EXIT_CONTRACT = 6;
 
-const REQUEST_TIMEOUT_MS = 10_000;
-
 const exitForState = (state: ProviderResultState): number => {
   switch (state) {
     case "SOURCE_EMPTY":
@@ -137,7 +141,23 @@ const fetchLivePage = async (
     return { ok: false, state: "PROVIDER_FAILURE", reason: "http-client-error" };
   }
 
-  return { ok: true, html: await response.text() };
+  // F4. `await response.text()` IS INSIDE A try, AND THAT IS NOT DEFENSIVE PADDING. A connection
+  // reset mid-body is THE ordinary transient failure when scraping over a residential connection:
+  // the status line arrived, so every check above passed, and the socket then died. Outside a try
+  // that rejection leaves `run()` entirely, lands in runAllTargets' belt-and-braces catch and is
+  // recorded as EXIT_CONFIG -- and since 2 TOPS the precedence, ONE FLAKY SOCKET MAKES THE WHOLE
+  // RUN EXIT 2 even when the other eight targets succeeded. The docs define 2 as "nothing
+  // self-heals", so the operator is sent to the wrong runbook by a blip that fixes itself.
+  // UNAVAILABLE / network-error -> exit 5, "the next run is the retry", is what it actually is.
+  let html: string;
+  try {
+    html = await response.text();
+  } catch (error) {
+    const timedOut = error instanceof Error && error.name === "TimeoutError";
+    return { ok: false, state: "UNAVAILABLE", reason: timedOut ? "timeout" : "network-error" };
+  }
+
+  return { ok: true, html };
 };
 
 export const run = async (

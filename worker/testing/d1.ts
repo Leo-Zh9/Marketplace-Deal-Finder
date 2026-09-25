@@ -9,6 +9,7 @@ import schemaSql from "../../migrations/0001_initial_storage.sql?raw";
 import evaluationSql from "../../migrations/0002_evaluation_tasks.sql?raw";
 import searchSql from "../../migrations/0003_search_settings.sql?raw";
 import monitorSql from "../../migrations/0004_monitor.sql?raw";
+import watchTargetsSql from "../../migrations/0005_watch_targets.sql?raw";
 
 /**
  * Strip `--` line comments, split on `;`, trim, drop empties. The schema contains no
@@ -40,10 +41,10 @@ export interface TestDatabase {
  * drift apart. Without 0002 here, every 3D test would run against an evaluation_tasks table
  * with none of the evaluation columns; without 0003, every 3E-a settings test would fail on
  * a missing table; without 0004, every 3E-b monitoring test would fail on a missing
- * monitor_lock.
+ * monitor_lock; without 0005, every watch-list test would fail on a missing watch_targets.
  */
 export const applyMigrations = async (db: D1Database): Promise<void> => {
-  for (const sql of [schemaSql, evaluationSql, searchSql, monitorSql]) {
+  for (const sql of [schemaSql, evaluationSql, searchSql, monitorSql, watchTargetsSql]) {
     await db.batch(splitSqlStatements(sql).map((statement) => db.prepare(statement)));
   }
 };
@@ -68,7 +69,7 @@ export const createTestDatabase = async (): Promise<TestDatabase> => {
 };
 
 /**
- * One batch of DELETEs across all eight tables, for `beforeEach` isolation.
+ * One batch of DELETEs across all ten tables, for `beforeEach` isolation.
  *
  * search_settings BEFORE search_revisions, and that is not style. D1 runs with
  * `PRAGMA foreign_keys = 1`, search_settings.current_revision REFERENCES
@@ -80,6 +81,15 @@ export const createTestDatabase = async (): Promise<TestDatabase> => {
  * -- so a truncate that left the table empty would reintroduce, in every test after the first,
  * exactly the state the seed exists to prevent. The upsert restores the seed even when a test
  * deleted the row on purpose.
+ *
+ * THE TWO WATCH-LIST TABLES ARE DELETED, NOT RESTORED, AND THAT DIFFERS FROM monitor_lock FOR A
+ * REASON. monitor_lock's seed is load-bearing: the documented kill switch is a bare
+ * `UPDATE ... WHERE id = 1`, which against an empty table is a silent no-op. NEITHER watch-list
+ * seed is load-bearing for any test -- no code path degrades quietly when they are absent;
+ * `market: null` and an empty `targets` array are both explicit, tested states (W-4, W-5, L-6).
+ * So they are deleted for ordinary isolation and each test inserts what it needs. The SHIPPED
+ * seed's own correctness is asserted by schema.test.ts S7c, which runs against a database this
+ * function never touches.
  */
 export const truncateAll = async (db: D1Database): Promise<void> => {
   await db.batch([
@@ -90,6 +100,8 @@ export const truncateAll = async (db: D1Database): Promise<void> => {
     db.prepare("DELETE FROM search_settings"),
     db.prepare("DELETE FROM search_revisions"),
     db.prepare("DELETE FROM monitor_runs"),
+    db.prepare("DELETE FROM watch_targets"),
+    db.prepare("DELETE FROM watch_market"),
     db.prepare(
       `INSERT INTO monitor_lock (id, run_id, acquired_at, expires_at) VALUES (1, '', 0, 0)
        ON CONFLICT(id) DO UPDATE SET run_id = '', acquired_at = 0, expires_at = 0`,

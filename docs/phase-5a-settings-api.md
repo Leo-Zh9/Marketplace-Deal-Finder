@@ -61,15 +61,25 @@ self-heals — but that one response lies about the outcome.
 
 Phase 5's documented payload also carries `components`, `models`, `location`, `radiusKm` and
 `dealRule`. `search_revisions` has nowhere to put them and `SearchSettingsInput` does not accept
-them; 3E-a left them out deliberately, because they are collection-side and collection is parked.
+them; 3E-a left them out deliberately, because they are collection-side.
 
 A `PUT` carrying any of them is a **400 `SETTINGS_FIELD_UNSUPPORTED`** listing them. The decisive
 argument is the spec's own copy: *"Could not save settings. Your previous monitoring settings are
 still active."* is exactly true under a 400 and false under a 200 that stored three of eight
 fields. A 400 can be relaxed to a 200 later; the reverse breaks callers.
 
-**Rejected:** mapping `dealRule` (the spec gives no spelling for `MAXIMUM_PRICE` or `BOTH`), and a
-migration `0005` to store the other five (nothing would read them while collection is parked, and
+> **THE RULING STILL STANDS; ITS ORIGINAL REASON HAS GONE STALE, AND SAYING SO MATTERS.**
+> Migration `0005` shipped `watch_market` and `watch_targets`, so "`search_revisions` has nowhere
+> to put them" is **no longer why** `location` and `radiusKm` are refused here. They are refused
+> because **they belong to `watch_market`, not to the revision log** — and that separation is
+> load-bearing, not filing: `search_revisions`' revision number is `evaluateBatch`'s staleness
+> key, so storing the market there would make "I now travel 20 km instead of 25" re-open **every
+> evaluation task in the corpus**. Editing what you hunt must cost zero verdicts. A future writer
+> for those two fields is a route over `watch_market`, never a widening of this one. Without this
+> paragraph the next reader concludes the API is simply missing a feature.
+
+**Rejected:** mapping `dealRule` (the spec gives no spelling for `MAXIMUM_PRICE` or `BOTH`), and
+storing the other five in the revision log (`components` and `models` have no reader yet, and
 `0001`–`0004` are applied in production).
 
 ## Ruling 2 — `GET` with no settings is `200 {"settings": null}`

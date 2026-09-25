@@ -19,7 +19,9 @@ operator's machine and **everything else stays on Cloudflare exactly as built**:
 
 ```
 the operator's Mac (residential IP)        Cloudflare  (UNCHANGED)
-  collector: fetch -> parse  --POST-->  /api/listings -> recordSightings -> aggregate
+  collector: --GET--------------------> /api/watch-targets   (what to hunt, and where)
+             per target: fetch -> parse
+                        --POST--------> /api/listings -> recordSightings -> aggregate
                                         evaluation, monitoring, cleanup, telemetry
 ```
 
@@ -524,9 +526,19 @@ discovered in an aggregate.
 > mean, and `MINIMUM_REFERENCE_COUNT = 5` is the only bar. The route can also still *decrease* a
 > contribution by re-posting a known id, which the e2e exercises as its control.
 >
-> It still reads no settings, no evaluation results, no user identity, and not even the error
-> text of a failed write. **What it can read has grown, and an absolute claim here would be
-> false.** As before, the response tells a caller whether a `(source, listingId)` it guesses
+> **THE TOKEN IS NO LONGER WRITE-ONLY, AND THIS SLICE IS WHAT SPENT THAT.** It now also carries
+> **`GET /api/watch-targets`**, so a leak additionally discloses **what the operator hunts and
+> where**: every `component_type`, every `query` string, and a latitude/longitude to about 11 m.
+> The seed centre is Nathan Phillips Square — a public downtown landmark, chosen so that a leak
+> does not disclose the operator's home — and **the settings UI must preserve that property.**
+> The read is strictly less privileged than the write the same token already bought, and a second
+> secret with its own rotation was judged not worth it for a read of three rows; that is an
+> accepted trade, named here rather than discovered from a leak.
+>
+> It still reads **no evaluation results, no user identity, no deal rules and no notification
+> history**, and not even the error text of a failed write. It still cannot reach
+> `/api/settings` or `/api/auth/session`. **What it can read has grown twice now, and an
+> absolute claim here would be false.** As before, the response tells a caller whether a `(source, listingId)` it guesses
 > already exists, and whether a guess at that row's contents is exact, because `UNCHANGED` is
 > returned only on a content-hash match. **New in this slice: `contributions` now distinguishes
 > `recorded` / `restored` / `removed`, which were structurally unreachable while every row
@@ -534,8 +546,9 @@ discovered in an aggregate.
 > `(source, listingId)` is currently contributing to a benchmark.** The `rowsRead` figures the
 > previous version of this paragraph quoted are not carried over: once a listing contributes, the
 > CHANGED path runs three more statements, and no one has measured what `usage.rowsRead` reports
-> then. It cannot reach `/api/settings` or `/api/auth/session`, and cannot be used from a
-> browser, from any origin.
+> then. It cannot be used from a browser, from any origin — `/api/listings` **and**
+> `/api/watch-targets` both refuse a request carrying any `Origin` at all, and neither is in
+> `ROUTE_METHODS`, so neither advertises a preflight.
 >
 > The mitigation is now the token's secrecy, rotation and `wrangler tail` visibility — not the
 > shape of the route.
@@ -580,45 +593,152 @@ function does not compile, but three casts and a one-word parameter widening all
 
 ---
 
+## The watch list — what to hunt, and where
+
+```jsonc
+GET /api/watch-targets
+X-Collector-Token: <the collector secret>
+
+200
+{"market":{"location":"toronto","latitude":43.6532,"longitude":-79.3832,"radiusKm":25},
+ "targets":[{"targetId":"cpu-toronto","componentType":"cpu","query":"cpu"},
+            {"targetId":"gpu-toronto","componentType":"gpu","query":"graphics card"}]}
+```
+
+`targets` is ordered **by `target_id`**, so the run order is deterministic and testable.
+`market` is **`null`** when the singleton row is absent — a reachable state (someone can `DELETE`
+it), reported explicitly and never defaulted, because a default market would collect into the
+wrong `market_key` silently.
+
+It lives in `watch_market` and `watch_targets` (migration `0005`) and **deliberately not in
+`search_revisions`.** That table is the append-only revision log and its revision number is
+`evaluateBatch`'s staleness key: a bump re-opens **every** evaluation task in the corpus. Adding
+"also watch RAM" says nothing about whether an already-judged GPU was a deal, so editing the
+watch list must cost **zero verdicts**. A separate table makes that structural rather than
+careful.
+
+**`watch_market` is a `CHECK (id = 1)` singleton** — the same idiom, and the same reason, as
+`search_settings` in `0003`. One market per run makes `market_key` constant by construction.
+`radius_km` carries `typeof(radius_km) = 'integer'` alongside its range: SQLite `INTEGER` is
+affinity, not a type, and without that term `12.5` stores as a REAL — the same trap that jammed
+every settings `PUT` once already.
+
+### Its auth is the collector credential, and why
+
+`authenticateRequest` admits exactly two identities: a **loopback-only** development identity and
+a **Firebase ID token on `APPROVED_EMAILS`**. A headless `node collector/main.ts` on the
+operator's Mac reaching a public Worker is **neither**. The collector already holds and rotates
+`COLLECTOR_TOKEN`; reading its own configuration is strictly **less** privileged than the write
+that token already buys; and the two credential systems stay disjoint in both directions.
+
+The route carries the ingest route's rules verbatim: **any `Origin` header at all is a 403**, it
+is **absent from `ROUTE_METHODS`** (so `OPTIONS` never advertises a browser channel), a missing
+`DB` binding is `503 DATABASE_UNAVAILABLE`, and a D1 failure is **`503
+WATCH_TARGETS_STORAGE_FAILED`** — a code of its own, because three different fixes behind one
+code sends an operator to the wrong one. Swallowing that failure and answering an empty list
+would make an outage read as "there is nothing to hunt".
+
+**What a leaked token can now also read:** the component types, the query strings and a lat/long
+to about 11 m. The seed centre is Nathan Phillips Square — a public downtown landmark, chosen so
+a leak does not disclose the operator's home, and **the settings UI must preserve that
+property.**
+
+---
+
 ## Running the collector
 
 ```bash
 COLLECTOR_API_BASE=https://your-worker.workers.dev \
 COLLECTOR_TOKEN=... \
-COLLECTOR_COMPONENT_TYPE=gpu \
-COLLECTOR_LOCATION=toronto \
-COLLECTOR_QUERY='graphics card' \
-COLLECTOR_LATITUDE=43.5123 COLLECTOR_LONGITUDE=-79.8765 COLLECTOR_RADIUS_KM=18 \
 npm run collect
 ```
+
+**The component type, the query, the location, the coordinates and the radius are no longer
+environment variables.** They come from `GET /api/watch-targets`, one search per target, in one
+process.
 
 | variable | required | default |
 |---|---|---|
 | `COLLECTOR_API_BASE` | yes | — |
 | `COLLECTOR_TOKEN` | yes | — |
-| `COLLECTOR_COMPONENT_TYPE` | yes | — |
-| `COLLECTOR_LOCATION` | yes | — a URL path segment, `^[a-z0-9]+(-[a-z0-9]+)*$` |
-| `COLLECTOR_QUERY` | yes | — |
-| `COLLECTOR_LATITUDE` / `COLLECTOR_LONGITUDE` / `COLLECTOR_RADIUS_KM` | yes | — |
 | `COLLECTOR_SOURCE` | no | `facebook-marketplace` |
 | `COLLECTOR_LIMIT` | no | 15 |
 | `COLLECTOR_DAYS_SINCE_LISTED` | no | 7 |
+| `COLLECTOR_TARGET_DELAY_MS` | no | 60000. **Milliseconds BETWEEN targets.** A test-only seam, the same character as `COLLECTOR_HTML_FILE`: **setting it low in production is how the residential IP earns a login wall.** |
 | `COLLECTOR_HTML_FILE` | no | unset means fetch live; a path parses that file instead |
 | `COLLECTOR_DRY_RUN` | no | unset. Any value parses and prints and **never posts** |
 
-**Defaults exist only where a wrong value cannot corrupt data.** `source`, the component type,
-the coordinates and the radius have none: each of them scopes a stored row or an aggregate.
+**Defaults exist only where a wrong value cannot corrupt data.** `source` has none: it scopes
+every stored row.
 
-It prints one line of JSON on stdout and exits.
+### One search per target, and the two guards on the burst
+
+- **`MAX_TARGETS_PER_RUN = 9`, and it REFUSES rather than truncating.** Over the cap **nothing
+  runs**, the run line reports `targets:<the count the server returned>` with an empty
+  `exitCodes`, and the exit code is 2. A cap below the item count applied to an *ordered* list
+  "would starve **the same** sources every run, forever" — `worker/scheduling/collection.ts`
+  already states the rule for `MAX_DRAIN_SOURCES`. It is also what makes the daily request count
+  a known bounded number: `targets × 48`, at most **432/day** at the cap.
+- **60 s between targets**, not before the first and not after the last. **The justification is
+  burst shape and only burst shape:** nine searches back to back is ~nine requests in nine
+  seconds from one residential IP. **It does not change daily volume at all** — volume is
+  `runs/day × targets`, in which the delay does not appear. **What number is actually safe has
+  not been measured and is not invented here**; no request was made to Facebook in choosing it.
+  If a block appears, lengthen the **cadence** (one plist edit), not the delay.
+- **Both requests now time out at 10 s.** Measured before they did: a POST to a socket that
+  accepts and never answers had not settled after 20 s, and a GET ran 12,005 ms. With N targets
+  in one process a hung POST strands the remaining N−1 and a hung GET strands all N.
+
+It prints **one line of JSON per target, as each finishes**, then **one run line**.
+
+```
+{"kind":"target","target":"gpu-toronto","componentType":"gpu","exitCode":0,"state":"SUCCESS",…}
+{"kind":"target","target":"cpu-toronto","componentType":"cpu","exitCode":4,"state":"PROVIDER_FAILURE","reason":"parser-blind",…}
+{"kind":"run","targets":2,"complete":false,"exitCode":4,"exitCodes":{"0":1,"4":1},"delayMs":60000,"dryRun":false}
+```
+
+Per-target lines are printed **as they happen**, so a process killed mid-run still leaves the
+record of everything that completed.
+
+**The run line's fields.** `targets` is **the count the server returned, never the count that
+ran** — an operator whose cap fired needs to know they have 12 targets, not merely that the cap
+is 9. `exitCodes` is the histogram. `complete` is `targets > 0 && every target exited 0`.
+`delayMs` is the throttle actually used. `dryRun` is **not cosmetic**: a launchd environment file
+with `COLLECTOR_DRY_RUN` set reports `complete:true, exitCode:0` **forever while collecting
+nothing**, and it is the one field that distinguishes that state. `error` appears only on a
+whole-run failure.
+
+**The invariant, and it has two clauses:**
+
+> `error !== undefined` ⟹ `exitCodes` is **empty**.
+> `error === undefined` ⟹ `sum(Object.values(exitCodes)) === targets`.
+
+The one-clause form ("the sum always equals `targets`") is **false**: the cap refusal and a null
+market both report `targets:N` with an empty `exitCodes`. Reconciling it by redefining `targets`
+as the count that *ran* is exactly how a silently dropped target starts reporting success.
+
+**Every target in the returned list is attempted and none is ever removed from it.** A target
+that fails validation, or whose `run()` throws, is that target's result at **exit 2** — it is not
+filtered out.
 
 | exit | meaning |
 |---|---|
 | **0** | listings parsed, the POST returned 200, **and the Worker reported zero FAILED** |
-| 2 | a required variable is missing. Nothing was fetched |
+| 2 | a configuration error. Nothing self-heals: a required variable is missing, the watch list is empty or over the cap, the market is absent or unusable, a target row is unusable, or a negative/fractional target delay |
 | 3 | `SOURCE_EMPTY` — nothing posted. Normal on a quiet day; see the alarm note below |
 | 4 | `PROVIDER_FAILURE` — the page changed shape. **A human must look.** Nothing posted |
-| 5 | transient: the source was unavailable or rate-limited, or the POST failed with 5xx or a network error. The next run is the retry |
-| 6 | the POST was refused with a 4xx, or returned 200 while the Worker reported `FAILED > 0` |
+| 5 | transient: the source was unavailable or rate-limited, the watch-list `GET` failed with 5xx/transport/timeout, or the POST failed with 5xx or a network error. The next run is the retry |
+| 6 | the POST was refused with a 4xx, or returned 200 while the Worker reported `FAILED > 0`; or the watch-list `GET` answered 4xx or a 200 of the wrong shape |
+
+**The process exits with the most severe per-target code**, by this precedence:
+
+> **`2 > 6 > 4 > 5 > 3 > 0`**
+
+`2` nothing self-heals; `6` the server refused or partially refused a **write**, so data is at
+risk; `4` the source changed shape — a human must look, but nothing was posted; `5` the next run
+is the retry; `3` normal on a quiet day. **`6 > 4` is a judgement, recorded as one:** both mean
+"a human must look", and the one nearer the data was picked. It is **not** `Math.max`, which
+ranks 6 above 2 and 5 above 4.
 
 **A repeated exit 5 across runs is a persistent server-side failure, not a transient one** —
 measured: a one-listing batch whose only write fails answers 503 and lands on 5, so a *total*
@@ -633,15 +753,148 @@ which needs cross-run state and **is not built**.
 
 ### Schedule
 
-**Every 30 minutes**, matching the monitoring cron. It is a one-shot process, not a daemon: one
-request to the source, one POST, then it exits — no pagination, no cursor following, no retry of
-either request, no internal loop. **A documented schedule is a weaker guard than a mechanism**,
-and it was chosen over a marker file or a lock because that is state on a laptop the operator can
-and will delete. The real exposure of a runaway is **Facebook**, not Cloudflare: 1,440
-requests/day from one residential IP is where a block comes from. D1-side, every write is
-idempotent, so a runaway wastes quota and does not corrupt.
+**Every 30 minutes**, matching the monitoring cron. It is still a one-shot process, not a daemon:
+one `GET` for the watch list, then one request to the source and one POST per target, then it
+exits — no pagination, no cursor following, no retry of any request, one bounded loop whose
+length the cap bounds. **A documented schedule is a weaker guard than a mechanism**, which is why
+`MAX_TARGETS_PER_RUN` is code rather than prose. The real exposure of a runaway is **Facebook**,
+not Cloudflare. D1-side, every write is idempotent, so a runaway wastes quota and does not
+corrupt.
 
-No launchd plist is shipped. Building a daemon is how a laptop loop starts.
+#### The launchd job
+
+`scripts/launchd/com.marketplace-deal-finder.collector.plist.template` and
+`scripts/collector-run.sh` ship as **templates that a human installs**. Nothing in this
+repository writes to `~/Library/LaunchAgents`, and no test runs `launchctl load` or
+`launchctl bootstrap`.
+
+**`StartCalendarInterval`, never `StartInterval`, and the keys are not interchangeable on a Mac
+that sleeps.** `man launchd.plist`: `StartInterval` — "If the system is asleep during the time of
+the next scheduled interval firing, **that interval will be missed** due to shortcomings in
+kqueue(3)"; `StartCalendarInterval` — "**Unlike cron which skips job invocations when the
+computer is asleep, launchd will start the job the next time the computer wakes up.**" So
+`StartCalendarInterval` recovers exactly one run on wake where `StartInterval` silently loses the
+window. **Do not swap the key.**
+
+`RunAtLoad` is `false`: the man page says the key "should be avoided, as speculative job launches
+have an adverse effect on system-boot and user-login scenarios". The install ends with one manual
+`launchctl kickstart`, so there is still immediate confirmation.
+
+**Why a wrapper at all** — three real failures, not tidiness. launchd jobs run with a minimal
+environment and **no `PATH` to a version-managed `node`**; they have **no working directory**, and
+`node collector/main.ts` needs the repo root; and **the token must not be in the plist**, because
+files in `~/Library/LaunchAgents` are world-readable. The wrapper sources
+`~/.marketplace-collector.env` and **refuses to run unless that file exists and its mode is
+exactly 600**.
+
+**What protects that file is its mode and its location, not `.gitignore`.** It lives in `$HOME`,
+where `.gitignore` has no say whatsoever, and `.env.*` never matched `marketplace-collector.env`
+anyway — that pattern needs a leading dot before `env` (measured with `git check-ignore -v`).
+`.gitignore` now names the file explicitly, but **only** to catch a copy dropped inside the repo.
+Do not read that as cover for the real one.
+
+**Install:**
+
+```bash
+# 0. APPLY THE MIGRATION FIRST. The route reads watch_market and watch_targets; against a database
+#    that has not been migrated it answers 503, which the collector maps to retryable -> EXIT 5,
+#    "the next run is the retry" -- FOREVER, every 30 minutes, with the health check above
+#    reporting the failure only because it reads exitCode as well as recency. That is exactly the
+#    laundering collector/watchTargets.ts exists to prevent, one layer up.
+# `--no-install` on every npx, as everywhere else in this repo: without devDependencies present,
+# a bare `npx` SILENTLY DOWNLOADS A DIFFERENT WRANGLER, and this is the one step in the whole
+# install that touches PRODUCTION.
+npm run db:migrate                       # --remote; `npm run db:migrate:local` is the e2e's copy
+npx --no-install wrangler d1 execute marketplace-deal-finder-db --remote \
+  --command "SELECT target_id, component_type, query FROM watch_targets ORDER BY target_id"
+
+# 1. the secrets file, mode 600, never in the repo
+cat > ~/.marketplace-collector.env <<'EOF'
+COLLECTOR_API_BASE=https://your-worker.workers.dev
+COLLECTOR_TOKEN=...
+PATH=/opt/homebrew/bin:/usr/bin:/bin       # a PATH that finds YOUR node
+EOF
+chmod 600 ~/.marketplace-collector.env
+
+# 2. render the template
+# ~/Library/LaunchAgents does not exist by default on macOS. Without this the redirect below
+# fails, and plutil and bootstrap then fail after it -- three cascading failures from one absent
+# directory. `-p` makes it a no-op when it is already there.
+mkdir -p ~/Library/LaunchAgents
+REPO=$(pwd)                              # from the repo root
+sed -e "s|__REPO__|$REPO|g" -e "s|__HOME__|$HOME|g" \
+  scripts/launchd/com.marketplace-deal-finder.collector.plist.template \
+  > ~/Library/LaunchAgents/com.marketplace-deal-finder.collector.plist
+plutil -lint ~/Library/LaunchAgents/com.marketplace-deal-finder.collector.plist
+
+# 3. load it, then fire one run by hand for immediate confirmation
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.marketplace-deal-finder.collector.plist
+launchctl kickstart -p gui/$UID/com.marketplace-deal-finder.collector
+```
+
+**Verify:**
+
+```bash
+# launchd's own view: last exit code, runs, state
+launchctl print gui/$UID/com.marketplace-deal-finder.collector
+
+# RECENCY IS NOT HEALTH. This reads the last run line's CONTENT as well as its age.
+python3 - <<'EOF'
+import calendar, json, re, time, pathlib
+log = pathlib.Path.home() / "Library/Logs/marketplace-collector.log"
+# `if log.exists()` is not defensive padding: between `launchctl bootstrap` and the first run
+# completing there IS no log file, and that is exactly when an operator runs this. Without it the
+# first thing they see is a FileNotFoundError traceback instead of the answer.
+runs = re.findall(r'^(\S+Z) (\{"kind":"run".*\})$',
+                  log.read_text() if log.exists() else "", re.M)
+if not runs:
+    print("UNHEALTHY: no run line yet -- is the job loaded?")
+else:
+    stamp, payload = runs[-1]
+    line = json.loads(payload)
+    # calendar.timegm, NEVER mktime + time.timezone: the wrapper stamps UTC, mktime reads LOCAL,
+    # and time.timezone is the NON-DST offset -- measured, that combination reported a run made
+    # one second ago as "60 minutes ago" under EDT, i.e. permanently UNHEALTHY all summer.
+    age = (time.time() - calendar.timegm(time.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ"))) / 60
+    problems = []
+    if age > 45: problems.append(f"last run was {age:.0f} minutes ago")
+    if line.get("dryRun"): problems.append("COLLECTOR_DRY_RUN is set -- NOTHING IS BEING COLLECTED")
+    if line.get("exitCode") != 0: problems.append(f"exitCode {line['exitCode']}")
+    if not line.get("complete"): problems.append(f"incomplete: {line.get('exitCodes')}")
+    print(("UNHEALTHY: " + "; ".join(problems)) if problems else
+          f"healthy: {line['targets']} targets, all clean, {age:.0f} minutes ago")
+EOF
+```
+
+**RECENCY ALONE IS NOT HEALTH, AND THE SHARP CASE IS THE ONE THIS PAGE NAMES THREE TIMES:** with
+`COLLECTOR_DRY_RUN` set in the environment file, every run emits `complete:true, exitCode:0,
+dryRun:true` on the dot, launchd's own `last exit code` is `0`, and **both shipped signals report
+success while nothing whatsoever is collected.** That is why `dryRun` is on the run line, and a
+check that did not read it would make the field decorative. The same applies to a run that exits
+2 every 30 minutes: perfectly punctual, perfectly useless.
+
+**Healthy is recent AND `complete:true` AND `exitCode:0` AND `dryRun:false`.** On age alone:
+**under 30 min** is the ordinary case, **under about an hour** means one window was skipped, and
+**hours** means the Mac slept or the job is not loaded. Every line in the log is timestamped by
+the wrapper, so **a missed window is a gap in a file** rather than an absence of evidence.
+
+**Sleep, stated rather than solved.** Coverage equals uptime; `StartCalendarInterval` recovers
+one run on wake and coalesces the rest. Deliberately **not** done: `pmset` / `caffeinate` to keep
+the Mac awake (the user's machine, not ours), and a Worker-side "last collection at" endpoint.
+
+**Uninstall:** `launchctl bootout gui/$UID/com.marketplace-deal-finder.collector` and delete the
+plist.
+
+**Expect a one-off aggregate reset if production already holds observations under different
+coordinates.** `market_key` is derived from the market's latitude, longitude and radius, so the
+seeded `43.6532,-79.3832|25km` is a *new* key: existing `model_stats` rows keep their old key,
+fall to `count 0` as their observations are re-recorded under the new one, and are swept by the
+daily cleanup — which `worker/storage/cleanupStaleObservations.ts` already names as a thing it
+exists to mop up ("one dead row per group per location or radius change"). Verdicts for the
+affected models are suspended until each new key reaches `MINIMUM_REFERENCE_COUNT = 5` again.
+**It self-heals and needs no intervention — but the operator will see it, so it is said here
+rather than discovered.** Editing the market to the previously-used coordinates before the first
+run avoids it entirely.
 
 ### Setting and rotating the token
 

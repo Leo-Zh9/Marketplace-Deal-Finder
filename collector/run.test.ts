@@ -2,6 +2,7 @@
 
 import { postListings, type IngestSummary, type PostResult } from "./postListings.ts";
 import { run, type CollectorConfig } from "./run.ts";
+import { REQUEST_TIMEOUT_MS } from "./types.ts";
 import {
   facebookSearchEmpty,
   facebookSearchPage,
@@ -203,6 +204,64 @@ describe("one collector run", () => {
     expect(summary.outcomes).toEqual({ NEW: 2, CHANGED: 0, UNCHANGED: 0, FAILED: 2 });
     // The one line the operator reads must say so too.
     expect(JSON.stringify(summary)).toContain('"FAILED":2');
+  });
+
+  /**
+   * R8: A CONNECTION RESET MID-BODY IS EXIT 5, NOT EXIT 2, AND THE DIFFERENCE IS WHO IS PAGED.
+   *
+   * It is THE ordinary transient failure when scraping over a residential connection: the status
+   * line arrives, every check in `fetchLivePage` passes, and the socket then dies while the body
+   * is being read. With `await response.text()` outside the try that rejection left `run()`
+   * entirely, landed in `runAllTargets`' belt-and-braces catch and was recorded as EXIT_CONFIG --
+   * and since 2 TOPS the precedence, ONE FLAKY SOCKET MADE THE WHOLE RUN EXIT 2 with the other
+   * eight targets green. `2` is documented as "nothing self-heals", so a blip that fixes itself
+   * sent the operator to the wrong runbook with the bare word `terminated`.
+   *
+   * THE ASSERTION IS ON THE EXIT CODE, never on "it does not throw": a throw-assertion would go
+   * green the moment anything upstream caught it, which is exactly how this hid.
+   */
+  it.each<[string, string, string]>([
+    ["a reset", "ECONNRESET", "network-error"],
+    ["a timeout mid-body", "TimeoutError", "timeout"],
+  ])("R8: %s while reading the body is UNAVAILABLE and exit 5, not exit 2", async (_label, name, reason) => {
+    const fetchImplementation = (async () => ({
+      status: 200,
+      headers: new Headers(),
+      text: async () => {
+        const error = new Error("socket hang up");
+        error.name = name;
+        throw error;
+      },
+    })) as unknown as typeof fetch;
+
+    const { exitCode, summary } = await run(
+      { ...config, htmlFile: null },
+      { fetchImplementation },
+    );
+
+    expect(exitCode).toBe(5);
+    expect(exitCode).not.toBe(2);
+    expect(summary.state).toBe("UNAVAILABLE");
+    expect(summary.reason).toBe(reason);
+  });
+
+  it("R8: the shipped request bound is 10 s, and the live fetch uses it by default", async () => {
+    // A PIN, and it is not decoration: nothing else asserts the value, and raising it to
+    // 10_000_000 leaves every other test green while taking the measured hang guard AND the
+    // `20N + 60(N-1)` schedule budget with it. ONE authority, in collector/types.ts.
+    expect(REQUEST_TIMEOUT_MS).toBe(10_000);
+
+    const timeout = vi.spyOn(AbortSignal, "timeout");
+    const fetchImplementation = (async () => ({
+      status: 200,
+      headers: new Headers(),
+      text: async () => facebookSearchEmpty,
+    })) as unknown as typeof fetch;
+
+    await run({ ...config, htmlFile: null }, { fetchImplementation });
+
+    // The DEFAULT is what ships; every other test in this file injects its own.
+    expect(timeout).toHaveBeenCalledWith(REQUEST_TIMEOUT_MS);
   });
 
   it("R6: a clean 200 exits 0 and its printed line says FAILED:0", async () => {

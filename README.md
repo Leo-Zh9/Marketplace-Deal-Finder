@@ -121,10 +121,18 @@ batches to `POST /api/listings`:
 npm run collect     # see docs/collector-ingest.md for the environment it needs
 ```
 
-It is a one-shot process: one request to the source, one POST, then it exits. The route is
-guarded by a Worker secret, `COLLECTOR_TOKEN`, which is a **third** identity and reaches the
-ingest route and nothing else — `docs/collector-ingest.md` states exactly what a leak of it
-would allow. **Until that secret is set, the deployed route answers 503 and the branch is dead.**
+It is a one-shot process, not a daemon — but it is no longer a *single-request* one. It first
+reads its **watch list** from `GET /api/watch-targets` (what to hunt, and the one market saying
+where and how far), then runs **one search per target**, at most `MAX_TARGETS_PER_RUN = 9`, with
+60 s between them: one GET plus up to nine source requests and nine POSTs, then it exits. No
+pagination, no cursor following, no retry of any request.
+
+Both routes are guarded by the same Worker secret, `COLLECTOR_TOKEN`, a **third** identity that
+reaches **`POST /api/listings` and `GET /api/watch-targets`, and nothing else**. A leak therefore
+now discloses the component types, the query strings and a lat/long as well as allowing writes —
+`docs/collector-ingest.md` states exactly what it would allow. **Until that secret is set, the
+deployed routes answer 503 and both branches are dead**, and **`npm run db:migrate` must have run
+before the first collection** or the watch-list read is a permanent 503.
 
 **Before changing the evaluation mode, read the warning in `docs/collector-ingest.md`:** until
 model normalization lands, `MAXIMUM_PRICE` makes the drain mark un-normalized listings — a free
