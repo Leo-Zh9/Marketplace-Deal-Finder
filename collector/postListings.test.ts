@@ -1,7 +1,7 @@
 // @vitest-environment node
 
 import { postListings, type IngestSummary } from "./postListings.ts";
-import type { RawListing } from "./types.ts";
+import { REQUEST_TIMEOUT_MS, type RawListing } from "./types.ts";
 
 const apiBase = "https://api.example.workers.dev";
 const token = "post-suite-collector-token-b71e40d9c5a2";
@@ -160,6 +160,73 @@ describe("posting a batch to the Worker", () => {
     }) as unknown as typeof fetch;
 
     await expect(postListings(input, fake)).resolves.toEqual({
+      ok: false,
+      status: null,
+      code: null,
+      retryable: true,
+    });
+  });
+
+  /**
+   * P-1: THE TIMEOUT, AND IT WAS MEASURED MISSING. A fetch POST to a TCP server that accepts the
+   * connection and never responds HAD NOT SETTLED AFTER 20 s on Node 24 -- only the harness's own
+   * AbortController ended it. With one search per process a hung POST hung one process; with N
+   * targets in ONE process it STRANDS THE REMAINING N-1 and pushes the process past its window.
+   *
+   * TWO ASSERTIONS AND BOTH ARE NEEDED: the `signal` is what would actually be dropped, and the
+   * abort mapping is what makes the drop matter.
+   */
+  it("P-1: the request carries an abort signal", async () => {
+    const calls: RequestInit[] = [];
+    const fake = (async (_url: string, init: RequestInit) => {
+      calls.push(init);
+      return jsonResponse(200, summary);
+    }) as unknown as typeof fetch;
+
+    await postListings(input, fake);
+
+    expect(calls[0].signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("P-1: the default bound is the shipped 10 s, not merely 'some' timeout", async () => {
+    expect(REQUEST_TIMEOUT_MS).toBe(10_000);
+
+    const timeout = vi.spyOn(AbortSignal, "timeout");
+    const fake = (async () => jsonResponse(200, summary)) as unknown as typeof fetch;
+
+    await postListings(input, fake);
+
+    // `run.ts` calls `post(input, fetchImplementation)` with no third argument, so THE DEFAULT IS
+    // WHAT PRODUCTION USES and the injected `timeoutMs: 5` below never reaches it.
+    expect(timeout).toHaveBeenCalledWith(REQUEST_TIMEOUT_MS);
+  });
+
+  it("P-1: an injected AbortError is retryable -- the next run is the retry", async () => {
+    const fake = (async () => {
+      const error = new Error("The operation was aborted");
+      error.name = "AbortError";
+      throw error;
+    }) as unknown as typeof fetch;
+
+    await expect(postListings(input, fake)).resolves.toEqual({
+      ok: false,
+      status: null,
+      code: null,
+      retryable: true,
+    });
+  });
+
+  it("P-1: a real timeout aborts rather than hanging", async () => {
+    const fake = ((_url: string, init: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init.signal?.addEventListener("abort", () => {
+          const error = new Error("timed out");
+          error.name = "TimeoutError";
+          reject(error);
+        });
+      })) as unknown as typeof fetch;
+
+    await expect(postListings(input, fake, 5)).resolves.toEqual({
       ok: false,
       status: null,
       code: null,

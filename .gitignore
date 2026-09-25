@@ -10,4 +10,10 @@ coverage/
 .dev.vars
 .dev.vars.*
 !.dev.vars.example
+# The collector's launchd environment file. It normally lives in $HOME, where .gitignore has no
+# say at all -- these two lines exist ONLY for the case a copy is dropped in the repo, which is
+# what an operator following the install runbook is most likely to do by accident. Note that
+# `.env.*` above does NOT match it: that pattern needs a leading dot before `env`.
+.marketplace-collector.env
+marketplace-collector.env
 *.log

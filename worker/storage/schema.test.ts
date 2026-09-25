@@ -4,6 +4,8 @@ import { createTestDatabase, splitSqlStatements, type TestDatabase } from "../te
 import schemaSql from "../../migrations/0001_initial_storage.sql?raw";
 import evaluationSql from "../../migrations/0002_evaluation_tasks.sql?raw";
 import monitorSql from "../../migrations/0004_monitor.sql?raw";
+import watchSql from "../../migrations/0005_watch_targets.sql?raw";
+import { COMPONENT_TYPES } from "../api/listings";
 
 /**
  * Every CHECK in `sql`, innermost text only, whitespace normalised.
@@ -54,13 +56,14 @@ afterAll(async () => {
 
 // Test 14 -- schema / migration.
 describe("0001_initial_storage.sql", () => {
-  // Test S1. createTestDatabase applies 0001, 0002, 0003 AND 0004, so this asserts what the
-  // four migrations together create and NOTHING ELSE: 0002 is purely additive and creates no
-  // table of its own, 0003 adds exactly the two 3E-a tables, and 0004 adds exactly the two
-  // 3E-b ones. monitor_lock used to be named here as the table that would show up if someone
-  // created it early; it is 3E-b's now, it has a reader (the run lock's ACQUIRE_LOCK and
-  // LOCK_HELD, every run), and a table nobody planned still shows up here and nowhere else.
-  it("creates exactly the eight tables 0001, 0002, 0003 and 0004 define", async () => {
+  // Test S1'. createTestDatabase applies 0001 through 0005, so this asserts what the five
+  // migrations together create and NOTHING ELSE: 0002 is purely additive and creates no
+  // table of its own, 0003 adds exactly the two 3E-a tables, 0004 adds exactly the two
+  // 3E-b ones, and 0005 adds exactly the two watch-list ones. monitor_lock used to be named
+  // here as the table that would show up if someone created it early; it is 3E-b's now, it has
+  // a reader (the run lock's ACQUIRE_LOCK and LOCK_HELD, every run), and a table nobody planned
+  // still shows up here and nowhere else.
+  it("creates exactly the ten tables 0001 through 0005 define", async () => {
     // The filter is required: after the migration sqlite_master also holds D1's internal
     // _cf_METADATA and four sqlite_autoindex_* entries for the composite primary keys.
     const { results } = await database.db
@@ -78,6 +81,8 @@ describe("0001_initial_storage.sql", () => {
       "price_observations",
       "search_revisions",
       "search_settings",
+      "watch_market",
+      "watch_targets",
     ]);
   });
 
@@ -91,7 +96,10 @@ describe("0001_initial_storage.sql", () => {
   // 0004 adds none either, and that is MEASURED rather than assumed: monitor_runs.run_seq is a
   // rowid alias, and its `run_id TEXT UNIQUE` creates sqlite_autoindex_monitor_runs_1, whose
   // `sql IS NULL` -- so it is invisible to this query by the same rule that hides the composite
-  // primary keys. The list below is byte-for-byte the one master returns.
+  // primary keys. 0005 adds none by THE SAME RULE, measured: watch_targets' TEXT PRIMARY KEY
+  // creates sqlite_autoindex_watch_targets_1 whose `sql IS NULL`, and watch_market.id is an
+  // INTEGER rowid alias. THE LIST BELOW NOT CHANGING IS ITSELF THE ASSERTION.
+  // The list below is byte-for-byte the one master returns.
   it("creates exactly the 0001 and 0002 indexes, and no others", async () => {
     const { results } = await database.db
       .prepare("SELECT name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL ORDER BY name")
@@ -359,5 +367,250 @@ describe("0004_monitor.sql", () => {
     // column deliberately carries NO CHECK -- the status set will grow (the spec already names
     // SOURCE_EMPTY) and SQLite cannot add or drop one in place.
     expect(extractChecks(statements.join("\n"))).toEqual(["id = 1"]);
+  });
+});
+
+/**
+ * Phase 3F's additive migration. Same seam, same file-is-the-source-of-truth discipline as the
+ * 0002 and 0004 blocks above.
+ *
+ * TWO DATABASES, AND THE REASON IS `CHECK (id = 1)`. `watch_market` can hold exactly one row, and
+ * 0005 seeds it -- so the behavioural CHECK tests below cannot insert a candidate row into the
+ * seeded database without first destroying the very seed S7c reads. `probe` is a second,
+ * throwaway database whose market row each candidate replaces; `database` keeps the shipped
+ * state, and S7g only ever attempts writes that are REFUSED, so it leaves that state intact.
+ */
+describe("0005_watch_targets.sql", () => {
+  let probe!: TestDatabase;
+
+  beforeAll(async () => {
+    probe = await createTestDatabase();
+  }, 120_000);
+
+  afterAll(async () => {
+    await probe.dispose();
+  });
+
+  /** One candidate at a time: the singleton CHECK means the table can never hold two. */
+  const tryMarket = async (columns: string, values: string) => {
+    await probe.db.prepare("DELETE FROM watch_market").run();
+    return probe.db.prepare(`INSERT INTO watch_market (id, ${columns}) VALUES (1, ${values})`).run();
+  };
+
+  // Test S7a.
+  it("S7a: both tables carry exactly their columns, in order, all NOT NULL", async () => {
+    const marketColumns = await database.db
+      .prepare("SELECT name, `notnull`, pk FROM pragma_table_info('watch_market')")
+      .all<{ name: string; notnull: number; pk: number }>();
+
+    expect(marketColumns.results.map((row) => row.name)).toEqual([
+      "id",
+      "location",
+      "latitude",
+      "longitude",
+      "radius_km",
+    ]);
+    expect(marketColumns.results.every((row) => row.notnull === 1)).toBe(true);
+    expect(marketColumns.results.find((row) => row.name === "id")?.pk).toBe(1);
+
+    const targetColumns = await database.db
+      .prepare("SELECT name, `notnull`, pk FROM pragma_table_info('watch_targets')")
+      .all<{ name: string; notnull: number; pk: number }>();
+
+    expect(targetColumns.results.map((row) => row.name)).toEqual([
+      "target_id",
+      "component_type",
+      "query",
+    ]);
+    // A nullable column here is not cosmetic: `query` NULL reaches `buildSearchUrl` as a
+    // TypeError that run() launders into exit 5, and `component_type` NULL is a 400 at ingest.
+    expect(targetColumns.results.every((row) => row.notnull === 1)).toBe(true);
+    // A TEXT primary key: the label in the operator's only signal (the stdout line) and in the
+    // settings UI. `"target":3` is unreadable.
+    expect(targetColumns.results.find((row) => row.name === "target_id")?.pk).toBe(1);
+  });
+
+  // Test S7b. THE CHECKS, EXHAUSTIVELY -- and, like S2b, this is a PRESENCE pin rather than a
+  // behavioural one. It is what catches a deletion that NO behavioural test would otherwise see;
+  // S7e, S7f and S7g are the behavioural halves, and both halves are needed.
+  it("S7b: declares exactly these eight CHECK constraints, and no others", () => {
+    const checks = extractChecks(splitSqlStatements(watchSql).join("\n"));
+
+    expect(checks).toEqual([
+      "id = 1",
+      "typeof(radius_km) = 'integer' AND radius_km >= 1 AND radius_km <= 25",
+      "latitude >= -90 AND latitude <= 90",
+      "longitude >= -180 AND longitude <= 180",
+      "length(location) > 0 AND location NOT GLOB '*[^a-z0-9-]*'",
+      "length(target_id) > 0",
+      "length(component_type) > 0",
+      "length(query) > 0",
+    ]);
+  });
+
+  /**
+   * Test S7c. THE SHIPPED SEED, VALIDATED RATHER THAN PINNED.
+   *
+   * Validated because `scripts/e2e-local.sh` OVERWRITES the market row and DELETES both targets
+   * before it collects -- THE GATE NEVER EXECUTES AGAINST THE SHIPPED SEED AT ALL -- so literal
+   * pins here would stay green while the shipped rows were unusable. This is the only thing in
+   * the suite that looks at them.
+   *
+   * THE COLLECTOR-SIDE HALF IS `collector/watchTargets.test.ts` C-6, and it is a separate file
+   * because it must be: `tsconfig.worker.json` cannot compile the collector's `.ts`-extension
+   * imports, so `parseMarket` and `parseTarget` are not reachable from here. C-6 reads the same
+   * migration file and runs the real parsers over the real seed values.
+   */
+  it("S7c: the shipped seed is two usable targets and one usable market", async () => {
+    const targets = await database.db
+      .prepare("SELECT target_id, component_type, query FROM watch_targets ORDER BY target_id")
+      .all<{ target_id: string; component_type: string; query: string }>();
+
+    expect(targets.results).toHaveLength(2);
+    for (const row of targets.results) {
+      // Not a literal list: a seeded 'gpuu' is a loud 400 INVALID_LISTINGS at ingest, and
+      // COMPONENT_TYPES is the authority that decides it.
+      expect(Object.hasOwn(COMPONENT_TYPES, row.component_type)).toBe(true);
+      expect(row.target_id.length).toBeGreaterThan(0);
+      expect(row.query.trim().length).toBeGreaterThan(0);
+    }
+
+    const market = await database.db
+      .prepare("SELECT location, latitude, longitude, radius_km, typeof(radius_km) AS radius_type FROM watch_market")
+      .all<{
+        location: string;
+        latitude: number;
+        longitude: number;
+        radius_km: number;
+        radius_type: string;
+      }>();
+
+    expect(market.results).toHaveLength(1);
+    const row = market.results[0];
+    expect(row.radius_type).toBe("integer");
+    expect(Number.isInteger(row.radius_km)).toBe(true);
+    expect(row.radius_km).toBeGreaterThanOrEqual(1);
+    expect(row.radius_km).toBeLessThanOrEqual(25);
+    expect(Math.abs(row.latitude)).toBeLessThanOrEqual(90);
+    expect(Math.abs(row.longitude)).toBeLessThanOrEqual(180);
+  });
+
+  // Test S7d. The FILE, not the applied result: a destructive statement would still leave the
+  // right tables on a FRESH database while destroying the deployed one. 0001-0004 are APPLIED IN
+  // PRODUCTION and SQLite can neither drop a CHECK nor alter a primary key.
+  it("S7d: is two CREATE TABLEs and three seed INSERTs, and nothing destructive", () => {
+    const statements = splitSqlStatements(watchSql);
+
+    expect(statements).toHaveLength(5);
+    expect(statements.filter((statement) => statement.startsWith("CREATE TABLE"))).toHaveLength(2);
+    expect(statements.filter((statement) => statement.startsWith("INSERT INTO"))).toHaveLength(3);
+
+    for (const statement of statements) {
+      expect(statement).not.toMatch(/\b(DROP|ALTER|UPDATE|DELETE)\b/);
+    }
+  });
+
+  /**
+   * Test S7e. THE RADIUS CHECK, BEHAVIOURALLY. S7b alone is a presence pin: deleting the
+   * `typeof(radius_km) = 'integer'` term leaves a range-only check that 12.5, 1.5 and the string
+   * "12.5" ALL PASS, storing as typeof='real' -- MEASURED, and it is the same affinity trap that
+   * jammed every settings PUT with a 60000.5 in search_revisions. These three rows are the ones
+   * that go green-to-red.
+   */
+  it.each<[string, string]>([
+    ["12.5", "12.5"],
+    ["1.5", "1.5"],
+    ['the string "12.5"', "'12.5'"],
+    ["0", "0"],
+    ["26", "26"],
+    ["-3", "-3"],
+    ["'abc'", "'abc'"],
+  ])("S7e: radius_km %s is refused", async (_label, literal) => {
+    await expect(
+      tryMarket("location, latitude, longitude, radius_km", `'toronto', 43.6532, -79.3832, ${literal}`),
+    ).rejects.toThrow(/CHECK constraint failed/);
+  });
+
+  it.each<[string, string]>([
+    ["25.0", "25.0"],
+    ["the string '25'", "'25'"],
+    ["1", "1"],
+    ["25", "25"],
+  ])("S7e: radius_km %s is accepted and stored as an integer", async (_label, literal) => {
+    await tryMarket("location, latitude, longitude, radius_km", `'toronto', 43.6532, -79.3832, ${literal}`);
+
+    const row = await probe.db
+      .prepare("SELECT radius_km AS value, typeof(radius_km) AS kind FROM watch_market")
+      .first<{ value: number; kind: string }>();
+
+    // 25.0 and '25' coerce to the INTEGER 25, so the typeof term costs a legitimate writer
+    // nothing -- which is the whole reason it is affordable.
+    expect(row?.kind).toBe("integer");
+    expect(Number.isInteger(row?.value)).toBe(true);
+  });
+
+  /**
+   * Test S7f. THE LOCATION CHECK, BEHAVIOURALLY. Delete the `NOT GLOB` term and every refused row
+   * below stores -- and '..' then reaches a URL path segment.
+   *
+   * THE INTEGER 25 IS DELIBERATELY NOT A ROW HERE, AND THAT IS A CORRECTION TO A CLAIM THAT IS
+   * EASY TO MAKE AND WRONG. MEASURED: TEXT affinity stores the integer literal 25 as the text
+   * "25", which is all digits, so this GLOB ACCEPTS it -- exactly as it accepts the perfectly
+   * legal location '123'. Only a value carrying a '.' is caught, which is why the REAL literal
+   * 25.0 (stored as "25.0") is the row instead.
+   */
+  it.each<[string, string]>([
+    ["a path separator", "'toronto/search'"],
+    ["a parent segment", "'..'"],
+    ["a traversal", "'../../etc'"],
+    ["upper case", "'TORONTO'"],
+    ["a space", "'to ronto'"],
+    ["a dot", "'a.b'"],
+    ["empty", "''"],
+    ["the REAL 25.0", "25.0"],
+  ])("S7f: the location %s is refused", async (_label, literal) => {
+    await expect(
+      tryMarket("location, latitude, longitude, radius_km", `${literal}, 43.6532, -79.3832, 25`),
+    ).rejects.toThrow(/CHECK constraint failed/);
+  });
+
+  it.each<[string, string]>([
+    ["toronto", "'toronto'"],
+    ["new-york", "'new-york'"],
+  ])("S7f: the location %s is accepted", async (_label, literal) => {
+    await tryMarket("location, latitude, longitude, radius_km", `${literal}, 43.6532, -79.3832, 25`);
+    const row = await probe.db.prepare("SELECT COUNT(*) AS n FROM watch_market").first<{ n: number }>();
+    expect(row?.n).toBe(1);
+  });
+
+  /**
+   * Test S7g. THE SINGLETON, ALL FOUR ROUTES TO A SECOND MARKET.
+   *
+   * THE OMITTED-`id` ROW IS THE ONE THAT MATTERS MOST: `id` is an INTEGER rowid alias, so an
+   * INSERT that leaves it out AUTO-ASSIGNS 2 -- and that is the shape a runbook
+   * `wrangler d1 execute` or a settings-UI writer actually produces. It is where the CHECK stops
+   * something a human would plausibly type.
+   *
+   * Every attempt here is REFUSED, so this test leaves the shipped seed exactly as it found it.
+   */
+  it("S7g: all four routes to a second market are refused, and one row survives", async () => {
+    const attempts: Array<[string, string]> = [
+      ["an explicit id 2", "INSERT INTO watch_market (id, location, latitude, longitude, radius_km) VALUES (2, 'toronto', 43.6532, -79.3832, 25)"],
+      ["an explicit id 0", "INSERT INTO watch_market (id, location, latitude, longitude, radius_km) VALUES (0, 'toronto', 43.6532, -79.3832, 25)"],
+      ["an OMITTED id, which auto-assigns 2", "INSERT INTO watch_market (location, latitude, longitude, radius_km) VALUES ('toronto', 43.6532, -79.3832, 25)"],
+      ["moving the existing row", "UPDATE watch_market SET id = 2 WHERE id = 1"],
+    ];
+
+    for (const [label, statement] of attempts) {
+      await expect(
+        database.db.prepare(statement).run(),
+        `${label} must be refused`,
+      ).rejects.toThrow(/CHECK constraint failed/);
+    }
+
+    const row = await database.db
+      .prepare("SELECT COUNT(*) AS n FROM watch_market")
+      .first<{ n: number }>();
+    expect(row?.n).toBe(1);
   });
 });

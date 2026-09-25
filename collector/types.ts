@@ -71,3 +71,18 @@ export const SPEC_RESULT_LIMIT = 15;
 
 /** One page yields ~24 listings and the collector does not paginate. */
 export const MAX_RESULT_LIMIT = 50;
+
+/**
+ * THE BOUND ON EVERY REQUEST THE COLLECTOR MAKES -- the page fetch, the listings POST and the
+ * watch-list GET -- AND IT LIVES HERE BECAUSE THERE MUST BE EXACTLY ONE OF IT. It was three
+ * literals across three files, which is the "second authority that can drift" postListings.ts's
+ * own comment warns about.
+ *
+ * IT IS LOAD-BEARING TWICE OVER. Measured before any of the three had one: a POST to a socket
+ * that accepts and never answers had not settled after 20 s, and a GET ran 12,005 ms. With N
+ * targets in ONE process a hung POST strands the remaining N-1 and a hung GET strands all N
+ * before one starts. And it is what makes runTargets.ts's schedule budget real rather than
+ * aspirational: worst case per target is 10 s page + 10 s POST = 20 s, so `20N + 60(N-1)` is
+ * 660 s at the cap against an 1,800 s window. RAISING THIS RAISES THAT BUDGET.
+ */
+export const REQUEST_TIMEOUT_MS = 10_000;

@@ -62,7 +62,7 @@ const MAX_SOURCE_LENGTH = 64;
  * component type to worker/storage/types.ts without adding it here a compile error.
  * `Object.hasOwn`, never `key in`, so "toString" and "constructor" are not component types.
  */
-const COMPONENT_TYPES: Record<Listing["componentType"], true> = {
+export const COMPONENT_TYPES: Record<Listing["componentType"], true> = {
   cpu: true,
   cpu_cooler: true,
   motherboard: true,

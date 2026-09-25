@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  A TEMPLATE. NOTHING IN THIS REPOSITORY INSTALLS IT, and no test ever runs `launchctl load` or
+  `launchctl bootstrap`. Replace __REPO__ and __HOME__, copy the result to
+  ~/Library/LaunchAgents/com.marketplace-deal-finder.collector.plist, and bootstrap it by hand.
+  docs/collector-ingest.md carries the four commands.
+
+  StartCalendarInterval, NOT StartInterval, and the keys are NOT interchangeable on a Mac that
+  sleeps. man launchd.plist:
+
+    StartInterval -- "If the system is asleep during the time of the next scheduled interval
+    firing, THAT INTERVAL WILL BE MISSED due to shortcomings in kqueue(3)."
+
+    StartCalendarInterval -- "Unlike cron which skips job invocations when the computer is
+    asleep, LAUNCHD WILL START THE JOB THE NEXT TIME THE COMPUTER WAKES UP. If multiple
+    intervals transpire before the computer is woken, those events will be coalesced into one
+    event upon wake from sleep."
+
+  So StartCalendarInterval recovers exactly one run on wake where StartInterval silently loses
+  the window. DO NOT SWAP THE KEY.
+
+  RunAtLoad is false because the man page says the key "should be avoided, as speculative job
+  launches have an adverse effect on system-boot and user-login scenarios". The install runbook
+  ends with one manual `launchctl kickstart`, so the operator still gets immediate confirmation.
+
+  NO EnvironmentVariables BLOCK, AND THAT IS THE POINT OF THE WRAPPER. Files in
+  ~/Library/LaunchAgents are world-readable; COLLECTOR_TOKEN in this file would be a live secret
+  in one. scripts/collector-run.sh sources it from ~/.marketplace-collector.env and refuses the
+  file unless its mode is 600.
+
+  No ThrottleInterval: the 10 s default floor is irrelevant at 1,800 s.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.marketplace-deal-finder.collector</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__REPO__/scripts/collector-run.sh</string>
+  </array>
+
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Minute</key><integer>30</integer></dict>
+  </array>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/marketplace-collector.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/marketplace-collector.log</string>
+</dict>
+</plist>

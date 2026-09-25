@@ -7,6 +7,7 @@ import {
 import { authorizeCollector, type CollectorEnvironment } from "./auth/collectorToken";
 import { handlePostListings } from "./api/listings";
 import { handleGetSettings, handlePutSettings } from "./api/settings";
+import { handleGetWatchTargets } from "./api/watchTargets";
 import { handleScheduled, type ScheduledEnvironment } from "./scheduling/scheduled";
 
 /**
@@ -86,6 +87,10 @@ const errorMessages: Record<string, string> = {
   INGEST_BATCH_TOO_LARGE: "The request contains too many listings.",
   INVALID_LISTINGS: "The listings in the request are not valid.",
   INGEST_STORAGE_FAILED: "The listings could not be stored.",
+  // Distinct from SETTINGS_STORAGE_FAILED and INGEST_STORAGE_FAILED for the reason the
+  // COLLECTOR_CONFIG_* comment above already gives: three different fixes behind one code sends
+  // an operator to the wrong one.
+  WATCH_TARGETS_STORAGE_FAILED: "The watch list could not be read.",
 };
 
 type ExtraHeaders = Record<string, string>;
@@ -256,6 +261,41 @@ export const handleRequest = async (
     return result.ok
       ? json(result.body, result.status, { Vary: "Origin" })
       : errorResponse(result.code, result.status, { Vary: "Origin" }, result.details);
+  }
+
+  // THE WATCH LIST IS READ ON THE COLLECTOR CREDENTIAL, for the same reason the ingest route is
+  // written on it: `authenticateRequest` admits exactly a loopback-only development identity and
+  // a Firebase ID token on APPROVED_EMAILS, and a headless `node collector/main.ts` on the
+  // operator's Mac reaching a public Worker is NEITHER. Reading its own configuration is
+  // strictly LESS privileged than the write the same token already buys, and it keeps the two
+  // credential systems disjoint in both directions.
+  //
+  // `/api/watch-targets` is ABSENT FROM ROUTE_METHODS for the reason X6c records for
+  // `/api/listings`: that table is the ADVERTISED BROWSER SURFACE and feeds only the OPTIONS
+  // preflight. Adding a row would make `OPTIONS /api/watch-targets` answer 204 advertising
+  // `GET, OPTIONS` -- a real browser channel -- while every existing test stayed green. X-a is
+  // the only guard on that.
+  //
+  // COLLECTOR_TOKEN IS REACHED THROUGH `authorizeCollector(request, environment)` AND NOTHING
+  // ELSE. It lives on `CollectorEnvironment` so that a direct read inside a `WorkerEnvironment`
+  // function does not compile. Do not widen a parameter or cast to reach it.
+  if (request.method === "GET" && url.pathname === "/api/watch-targets") {
+    const authorized = await authorizeCollector(request, environment);
+    if (!authorized.ok) {
+      return errorResponse(authorized.code, authorized.status, { Vary: "Origin" });
+    }
+
+    const db = environment.DB;
+    if (db === undefined) return errorResponse("DATABASE_UNAVAILABLE", 503, { Vary: "Origin" });
+
+    const result = await handleGetWatchTargets(db);
+
+    // `{ Vary: "Origin" }`, NEVER `cors`: `authorizeCollector` refuses a request bearing ANY
+    // Origin, so no watch-list response can ever carry Access-Control-Allow-Origin. X-e pins it
+    // on every outcome.
+    return result.ok
+      ? json(result.body, result.status, { Vary: "Origin" })
+      : errorResponse(result.code, result.status, { Vary: "Origin" });
   }
 
   const authentication = await authenticateRequest(request, environment, dependencies);

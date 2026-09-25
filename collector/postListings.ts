@@ -6,7 +6,7 @@
  * process that lives on a laptop is precisely what turns one bad run into a hot loop.
  */
 
-import type { RawListing } from "./types.ts";
+import { REQUEST_TIMEOUT_MS, type RawListing } from "./types.ts";
 
 /** Mirrors the Worker's `IngestBody`. Counts only; the Worker never sends an error string. */
 export interface IngestSummary {
@@ -60,6 +60,7 @@ const isRetryable = (status: number): boolean => status >= 500;
 export const postListings = async (
   input: PostInput,
   fetchImplementation: typeof fetch = globalThis.fetch,
+  timeoutMs: number = REQUEST_TIMEOUT_MS,
 ): Promise<PostResult> => {
   const body = JSON.stringify({
     source: input.source,
@@ -80,6 +81,7 @@ export const postListings = async (
         "X-Collector-Token": input.token,
       },
       body,
+      signal: AbortSignal.timeout(timeoutMs),
     });
   } catch {
     return { ok: false, status: null, code: null, retryable: true };

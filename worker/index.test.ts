@@ -986,3 +986,242 @@ describe("the ingest route's credential boundary", () => {
     });
   });
 });
+
+/**
+ * THE WATCH-LIST ROUTE'S CREDENTIAL BOUNDARY. `GET /api/watch-targets` admits exactly the same
+ * ONE identity the ingest route does -- the collector secret -- and every other route admits
+ * exactly the two it admitted before.
+ *
+ * X-d IS THE EXISTING X4 TABLE ABOVE, UNCHANGED AND NOT DUPLICATED HERE. X4 is what proves a
+ * collector token still buys nothing on the four Firebase routes; folding the collector check
+ * into `authenticateRequest` -- the one mutation X-b and X-c cannot see, because under it the
+ * new route would still answer correctly -- turns every row of X4 red and nothing else. Do not
+ * delete X4 because `CollectorEnvironment` "makes the leak impossible": it does not.
+ */
+describe("the watch-list route's credential boundary", () => {
+  const collectorToken = "index-suite-watch-token-8b4d20fe61a7";
+  const watchPath = "/api/watch-targets";
+
+  /** Any touch is a failure: the credential check runs before the handler. */
+  const untouchableDb = () =>
+    ({
+      prepare: () => {
+        throw new Error("the database must not be reached");
+      },
+      batch: () => {
+        throw new Error("the database must not be reached");
+      },
+    }) as unknown as D1Database;
+
+  let watchDatabase!: TestDatabase;
+
+  beforeAll(async () => {
+    watchDatabase = await createTestDatabase();
+    await truncateAll(watchDatabase.db);
+    await watchDatabase.db
+      .prepare(
+        "INSERT INTO watch_market (id, location, latitude, longitude, radius_km) VALUES (1, 'toronto', 43.6532, -79.3832, 25)",
+      )
+      .run();
+    await watchDatabase.db
+      .prepare(
+        "INSERT INTO watch_targets (target_id, component_type, query) VALUES ('gpu-toronto', 'gpu', 'graphics card')",
+      )
+      .run();
+  }, 120_000);
+
+  afterAll(async () => {
+    await watchDatabase.dispose();
+  });
+
+  const watchEnvironment = (overrides: Partial<Environment> = {}): Environment =>
+    environment({ COLLECTOR_TOKEN: collectorToken, DB: untouchableDb(), ...overrides });
+
+  const watch = (init: RequestInit = {}, env: Environment = watchEnvironment()) =>
+    handleRequest(new Request(`${workerOrigin}${watchPath}`, init), env, dependencies);
+
+  /**
+   * X-a: MEASURED for `/api/listings` in X6c and true here for the same reason. Adding
+   * `["/api/watch-targets", ["GET"]]` to ROUTE_METHODS leaves every other test in this file
+   * passing while `OPTIONS /api/watch-targets` from the allowed origin answers 204 advertising
+   * `Access-Control-Allow-Methods: GET, OPTIONS` -- a real browser channel invisible to all of
+   * them. The table is the ADVERTISED BROWSER SURFACE and this route has no browser caller.
+   */
+  it("X-a: /api/watch-targets is deliberately absent from the advertised surface", () => {
+    expect(ROUTE_METHODS.has(watchPath)).toBe(false);
+  });
+
+  it("X-b: no token is 401", async () => {
+    const response = await watch();
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "AUTH_TOKEN_MISSING" },
+    });
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
+  });
+
+  it("X-b: a wrong token is 401", async () => {
+    const response = await watch({
+      headers: { "X-Collector-Token": "not-the-collector-token-but-long-enough" },
+    });
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "AUTH_TOKEN_INVALID" },
+    });
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
+  });
+
+  /**
+   * X-b: THE ALLOWED ORIGIN IS THE ROW THAT KILLS THE MUTATION, exactly as X6a is for ingest. An
+   * evil origin is already refused by the pre-existing CORS block, so only this row can see the
+   * branch's own Origin refusal disappear.
+   */
+  it("X-b: even the ALLOWED origin with a VALID token is 403 -- no browser channel at all", async () => {
+    const response = await watch({
+      headers: { Origin: pagesOrigin, "X-Collector-Token": collectorToken },
+    });
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "CORS_ORIGIN_DENIED" },
+    });
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
+  });
+
+  it("X-b: the preflight is refused and advertises nothing", async () => {
+    const response = await handleRequest(
+      new Request(`${workerOrigin}${watchPath}`, {
+        method: "OPTIONS",
+        headers: { Origin: pagesOrigin, "Access-Control-Request-Method": "GET" },
+      }),
+      watchEnvironment(),
+      dependencies,
+    );
+    expect(response.status).toBe(403);
+    expect(response.headers.get("Access-Control-Allow-Methods")).toBeNull();
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
+  });
+
+  /**
+   * X-c: THE X10 MIRROR. An approved Firebase identity is not a collector, and routing this path
+   * through `authenticateRequest` would admit one. The watch list is the operator's search
+   * configuration; widening the advertised browser surface for a caller that does not exist yet
+   * is the thing this project's rules forbid.
+   */
+  it("X-c: an approved Firebase identity gets 401 on the watch-list route", async () => {
+    const response = await watch(
+      { headers: { Authorization: await bearerFor() } },
+      watchEnvironment({ DB: watchDatabase.db }),
+    );
+
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "AUTH_TOKEN_MISSING" },
+    });
+  });
+
+  it("X-c: the loopback development identity does not open it either", async () => {
+    for (const origin of ["http://localhost:8787", "http://127.0.0.1:8787"]) {
+      const response = await handleRequest(
+        new Request(`${origin}${watchPath}`),
+        watchEnvironment({ APP_ENV: "local" }),
+        dependencies,
+      );
+      expect(response.status).toBe(401);
+    }
+  });
+
+  it("X-b: a valid token with no Origin reads the watch list", async () => {
+    const response = await watch(
+      { headers: { "X-Collector-Token": collectorToken } },
+      watchEnvironment({ DB: watchDatabase.db }),
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      market: { location: "toronto", latitude: 43.6532, longitude: -79.3832, radiusKm: 25 },
+      targets: [{ targetId: "gpu-toronto", componentType: "gpu", query: "graphics card" }],
+    });
+  });
+
+  it.each([
+    [
+      "a successful read",
+      200,
+      () =>
+        watch(
+          { headers: { "X-Collector-Token": collectorToken } },
+          watchEnvironment({ DB: watchDatabase.db }),
+        ),
+    ],
+    ["a missing credential", 401, () => watch()],
+    [
+      "an allowed browser origin",
+      403,
+      () => watch({ headers: { Origin: pagesOrigin, "X-Collector-Token": collectorToken } }),
+    ],
+    [
+      "an unconfigured credential",
+      503,
+      () =>
+        watch(
+          { headers: { "X-Collector-Token": collectorToken } },
+          watchEnvironment({ COLLECTOR_TOKEN: undefined }),
+        ),
+    ],
+    [
+      "a missing database binding",
+      503,
+      () =>
+        watch(
+          { headers: { "X-Collector-Token": collectorToken } },
+          watchEnvironment({ DB: undefined }),
+        ),
+    ],
+  ])("X-e: %s carries Vary, every security header and NO CORS header", async (_label, status, send) => {
+    const response = await send();
+
+    expect(response.status).toBe(status);
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
+    expect(response.headers.get("Vary")).toBe("Origin");
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(response.headers.get("Permissions-Policy")).toBe(
+      "camera=(), microphone=(), geolocation=()",
+    );
+    expect(response.headers.get("Referrer-Policy")).toBe("no-referrer");
+    expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff");
+    expect(response.headers.get("X-Frame-Options")).toBe("DENY");
+  });
+
+  /**
+   * The path and the method are matched EXACTLY. The database throws on contact, so a spelling
+   * that reached the handler could not answer 401 -- it would land on a 503 instead.
+   */
+  it.each([
+    ["a trailing slash", "/api/watch-targets/", 401, "AUTH_TOKEN_MISSING"],
+    ["a cased spelling", "/api/Watch-Targets", 401, "AUTH_TOKEN_MISSING"],
+    ["a longer path with the same prefix", "/api/watch-targets-evil", 401, "AUTH_TOKEN_MISSING"],
+    ["an underscore spelling", "/api/watch_targets", 401, "AUTH_TOKEN_MISSING"],
+  ])("X-f: %s is not the watch-list route", async (_label, path, status, code) => {
+    const response = await handleRequest(
+      new Request(`${workerOrigin}${path}`, {
+        headers: { "X-Collector-Token": collectorToken },
+      }),
+      watchEnvironment(),
+      dependencies,
+    );
+
+    expect(response.status).toBe(status);
+    await expect(response.json()).resolves.toMatchObject({ error: { code } });
+  });
+
+  it.each([["POST"], ["PUT"], ["DELETE"], ["PATCH"]])(
+    "X-f: %s /api/watch-targets is not the watch-list route",
+    async (method) => {
+      const response = await watch({
+        method,
+        headers: { "X-Collector-Token": collectorToken },
+      });
+      expect(response.status).toBe(401);
+    },
+  );
+});
