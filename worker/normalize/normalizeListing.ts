@@ -161,7 +161,13 @@ export const SYSTEM_PHRASES = [
  * MEASURED WHEN THEY WERE ADDED, against the 176-name catalog as of PR #14 -- scoped rather
  * than re-numbered, because "0 move" is a before/after ablation that cannot be re-run now: 0 of
  * 176 self-resolutions moved, 0 of 1,408 cross-type pairs leaked, and no live listing changed
- * its stored validity or model key. T11 and T12 carry the invariant forward at 336 and 2,688.
+ * its stored validity or model key.
+ *
+ * WHAT GOES RED IF A TOKEN LEAVES THIS SET, MEASURED ONE AT A TIME: T21c (the per-element sweep,
+ * which carries its own literal copy), a named row in CASES (F1a `laptop`, F1b `notebook`, T9c
+ * `build`, T9d `tower`, R2a `desktop`), and F5b over WHOLE_MACHINES. T11 and T12 do NOT -- they
+ * prove only that no catalog name is shadowed and none is cross-listed, and both stay green with
+ * every guard in catalogIndex.ts deleted.
  *
  * THE ONE COST, NAMED: `laptop` fires on the live `"Timetec 16GB DDR4 3200MHz SODIMM Laptop
  * RAM"`. Under a gpu search that listing was already refused, so nothing stored changes; declared
@@ -382,7 +388,7 @@ const containsAnyPhrase = (values: readonly string[], phrases: readonly string[]
  *
  * THE COST, NAMED, AND IT HAS TWO HALVES. Word order is the only signal available, so any title
  * that LEADS with the retail category is refused -- including one naming a catalogued model:
- *   `"AMD Ryzen 5 5600 Desktop Processor"`         (uncatalogued: no span for the marker to trail)
+ *   `"AMD Ryzen 5 4500 Desktop Processor"`         (uncatalogued: no span for the marker to trail)
  *   `"Desktop Processor Core i9-14900K"`           (CATALOGUED, but the category leads)
  *   `"Desktop Memory Corsair Vengeance 32GB DDR5"` (the same on ram)
  * The second half is inherent rather than incidental: `"Desktop Processor: Core i9-14900K"` is

@@ -592,7 +592,9 @@ const FREE_PHRASINGS: [string, "usable" | "refused"][] = [
  * ITS JOB IS TO MAKE THE RESIDUAL KNOWN, NOT TO FINISH AN OPEN-ENDED LIST. Written cold it found
  * TEN mis-pools in twenty titles. Three were closed by adding `ii`, `touch` and `argb`, each
  * measured free against the 176 names AS OF PR #14, the 15 live titles and every title this
- * suite pins as a match; T11 and T12 carry that forward at 336 and 2,688. Six remain ACCEPTED EXPOSURE, pinned below with the reason each word was refused, and a
+ * suite pins as a match. Removing any one of them today turns THIS test (R6) red, together with
+ * T20's per-element sweep and, for `argb`, G1x -- not T11 or T12, which stay green even with
+ * every guard in catalogIndex.ts deleted. Six remain ACCEPTED EXPOSURE, pinned below with the reason each word was refused, and a
  * seventh -- the year suffix -- was already a standing decision. An unmeasured residual is what
  * `Corsair RM850x 2021` was before anyone looked.
  */
@@ -648,7 +650,7 @@ const SKU_SUFFIX_PHRASINGS: [Listing["componentType"], string, "refused" | "pool
  * rows that POOL are kept deliberately -- a corpus that agreed with the catalog everywhere would
  * be evidence about the catalog, not about the matcher.
  *
- * HONEST SCOPE, SO NOBODY OVERCLAIMS IT: this pins the 28 titles it names, not all 160 added
+ * HONEST SCOPE, SO NOBODY OVERCLAIMS IT: this pins the 30 titles it names, not all 160 added
  * models. Any deletion is still caught by T11's `toHaveLength(336)`; what the corpus adds is
  * that the CONSEQUENCE is named for what it covers. MEASURED: dropping `GeForce RTX 3060 8GB`
  * turns this red. A 160-row corpus would be ballast and was rejected as such.
@@ -688,6 +690,13 @@ const GENERATION_TITLES: [Listing["componentType"], string, string, string][] = 
   ["cpu_cooler", "Arctic Liquid Freezer II 240 A-RGB cpu cooler", "Arctic Liquid Freezer II 240", "POOL ~15%: `a rgb` -- G2 sees only `a`"],
   ["cpu_cooler", "Cooler Master Hyper 212 EVO V2 cpu cooler", "Cooler Master Hyper 212 EVO", "POOL ~15%: `v 2` -- G2 sees only `v`"],
   ["motherboard", "ASRock B550M Pro4 AC motherboard", "ASRock B550M Pro4", "POOL ~15%: `ac` is benign"],
+  // THE TWO POOLS THIS SLICE ITSELF CREATED, by shipping a bare stem. The plan's own rule is
+  // that a bare short name ships with its priced-apart siblings or not at all; these two stems
+  // shipped without the sibling, and the differentiator (`lite`, `performance`) is a benign word
+  // G2 cannot see. Both are at or above the ~20% encode threshold, so they are named here rather
+  // than left to an aggregate -- closing either means shipping the sibling, as X570-E did.
+  ["case", "Fractal Meshify 2 Lite ATX case", "Fractal Meshify 2", "POOL ~25-30%: the Lite is a cheaper steel-panel SKU; `lite` is benign to G2"],
+  ["case", "Lian Li Lancool II Mesh Performance computer case", "Lian Li Lancool II Mesh", "POOL ~20%: the Performance adds fans; `performance` is benign to G2"],
   ["gpu", "Sapphire Radeon RX 6500 XT 8GB graphics card", "Radeon RX 6500 XT", "POOL ~18-20%: the 4GB/8GB split is NOT encoded"],
   ["gpu", "EVGA GeForce RTX 3080 12GB FTW3 graphics card", "GeForce RTX 3080", "POOL ~12%: below the encode threshold, by decision"],
   ["gpu", "NVIDIA GeForce RTX 2060 12GB graphics card", "GeForce RTX 2060", "POOL ~25%: negligible volume, by decision"],
@@ -822,7 +831,7 @@ describe("normalizeListing -- the measured cost and the measured residual", () =
    * matching everything.
    */
   it("G1x: every new-generation seller title lands exactly where the measurement says", () => {
-    expect(GENERATION_TITLES).toHaveLength(28);
+    expect(GENERATION_TITLES).toHaveLength(30);
     for (const [componentType, title, expected, why] of GENERATION_TITLES) {
       const result = normalizeListing({ title, priceCents: 6300, componentType });
       const actual =
@@ -834,7 +843,7 @@ describe("normalizeListing -- the measured cost and the measured residual", () =
       expect(actual, `${title} -- ${why}`).toBe(expected);
     }
     // Not satisfiable by refusing everything, nor by matching everything.
-    expect(GENERATION_TITLES.filter(([, , expected]) => expected !== "no-key")).toHaveLength(20);
+    expect(GENERATION_TITLES.filter(([, , expected]) => expected !== "no-key")).toHaveLength(22);
     expect(GENERATION_TITLES.filter(([, , expected]) => expected === "no-key")).toHaveLength(8);
   });
 

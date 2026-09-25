@@ -44,8 +44,16 @@ export interface Token {
  * `TM`, which the lower-case-only split class below then treats as a separator, so NFKD placed
  * AFTER the lower-casing changes nothing (measured: it kills no test). Put it BEFORE, and the
  * `TM` is lower-cased into the token stream: the live `AMD Radeon™ RX 6800 XT ...` tokenizes
- * `radeontm` instead of `radeon`, loses its gpu marker and drops from `model-unmatched` to
- * `component-unconfirmed`. T15 in normalizeListing.test.ts is the test that goes red for it.
+ * `radeontm` instead of `radeon` and loses its gpu marker.
+ *
+ * T15t IN catalogIndex.test.ts IS THE TEST THAT GOES RED FOR IT, AND THE REASON IT HAD TO MOVE
+ * IS ITSELF THE LESSON. This comment used to name T15 in normalizeListing.test.ts, whose title
+ * IS that live listing. MEASURED: once `Radeon RX 6800 XT` entered the catalog, the mutation
+ * stopped killing anything at all -- `rx 6800 xt` is an OPTIONAL_LEADING entry point, so the
+ * title still resolves and still ends `VALID / matched`. It does NOT drop to
+ * `component-unconfirmed`, which is what this sentence used to claim. A guard whose only test
+ * asserts an END-TO-END outcome can be disarmed by a pure DATA change, with no code touched and
+ * no test going red; T15t asserts the TOKEN STREAM, which is the layer the guard lives at.
  * MEASURED: 0 of the 336 catalog names contain a non-ASCII character, so the catalog side loses
  * nothing either way.
  */
@@ -116,6 +124,22 @@ export const containsPhrase = (values: readonly string[], phrase: string): boole
  * this cannot interact with `core` as a trailing word, which SUFFIX_WORDS below refuses to admit
  * for a separate and still-valid reason.
  *
+ * THE ONE COST `core` ADDS, NAMED RATHER THAN DISCOVERED LATER. MEASURED:
+ * `"MSI PRO Z690-A i7 12700K combo"` under a cpu search is `VALID / Core i7-12700K` -- a
+ * CPU-plus-board bundle entering the chip's own average, in the INFLATING direction. It is a
+ * WIDENING of a hole that already exists rather than a new class: MEASURED on this same tree,
+ * `"ASUS TUF B650-Plus and Ryzen 7 7700X combo"` is already `VALID / Ryzen 7 7700X`, because
+ * `Ryzen` is part of the name a seller types and needs no entry point. `core` extends that
+ * exposure to the 19 Intel names; it does not create it. The bundle IS caught whenever the board
+ * is named with a motherboard marker -- `"i7 12700K and motherboard combo"` is refused by rule 5
+ * as `mixed-components` -- so what leaks is the phrasing that names a board model and no marker.
+ *
+ * THE FIX IS ONE WORD, AND IT IS DELIBERATELY NOT MADE HERE: `combo` as a one-word MULTIPLE
+ * phrase closes both halves at once. MULTIPLE is global across all nine types, so a new entry
+ * needs its own collision sweep against all 336 names, the 15 live titles and all seven corpora
+ * -- which is exactly the cost this slice has already learned that new vocabulary carries. It is
+ * the first thing to try the next time that vocabulary is opened.
+ *
  * `nvidia` AND `amd` ARE MEASURED INERT, AND THEY ARE KEPT ON PURPOSE. MEASURED: 0 of the 336
  * catalog names begin with either word -- every name this set can reach today is `GeForce ...`
  * (43), `Radeon ...` (20), `Intel Arc ...` (5) or `Core ...` (19) -- so neither can produce an
@@ -163,8 +187,21 @@ const OPTIONAL_LEADING = new Set(["geforce", "nvidia", "radeon", "amd", "intel",
  * than discovered. MEASURED AGAINST THE 176-NAME CATALOG AS OF PR #14, and scoped rather than
  * re-numbered because the per-addition ablation behind it cannot be re-run from the repo: every
  * addition beyond the original four left all 176 self-resolutions intact and the 1,408
- * cross-type pairs at 0 leaks. What holds TODAY, and is re-checked on every run, is T11 and T12:
- * 336 self-resolutions and 2,688 cross-type pairs at 0 leaks.
+ * cross-type pairs at 0 leaks.
+ *
+ * WHAT ACTUALLY GOES RED IF AN ENTRY LEAVES THIS LIST -- and it is NOT T11 or T12. MEASURED,
+ * deleting one element at a time: T20 in catalogIndex.test.ts (the per-element sweep, which
+ * carries its own literal copy of this list), R6 over SKU_SUFFIX_PHRASINGS, G1x over
+ * GENERATION_TITLES, and for four of them a named row in CASES (T26 `super`, T34 `redux`,
+ * T35 `gre`, T25/T27 the concatenated forms). Deleting `redux` gives T20 + R6 + T34; deleting
+ * `xt` gives T20 + G1x; deleting `ii` or `touch` gives T20 + R6.
+ *
+ * T11 AND T12 PROVE SOMETHING NARROWER, AND CITING THEM HERE WOULD BE FALSE COMFORT. MEASURED:
+ * deleting ALL THREE admissibility guards from `walkFrom` leaves T11 at 0 failures and T12 at 0
+ * leaks while `"MSI RTX 5070 Ti Super gaming card"` starts resolving to `GeForce RTX 5070 Ti`.
+ * What they do prove is that no catalog name is SHADOWED by another (T11: all 336 self-resolve)
+ * and that none is CROSS-LISTED under a foreign type (T12: 2,688 pairs, 0 leaks). Neither can
+ * see a guard or a vocabulary element disappear.
  */
 const SUFFIX_WORDS = new Set([
   "ti",
@@ -181,8 +218,8 @@ const SUFFIX_WORDS = new Set([
   // SKU_SUFFIX_PHRASINGS in normalizeListing.test.ts, which found 10 mis-pools in 20 real
   // variant titles. Each of these three is a genuine SKU differentiator with no descriptive use
   // this project could name, and each was measured against all 176 catalog names AS OF PR #14,
-  // the 15 live titles and every title the suite pins as a match. T11 and T12 carry the same
-  // property forward to the 336-name catalog on every run.
+  // the 15 live titles and every title the suite pins as a match. What kills their REMOVAL today
+  // is T20, R6 and -- for `argb` -- G1x; see the note above on why T11 and T12 cannot.
   "ii",
   "touch",
   "argb",

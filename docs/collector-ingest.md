@@ -129,13 +129,18 @@ price:
 | `skipped-no-model` | the rule accepted it as the right component and could not name it — a real component the catalog does not list |
 | `skipped-no-price` | **newly reachable in this slice.** A listing that resolved to a catalog model and whose `priceText` did not parse. It was structurally unreachable only while `modelKey` was always null |
 
-**`skipped-no-model` DOES NOT MEASURE CATALOG COVERAGE, and reading it that way undercounts by
-about 3x.** Measured over the 15 live listings from one real GPU search:
-`{skipped-invalid: 13, skipped-no-model: 1, recorded: 1}`. Three real, standalone, working GPUs
-the catalog lacks are in that set, and only one of them (`AMD Radeon™ RX 6800 XT …`) reaches
-`skipped-no-model`. `Gigabyte vision 3060ti (white)` and `Selling My 4070 TI` carry no
-`rtx`/`gtx`/`geforce`/`radeon` token and no catalog match, so the rule declines to guess and they
-land in `component-unconfirmed` → `NEEDS_REVIEW` → `skipped-invalid`.
+**`skipped-no-model` DOES NOT MEASURE CATALOG COVERAGE, and the catalog slice made that sharper
+rather than softer.** Re-measured over the same 15 live listings from one real GPU search, now
+against the 336-name catalog: `{skipped-invalid: 13, recorded: 2}` — **`skipped-no-model` is
+now 0**. It was `{skipped-invalid: 13, skipped-no-model: 1, recorded: 1}` when the catalog held
+176 names, and the single row that used to sit in `skipped-no-model` was `AMD Radeon™ RX 6800
+XT …`, which is now catalogued and recorded.
+
+A counter that reads 0 while real, standalone, uncatalogued GPUs are in the batch is exactly why
+it is not a coverage meter. Two of them are still there: `Gigabyte vision 3060ti (white)` and
+`Selling My 4070 TI` carry no `rtx`/`gtx`/`geforce`/`radeon` token and no catalog match, so the
+rule declines to guess and they land in `component-unconfirmed` → `NEEDS_REVIEW` →
+`skipped-invalid`, never in `skipped-no-model`.
 
 **How the coverage number IS obtained, since no counter is being added for it.** The response
 shape is not this slice's to grow. The number stays obtainable without one, because `validity`,
@@ -338,8 +343,8 @@ North"`, where `pc case` leads and the model follows, which is ordinary case phr
 
 **The named cost has two halves, because word order is the only signal available.** A title that
 LEADS with the retail category is refused whether or not the catalog knows the model:
-`"AMD Ryzen 5 5600 Desktop Processor"` (uncatalogued, so there is no span for the marker to
-trail) and `"Desktop Processor Core i9-14900K"` or `"Desktop Memory Corsair Vengeance 32GB DDR5"`
+`"AMD Ryzen 5 4500 Desktop Processor"` (uncatalogued, so there is no span for the marker to
+trail — the 5600 this example used to name is catalogued now, and T36g asserts that it matches) and `"Desktop Processor Core i9-14900K"` or `"Desktop Memory Corsair Vengeance 32GB DDR5"`
 (catalogued, but the category leads). The second half is inherent: `"Desktop Processor: Core
 i9-14900K"` is token-identical in shape to `"Desktop | Processor: Core i9-14900K"`, which is the
 prebuilt the rule exists to refuse. Lost references, never wrong ones.
@@ -360,7 +365,7 @@ which a marker cannot dissolve by construction.
 **Eight system-only product lines** (`razer blade`, `legion`, `omen`, `victus`, `zephyrus`,
 `xps`, `ideapad`, `pavilion`) are the second detector for a machine whose title names no
 whole-unit word at all, such as `"Razer Blade 16 RTX 5080"`. **Four brand candidates were refused
-on measured collisions:** `aorus` (5 catalog motherboards, and Gigabyte's GPU line), `nitro`
+on measured collisions:** `aorus` (8 catalog motherboards, and Gigabyte's GPU line), `nitro`
 (`Sapphire Nitro+` is a mainstream AMD board-partner GPU line), `predator` (Acer sells Predator
 RAM and NVMe drives) and `katana` (`Scythe Katana` is a mainstream tower CPU cooler) — the last
 of these was **admitted for a round and caught on re-review**, because the corpus guarding these
@@ -702,9 +707,13 @@ an explicitly free one is still `VALID` at `0`. Rows 3 and 4 are the two ways a 
 still comes out of a zero or a low price on no benchmark evidence.
 
 **Leave the evaluation mode on `DISCOUNT` or `BOTH`, not `MAXIMUM_PRICE`.** The instruction
-stands, and rows 3 and 4 are why: the catalog is current-generation only and most real supply is
-older, so a genuine but uncatalogued card under the maximum still reads as a deal on no evidence
-at all, and a free listing reads as the best deal in the database. Alerting is deferred, so today
+stands, and rows 3 and 4 are why — but its original reason no longer holds and is replaced
+rather than repeated. It used to be that the catalog was current-generation only while most real
+supply is older; the catalog now carries 336 names two generations back, so that premise is
+gone. What survives is the part that was never about coverage: an uncatalogued card under the
+maximum still reads as a deal on no evidence at all, and no catalog can be complete — GTX 900,
+RX 500 and Intel 10th gen are deliberately out, and a seller can always name something older or
+rarer. A free listing still reads as the best deal in the database. Alerting is deferred, so today
 a `DEAL` verdict changes a database column and nothing else — but the notification channel is the
 next thing being built, and the free listing is the row PR #6 exists because of.
 

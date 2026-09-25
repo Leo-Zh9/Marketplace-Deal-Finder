@@ -104,7 +104,9 @@ describe("catalog index -- the match and its guards", () => {
     // because the SAME tokenizer builds the index -- both sides break identically and the match
     // survives. What it does kill is the de-duplication in `matchCatalogModels`: this title
     // matches `Radeon RX 7800 XT` twice, once at `radeon` and once at the `rx` entry point. The
-    // NFKD hazard the tokenizer's comment describes is killed by T15, not here.
+    // NFKD hazard the tokenizer's comment describes is killed by T15t below, not here -- and not
+    // by T15 in normalizeListing.test.ts either, which is what this line used to say. Once
+    // `Radeon RX 6800 XT` was catalogued that mutation stopped killing anything end-to-end.
     ["T7b: the trademark sign is noise (kills the hit de-duplication, not the case-folding)", "gpu", "AMD Radeon™ RX 7800 XT graphics card", "Radeon RX 7800 XT"],
   ])("%s", (_name, componentType, title, expected) => {
     expect(match(componentType, title)).toBe(expected);
@@ -300,6 +302,15 @@ describe("catalog index -- exhaustive properties", () => {
    * THE SUFFIX SET IS MIRRORED AS A LITERAL, NOT IMPORTED. This file's own rule (see the
    * vocabulary block above): a test that iterates the production list cannot detect a deletion
    * FROM that list, because the exclusion disappears with the element.
+   *
+   * IT WALKS EVERY TRIE ENTRY POINT, NOT JUST THE FULL NAMES. `buildModelIndex` inserts each
+   * name AND every suffix obtained by dropping leading OPTIONAL_LEADING tokens -- 423 cores for
+   * 336 names. A prefix relation that exists only between two STRIPPED cores pools exactly as
+   * badly as one between two full names, and the full-name-only form could not see it.
+   * MEASURED: over all 423 cores the answer is the same 27 rows it was over the 336 names, so
+   * this ships as a no-op today and closes the gap the first time a stripped core becomes a
+   * prefix of another name. Duplicate labels (a pair visible at both the full and the stripped
+   * depth, as `Core i5-12400 < Core i5-12400F` is) are collapsed.
    */
   it("T47: every unguarded token-prefix pair is one of these 27", () => {
     const SUFFIX_MIRROR = new Set([
@@ -318,22 +329,39 @@ describe("catalog index -- exhaustive properties", () => {
       "argb",
     ]);
 
-    const pairs: string[] = [];
+    // A LITERAL MIRROR OF OPTIONAL_LEADING TOO, for the same reason as SUFFIX_MIRROR: importing
+    // it would make this blind to a deletion from it.
+    const LEADING_MIRROR = new Set(["geforce", "nvidia", "radeon", "amd", "intel", "core"]);
+    // Every core buildModelIndex inserts: the full token sequence, plus each suffix obtained by
+    // dropping leading optional tokens. `< length - 1` mirrors the production loop's guard
+    // against a name that is entirely optional-leading tokens collapsing to an empty core.
+    const cores = (model: string): string[][] => {
+      const sequence = tokenValues(tokenize(model));
+      const out = [sequence];
+      let start = 0;
+      while (start < sequence.length - 1 && LEADING_MIRROR.has(sequence[start])) {
+        start += 1;
+        out.push(sequence.slice(start));
+      }
+      return out;
+    };
+
+    const pairs = new Set<string>();
     for (const componentType of WORKER_TYPES) {
-      const sequences = catalogModels(componentType).map(
-        (model) => [model, tokenValues(tokenize(model))] as const,
+      const sequences = catalogModels(componentType).flatMap(
+        (model) => cores(model).map((tokens) => [model, tokens] as const),
       );
       for (const [shorter, shorterTokens] of sequences) {
         for (const [longer, longerTokens] of sequences) {
           if (shorter === longer || shorterTokens.length >= longerTokens.length) continue;
           if (!shorterTokens.every((value, index) => value === longerTokens[index])) continue;
           if (SUFFIX_MIRROR.has(longerTokens[shorterTokens.length])) continue;
-          pairs.push(`${componentType}: ${shorter} < ${longer}`);
+          pairs.add(`${componentType}: ${shorter} < ${longer}`);
         }
       }
     }
 
-    expect(pairs.sort()).toEqual([
+    expect([...pairs].sort()).toEqual([
       "case: Cooler Master NR200 < Cooler Master NR200P",
       "case: Corsair 4000D < Corsair 4000D Airflow",
       "case: Corsair 5000D < Corsair 5000D Airflow",
@@ -374,6 +402,16 @@ describe("catalog index -- exhaustive properties", () => {
    * `"... mini pc case"`, and `mini pc` is a SYSTEM_PHRASE. That name was drafted, caught here,
    * and is deliberately not in the catalog.
    *
+   * IT AUDITS TWO VOCABULARIES, NOT FOUR, AND THE ARITHMETIC IS WHY. A span straddles only if it
+   * STARTS before the join and ENDS after it, so it must be at least two tokens long. Every
+   * WHOLE_UNIT and MULTI_UNIT entry is a SINGLE token, which makes `from < boundary && to >
+   * boundary` impossible for them by construction -- including them would have been inert
+   * padding that made this test's name claim more than it audits. They are covered instead by
+   * T11: a single token that disqualifies a name fires on the name ALONE, so that name would
+   * fail to self-resolve. MEASURED: of 14 WHOLE_UNIT tokens and 1 MULTI_UNIT token, 0 are
+   * multi-token. What is left is the genuinely reachable class -- 8 of the 25 SYSTEM_PHRASES and
+   * 3 of the 9 MULTIPLE phrases, 11 in all.
+   *
    * ONLY SPANS THAT STRADDLE THE JOIN COUNT, AND THE NARROWING IS THE GUARD RATHER THAN A TEST
    * TRIMMED UNTIL IT WENT GREEN. The obvious formulation -- "name + marker must still resolve to
    * the name" -- FAILS 17 TIMES ON THE UNTOUCHED 176-NAME CATALOG, all of them
@@ -390,13 +428,21 @@ describe("catalog index -- exhaustive properties", () => {
    *
    * ASSERTED BY NAME, NOT BY COUNT, so a straddle that appears is readable without re-deriving.
    */
-  it("T48: no catalog name joined to its own type's marker spells a disqualifying phrase", () => {
+  it("T48: no catalog name joined to its own type's marker spells a multi-token system or multiplicity phrase", () => {
+    // Multi-token entries only: a one-token phrase cannot straddle a boundary. Asserted rather
+    // than assumed, so that a future two-token WHOLE_UNIT/MULTI_UNIT entry re-opens this test
+    // instead of silently sitting outside it.
+    const multiToken = (phrases: readonly string[]): string[] =>
+      phrases.filter((phrase) => tokenize(phrase).length > 1);
+    expect(multiToken([...WHOLE_UNIT])).toEqual([]);
+    expect(multiToken([...MULTI_UNIT])).toEqual([]);
+
     const vocabulary: [string, string][] = [
-      ...SYSTEM_PHRASES.map((phrase) => ["SYSTEM_PHRASES", phrase] as [string, string]),
-      ...MULTIPLE.map((phrase) => ["MULTIPLE", phrase] as [string, string]),
-      ...[...WHOLE_UNIT].map((token) => ["WHOLE_UNIT", token] as [string, string]),
-      ...[...MULTI_UNIT].map((token) => ["MULTI_UNIT", token] as [string, string]),
+      ...multiToken(SYSTEM_PHRASES).map((phrase) => ["SYSTEM_PHRASES", phrase] as [string, string]),
+      ...multiToken(MULTIPLE).map((phrase) => ["MULTIPLE", phrase] as [string, string]),
     ];
+    // Not satisfiable by an empty vocabulary.
+    expect(vocabulary).toHaveLength(11);
 
     const straddles: string[] = [];
     for (const componentType of WORKER_TYPES) {
