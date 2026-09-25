@@ -7,15 +7,23 @@
  *
  * THE BACKEND IS THE AUTHORITY OVER EVERYTHING THAT CAN MOVE MONEY. The wire carries five
  * fields per listing -- listingId, title, priceText, locationText, url -- and nothing else.
- * `priceCents` is computed here from the text; `modelKey`, `variantKey`, `validity` and
- * `observedAt` are set here; `componentType` and `market` come from the envelope and are
+ * `priceCents` is computed here from the text; `modelKey`, `variantKey` and `validity` are
+ * DERIVED here by `normalizeListing` from the title, the price and the declared component type;
+ * `observedAt` is set here; `componentType` and `market` come from the envelope and are
  * validated before use. Unknown keys are REFUSED, not dropped, at both levels, so a field this
  * module does not know about cannot arrive and be ignored.
+ *
+ * NORMALIZATION RUNS HERE, NOT IN THE COLLECTOR, AND THAT IS THE WHOLE SECURITY ARGUMENT. A
+ * leaked `COLLECTOR_TOKEN` can choose a title; it cannot choose a model key. `model_key` is one
+ * of the 176 names in `src/data/catalog.ts` or NULL, and only a title this server's own rule
+ * resolves to that model produces it. L3's `modelKey` case is the guard on that and must not be
+ * tidied away as redundant.
  *
  * `recordSightings` is CALLED, not reimplemented, not wrapped and not defended against. It is
  * the aggregate's only writer and 3C's suite pins it.
  */
 
+import { normalizeListing } from "../normalize/normalizeListing";
 import { recordSightings } from "../storage/recordSightings";
 import type { Listing, Sighting, SightingReport } from "../storage/types";
 import { parsePriceText } from "./priceText";
@@ -348,30 +356,47 @@ export const handlePostListings = async (
     }
 
     // Unparseable is NULL, not a rejection: the listing is real and is stored with a null
-    // price. The count is surfaced by `pricesUnparsed` and by nothing else -- MEASURED that
-    // `skipped-no-price` is structurally unreachable while modelKey is always null, because
-    // `skipReason` tests the model key first.
+    // price. The count is surfaced by `pricesUnparsed` -- and now ALSO, for some listings, by
+    // `skipped-no-price`, which BECAME REACHABLE with this slice: `skipReason` tests validity
+    // and then the model key, so a VALID listing that resolves to a catalog model and whose
+    // `priceText` did not parse lands there. It was structurally unreachable only while
+    // `modelKey` was always null.
     const priceCents = parsePriceText(row.priceText);
     if (priceCents === null) pricesUnparsed += 1;
+
+    // THE ONLY PLACE A MODEL KEY IS EVER PRODUCED. Pure in `(title, priceCents, componentType)`
+    // and identical for every client, which is what makes it testable and what keeps
+    // `contentHash` stable across isolates -- a non-deterministic rule would make every sighting
+    // CHANGED and collapse the write budget.
+    const normalization = normalizeListing({
+      title: row.title,
+      priceCents,
+      componentType: componentType as Listing["componentType"],
+    });
 
     sightings.push({
       listing: {
         listingId: row.listingId,
         componentType: componentType as Listing["componentType"],
-        // HARDCODED. Normalization is the next slice; `recordSightings` reports a null model
-        // key as `skipped-no-model`, which is precisely the signal that says "normalization
-        // has not run yet" and the signal that slice watches go to zero.
-        modelKey: null,
-        variantKey: null,
+        // DERIVED, never accepted from the wire. Null whenever `validity` is not VALID, so
+        // `model_key IS NOT NULL` implies `validity = 'VALID'` as a database-level invariant --
+        // asserted by SQL in scripts/e2e-local.sh. `variantKey` is null for every component type
+        // in this slice: the catalog already encodes the value-affecting axes it covers, and a
+        // title-derived variant key can only FRAGMENT a pool that needs 5 references to produce
+        // an estimate at all.
+        modelKey: normalization.modelKey,
+        variantKey: normalization.variantKey,
         title: row.title,
         priceCents,
         locationText: row.locationText ?? null,
         url: row.url,
         observedAt,
       },
-      // HARDCODED "VALID". A blanket NEEDS_REVIEW would flip every listing to
-      // `skipped-invalid` and MASK `skipped-no-model`.
-      validity: "VALID",
+      // From the same rule as the model key, so a listing the rule REFUSES cannot be stored as
+      // VALID: a whole PC whose title names a real GPU is INVALID_REFERENCE and cannot reach
+      // that GPU's average. `normalization.reason` -- which rule fired -- is deliberately
+      // neither stored nor returned; it exists so a test can tell two rules apart.
+      validity: normalization.validity,
     });
   }
 

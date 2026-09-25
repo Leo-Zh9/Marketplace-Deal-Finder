@@ -1,0 +1,278 @@
+/**
+ * The token layer and the per-component-type model index: everything that turns a title into one
+ * of the 176 names in `src/data/catalog.ts`. The classification rules live next door in
+ * `./normalizeListing.ts`; nothing in this file knows what `validity` is.
+ *
+ * WHY A TOKEN TRIE AND NOT SUBSTRING MATCHING. Lower-cased and stripped of punctuation,
+ * `"4070 Ti"` is a substring of `"GeForce RTX 4070 Ti Super"` and `"RTX 5060"` is a substring of
+ * both `"RTX 5060 Ti 16GB"` and `"RTX 5060 Ti 8GB"` -- so a substring rule pools a 4070 Ti
+ * listing with 4070 Ti SUPER prices. `model_stats` is an UNTRIMMED running mean with no outlier
+ * filter anywhere in the Worker, so one mis-pooled row moves a benchmark and nothing later
+ * dilutes it. A shorter model name must never silently match a longer one, which is what the
+ * three guards in `matchCatalogModels` are for.
+ */
+
+import { componentCatalog } from "../../src/data/catalog";
+import type { ComponentType } from "../../src/types";
+import type { Listing } from "../storage/types";
+
+/**
+ * The tokenizer's hard bound. MEASURED: the longest catalog model is 11 tokens and the longest
+ * of the 15 live titles is 18, so 64 is ~3.5x headroom over anything real; 0 of 176 catalog
+ * names reach it.
+ *
+ * `tokenize` TRUNCATES at this bound -- it does not throw and it does not refuse. A caller that
+ * receives exactly MAX_TOKENS tokens therefore cannot tell a title that fits from one that was
+ * cut, so it must treat the result as INCOMPLETE. `normalizeListing`'s rule 0 is that caller and
+ * it fails closed; see the comment there for why silent truncation was the wrong answer.
+ */
+export const MAX_TOKENS = 64;
+
+/** `endsRun` is true when this piece is the last one of its original alphanumeric run. */
+export interface Token {
+  value: string;
+  endsRun: boolean;
+}
+
+/**
+ * Lower-case, split on every non-alphanumeric character, then split each surviving run at its
+ * letter/digit boundaries -- so `"rtx5080"`, `"RTX 5080"` and `"RTX-5080"` all tokenize alike,
+ * which is what makes the concatenated aliases in real titles match the spaced catalog names.
+ *
+ * NO `normalize("NFKD")`, DELIBERATELY, AND THE ORDER IS THE WHOLE POINT. MEASURED:
+ * `"RTX™".toLowerCase().normalize("NFKD")` is `"rtxTM"` -- U+2122 decomposes to an UPPER-CASE
+ * `TM`, which the lower-case-only split class below then treats as a separator, so NFKD placed
+ * AFTER the lower-casing changes nothing (measured: it kills no test). Put it BEFORE, and the
+ * `TM` is lower-cased into the token stream: the live `AMD Radeon™ RX 6800 XT ...` tokenizes
+ * `radeontm` instead of `radeon`, loses its gpu marker and drops from `model-unmatched` to
+ * `component-unconfirmed`. T15 in normalizeListing.test.ts is the test that goes red for it.
+ * MEASURED: 0 of the 176 catalog names contain a non-ASCII character, so the catalog side loses
+ * nothing either way.
+ */
+export const tokenize = (text: string): Token[] => {
+  const tokens: Token[] = [];
+  for (const run of text.toLowerCase().split(/[^a-z0-9]+/)) {
+    if (run === "") continue;
+    const pieces = run.match(/[a-z]+|[0-9]+/g) ?? [];
+    for (let index = 0; index < pieces.length; index += 1) {
+      if (tokens.length === MAX_TOKENS) return tokens;
+      tokens.push({ value: pieces[index], endsRun: index === pieces.length - 1 });
+    }
+  }
+  return tokens;
+};
+
+export const tokenValues = (tokens: readonly Token[]): string[] =>
+  tokens.map((token) => token.value);
+
+/**
+ * WHERE a phrase matched, not merely whether. The marker-coverage neutralisation in
+ * `normalizeListing` needs the positions: `"PC case"` under a `case` search is the declared
+ * component, and only knowing that the `case` marker COVERS position 0 distinguishes it from
+ * `"RTX 5070 PC"`. A boolean cannot.
+ */
+export const phraseSpans = (
+  values: readonly string[],
+  phrase: readonly string[],
+): [number, number][] => {
+  const spans: [number, number][] = [];
+  if (phrase.length === 0) return spans;
+  for (let start = 0; start + phrase.length <= values.length; start += 1) {
+    let matched = true;
+    for (let offset = 0; offset < phrase.length; offset += 1) {
+      if (values[start + offset] !== phrase[offset]) {
+        matched = false;
+        break;
+      }
+    }
+    if (matched) spans.push([start, start + phrase.length]);
+  }
+  return spans;
+};
+
+/**
+ * A vocabulary phrase is tokenized with the SAME tokenizer as the title, so spacing and
+ * punctuation inside a phrase carry no meaning: `"i 9"`, `"i9"` and `"i-9"` are one phrase.
+ */
+export const containsPhrase = (values: readonly string[], phrase: string): boolean =>
+  phraseSpans(values, tokenValues(tokenize(phrase))).length > 0;
+
+/**
+ * Vendor prefixes a seller drops freely: `"RTX 5080"` is the same card as `"GeForce RTX 5080"`.
+ * Each one is inserted as an alternative ENTRY POINT, never removed from the model name itself.
+ *
+ * SERIES TOKENS (`rtx`, `rx`, `gtx`, `arc`) ARE DELIBERATELY NOT HERE. Dropping them would put a
+ * bare `5080` in the trie, and Dell ships an OptiPlex 5080; the live data already contains that
+ * hazard shape (`Lenovo ThinkCentre M70q`). The named cost: a title naming a card without its
+ * series word (`"Selling my 4070 Super"`) is a MISS, and a miss is safe.
+ */
+const OPTIONAL_LEADING = new Set(["geforce", "nvidia", "radeon", "amd", "intel"]);
+
+/**
+ * Tokens that turn an otherwise-complete model name into a DIFFERENT vendor SKU. G2 refuses a
+ * match followed by one of these, so `"RTX 5070 Ti Super"` does not pool into `RTX 5070 Ti`.
+ *
+ * AN OPEN-ENDED BLOCKLIST, NOT A CLOSED ONE. It closed five real mis-pools found under review
+ * (`NH-U12S redux`, `NH-D15 chromax`, `RX 9070 GRE`, `RTX 5090 D`, `H7 Flow RGB`), and
+ * `"Corsair RM850x 2021"` -> `Corsair RM850x` still stands: year-suffixed revisions are an
+ * unbounded class and enumerating years would prove the list open-ended rather than close it.
+ * That residual is PINNED by T36 in normalizeListing.test.ts so the next one is visible rather
+ * than discovered. MEASURED: every addition beyond the original four leaves all 176
+ * self-resolutions intact and the 1,408 cross-type pairs at 0 leaks.
+ */
+const SUFFIX_WORDS = new Set([
+  "ti",
+  "super",
+  "xt",
+  "xtx",
+  "gre",
+  "redux",
+  "le",
+  "chromax",
+  "rgb",
+  "d",
+]);
+
+/** A prefix trie node; the exported index is its root. */
+export interface ModelIndex {
+  children: Map<string, ModelIndex>;
+  /** The catalog name that ENDS here, or null when this node is only a prefix. */
+  model: string | null;
+}
+
+/**
+ * Insert each model's full token sequence plus every suffix obtained by dropping leading
+ * OPTIONAL_LEADING tokens. MEASURED: 176 models produce 199 cores, and 0 of them begin with a
+ * pure-digit token.
+ *
+ * First insert wins on a collision. MEASURED: no catalog name is shadowed -- T11 resolves all
+ * 176 to themselves.
+ */
+export const buildModelIndex = (models: readonly string[]): ModelIndex => {
+  const root: ModelIndex = { children: new Map(), model: null };
+  const insert = (sequence: readonly string[], model: string): void => {
+    let node = root;
+    for (const value of sequence) {
+      let next = node.children.get(value);
+      if (next === undefined) {
+        next = { children: new Map(), model: null };
+        node.children.set(value, next);
+      }
+      node = next;
+    }
+    if (node.model === null) node.model = model;
+  };
+
+  for (const model of models) {
+    const sequence = tokenValues(tokenize(model));
+    insert(sequence, model);
+    // `< length - 1`: a model whose name is ENTIRELY optional-leading tokens never becomes an
+    // empty core, which would make the root itself terminal and match every title.
+    let start = 0;
+    while (start < sequence.length - 1 && OPTIONAL_LEADING.has(sequence[start])) {
+      start += 1;
+      insert(sequence.slice(start), model);
+    }
+  }
+  return root;
+};
+
+/**
+ * One greedy walk from `start`, and the three guards that decide whether it is admissible.
+ *
+ * W  -- take the DEEPEST complete name reached, not the first. Without it `"Corsair RM850x
+ *       Shift"` stops at `Corsair RM850x`, i.e. a different, cheaper product.
+ * G1 -- the walk must not continue PAST the last complete name. `"Noctua NH-D15 G3"` walks one
+ *       token beyond `NH-D15`, so the title is more specific than anything the catalog holds and
+ *       the honest answer is no match.
+ * B2 -- the last matched token must END its character run. Without it `"Ryzen 7 7700X3D"` ends
+ *       mid-run on the `7700x` of `7700x3d` and pools an X3D chip into the non-X3D model.
+ * G2 -- the token AFTER the match must not be a vendor SKU suffix. See SUFFIX_WORDS.
+ */
+const walkFrom = (index: ModelIndex, tokens: readonly Token[], start: number): string | null => {
+  let node = index;
+  let depth = 0;
+  let terminalDepth = -1;
+  let terminalModel: string | null = null;
+
+  while (start + depth < tokens.length) {
+    const next = node.children.get(tokens[start + depth].value);
+    if (next === undefined) break;
+    node = next;
+    depth += 1;
+    if (node.model !== null) {
+      terminalDepth = depth;
+      terminalModel = node.model;
+    }
+  }
+
+  if (terminalModel === null) return null;
+  if (terminalDepth < depth) return null;
+  if (!tokens[start + terminalDepth - 1].endsRun) return null;
+  const after = tokens[start + terminalDepth];
+  if (after !== undefined && SUFFIX_WORDS.has(after.value)) return null;
+  return terminalModel;
+};
+
+/**
+ * Every DISTINCT catalog model the title names, in the order their matches start.
+ *
+ * A start-of-run guard and a span-containment filter were both written, MEASURED and DELETED
+ * rather than shipped untestable: 0 of the 199 cores begin with a digit token, and the greedy
+ * walk never yields two nested spans holding DIFFERENT models. Do not re-add either without a
+ * test that can go red.
+ */
+export const matchCatalogModels = (index: ModelIndex, tokens: readonly Token[]): string[] => {
+  const found = new Set<string>();
+  for (let start = 0; start < tokens.length; start += 1) {
+    const model = walkFrom(index, tokens, start);
+    if (model !== null) found.add(model);
+  }
+  return [...found];
+};
+
+/**
+ * THE NAMED TRAP: the Worker calls it `case_fan` (worker/storage/types.ts) and the catalog calls
+ * it `case_fans` (src/types.ts). Every other id is spelled the same on both sides.
+ *
+ * The `Record<Listing["componentType"], ...>` type makes adding a WORKER component type without
+ * a mapping a compile error, exactly as `COMPONENT_TYPES` in worker/api/listings.ts already does.
+ * THE REVERSE IS NOT CAUGHT: a new CATALOG id compiles fine and simply goes unused here.
+ */
+export const CATALOG_COMPONENT_ID: Record<Listing["componentType"], ComponentType> = {
+  cpu: "cpu",
+  cpu_cooler: "cpu_cooler",
+  motherboard: "motherboard",
+  ram: "ram",
+  storage: "storage",
+  gpu: "gpu",
+  psu: "psu",
+  case: "case",
+  case_fan: "case_fans",
+};
+
+const catalogModels = (id: ComponentType): readonly string[] => {
+  const definition = componentCatalog.find((entry) => entry.id === id);
+  // THROWS AT MODULE LOAD rather than falling back to an empty index. An empty index answers
+  // "no model" for every title of that type -- indistinguishable from a real miss, and it would
+  // disable a whole component type silently.
+  if (definition === undefined) {
+    throw new Error(`catalogIndex: src/data/catalog.ts has no component "${id}"`);
+  }
+  return definition.models;
+};
+
+/**
+ * Built ONCE at module load, not per request. MEASURED: 0.110 ms for all nine types.
+ */
+export const MODEL_INDEXES: Record<Listing["componentType"], ModelIndex> = (() => {
+  const entries = Object.entries(CATALOG_COMPONENT_ID) as [
+    Listing["componentType"],
+    ComponentType,
+  ][];
+  const indexes = {} as Record<Listing["componentType"], ModelIndex>;
+  for (const [workerType, catalogId] of entries) {
+    indexes[workerType] = buildModelIndex(catalogModels(catalogId));
+  }
+  return indexes;
+})();

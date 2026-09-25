@@ -60,8 +60,8 @@ until it aged off. An empty string is still refused: the parser emits `null`, ne
 | `locationText` | the wire, validated, **nullable** |
 | `componentType` | the envelope, checked against an exhaustive set with `Object.hasOwn` |
 | `priceCents` | **the server**, from `priceText` (see the grammar below), which is **nullable** |
-| `modelKey`, `variantKey` | **the server**, hardcoded `null` |
-| `validity` | **the server**, hardcoded `"VALID"` |
+| `modelKey`, `variantKey` | **the server**, derived from the title against `src/data/catalog.ts` (`variantKey` is `null` for every component type in this slice) |
+| `validity` | **the server**, from the same rule |
 | `observedAt` | **the server**, from the request clock |
 
 There is no field on this wire for `priceCents`, `modelKey`, `variantKey`, `validity` or
@@ -86,11 +86,16 @@ unvalidated `0.4` would reject the whole call as a 503 instead of a 400.
 ```json
 { "received": 4, "stored": 4,
   "outcomes":      { "NEW": 4, "CHANGED": 0, "UNCHANGED": 0, "FAILED": 0 },
-  "contributions": { "recorded": 0, "restored": 0, "removed": 0, "none": 0,
-                     "skipped-no-price": 0, "skipped-no-model": 4, "skipped-invalid": 0 },
+  "contributions": { "recorded": 1, "restored": 0, "removed": 0, "none": 0,
+                     "skipped-no-price": 0, "skipped-no-model": 1, "skipped-invalid": 2 },
   "pricesUnparsed": 0,
-  "usage": { "rowsRead": 8, "rowsWritten": 12 } }
+  "usage": { "rowsRead": 3, "rowsWritten": 33 } }
 ```
+
+Copied from a real `npm run e2e:local` run over the committed four-listing fixture, not composed
+by hand. One of those four is a standalone catalog GPU at a positive price; the others are a
+trade-only ad, a whole gaming PC whose title names a real GPU, and a GTX 1080 Ti the catalog does
+not list.
 
 Every key is always present, at 0 when it did not happen. `received` counts what was sent and
 `stored` counts what `recordSightings` returned, so its last-wins de-duplication of a repeated
@@ -100,10 +105,52 @@ Every key is always present, at 0 when it did not happen. `received` counts what
 listing id for `wrangler tail`; a caller holding only a bearer secret must not learn the schema
 from a failure.
 
-**`skipped-no-model` is the signal to watch.** While `modelKey` is hardcoded null, every
-non-contributing listing reports it — `skipped-no-price` is structurally unreachable, because
-`recordSightings` tests the model key first. When normalization lands, `skipped-no-model` going
-to zero is how you will know it works.
+**What each contribution key means now that normalization runs.** `recordSightings` reports
+exactly one per stored listing, and it tests `validity` first, then the model key, then the
+price:
+
+| key | means |
+|---|---|
+| `recorded` / `restored` | the listing entered the benchmark; `restored` means its observation had been deleted and was recreated |
+| `removed` | it used to contribute and no longer does — a re-sighting whose model key, market or price changed, or whose validity stopped being `VALID` |
+| `none` | `UNCHANGED`: nothing about it moved |
+| `skipped-invalid` | the rule refused it: wrong component, whole system, trade-only, for parts, a wanted ad, an unknown quantity, an ambiguous `CA$0`, or a title at the token cap |
+| `skipped-no-model` | the rule accepted it as the right component and could not name it — a real component the catalog does not list |
+| `skipped-no-price` | **newly reachable in this slice.** A listing that resolved to a catalog model and whose `priceText` did not parse. It was structurally unreachable only while `modelKey` was always null |
+
+**`skipped-no-model` DOES NOT MEASURE CATALOG COVERAGE, and reading it that way undercounts by
+about 3x.** Measured over the 15 live listings from one real GPU search:
+`{skipped-invalid: 13, skipped-no-model: 1, recorded: 1}`. Three real, standalone, working GPUs
+the catalog lacks are in that set, and only one of them (`AMD Radeon™ RX 6800 XT …`) reaches
+`skipped-no-model`. `Gigabyte vision 3060ti (white)` and `Selling My 4070 TI` carry no
+`rtx`/`gtx`/`geforce`/`radeon` token and no catalog match, so the rule declines to guess and they
+land in `component-unconfirmed` → `NEEDS_REVIEW` → `skipped-invalid`.
+
+**How the coverage number IS obtained, since no counter is being added for it.** The response
+shape is not this slice's to grow. The number stays obtainable without one, because `validity`,
+`title`, `price_cents` and `component_type` are all stored columns on `listings`:
+
+```sql
+-- lower bound: listings the rule accepted as the right component but could not identify
+SELECT COUNT(*) FROM listings WHERE validity = 'VALID' AND model_key IS NULL;
+
+-- upper bound: everything the rule declined but did not reject outright
+-- (component-unconfirmed + unknown-quantity + ambiguous-zero-price + title-too-long, which SQL
+--  cannot separate because the rule's `reason` is deliberately not stored)
+SELECT COUNT(*) FROM listings WHERE validity = 'NEEDS_REVIEW';
+```
+
+**Neither single query is the number.** The exact figure needs the reason, and the reason is
+recomputable rather than stored: `normalizeListing` is a pure function of `(title, priceCents,
+componentType)` and all three are columns, so
+
+```sql
+SELECT title, price_cents, component_type FROM listings WHERE validity <> 'INVALID_REFERENCE';
+```
+
+replayed through that function offline yields the per-reason breakdown exactly. That is a read
+plus a script, not a production code change, and it is the instrument whoever answers the catalog
+question should use.
 
 ### Status codes
 
@@ -176,48 +223,169 @@ An unparseable price is `null`, not a rejection: the listing is real and is stor
 
 ---
 
+## How a title becomes a model key
+
+Normalization runs **in the Worker**, inside `handlePostListings`, not in the collector. If the
+collector sent `modelKey`, a leaked token would set it to *any string* and `validity` to `VALID`
+directly, minting `model_stats` rows under keys no catalog model has. Server-side, the attacker's
+levers reduce to `title` and `priceText` — which they already control — and the rule is one rule
+for every client, testable offline.
+
+`worker/normalize/catalogIndex.ts` owns the tokens and the match; `worker/normalize/normalizeListing.ts`
+owns what a listing *is*. Both are pure functions of `(title, priceCents, componentType)`.
+
+### Tokens, and a cap that fails closed
+
+Lower-case, split on every non-alphanumeric character, then split each run at its letter/digit
+boundaries — so `"rtx5080"`, `"RTX 5080"` and `"RTX-5080"` tokenize alike. There is deliberately
+**no `normalize("NFKD")`**: measured, `"RTX™".toLowerCase().normalize("NFKD")` is `"rtxTM"`,
+because U+2122 decomposes to an upper-case `TM`, and 0 of the 176 catalog names contain a
+non-ASCII character anyway.
+
+The tokenizer stops at **64 tokens**. A title that reaches that bound *may* have been truncated,
+so it is answered `NEEDS_REVIEW` with a null key **before any other rule runs** — it is not
+silently shortened. Every one of the six disqualifier classes lives in the title text a
+truncation would discard, and a legal 146-character title can carry a catalog model with its
+`gaming pc` beyond the cut. Measured: the longest catalog model is 11 tokens and the longest of
+the 15 live titles is 18, so nothing real is near the bound.
+
+### The match: a prefix trie per component type, and three guards
+
+Each component type gets a trie built once at module load from its catalog names, plus every
+suffix obtained by dropping a leading `geforce`/`nvidia`/`radeon`/`amd`/`intel` — 176 models,
+199 entry points. Series words (`rtx`, `rx`, `gtx`, `arc`) are **not** droppable: a bare `5080`
+in the trie would match Dell's OptiPlex 5080. The cost is that `"Selling my 4070 Super"` is a
+miss, and a miss is safe.
+
+Each start position is walked greedily, and a hit is admissible only if all three guards pass:
+
+| guard | rule | what it prevents |
+|---|---|---|
+| deepest terminal | take the deepest complete name, not the first | `RM850x Shift` collapsing into `RM850x` |
+| no extension | the walk must not continue past the last complete name | `"Noctua NH-D15 G3"` → `NH-D15` |
+| end of run | the last matched token must end its character run | `"Ryzen 7 7700X3D"` → `Ryzen 7 7700X` |
+| no SKU suffix | the next token is not `ti`/`super`/`xt`/`xtx`/`gre`/`redux`/`le`/`chromax`/`rgb`/`d` | `"RTX 5070 Ti Super"` → `RTX 5070 Ti` |
+
+Two or more distinct models in one title is a refusal, not a choice.
+
+### The twelve rules, in order — first match wins
+
+```
+0.  capped title      the tokenizer returned 64 tokens                      -> NEEDS_REVIEW
+1.  wanted ad         wtb, want to buy, wanted, looking for, iso, ...       -> INVALID_REFERENCE
+2.  trade only        for trade, trade only, swap, trading, ...             -> INVALID_REFERENCE
+3.  broken / parts    for parts, not working, damaged, as is, ...           -> INVALID_REFERENCE
+4.  whole system      a system brand or phrase, or an uncovered whole-unit
+                      token (pc, tower, build, rig, ...)                    -> INVALID_REFERENCE
+5.  foreign parts     another component type is evidenced                   -> INVALID_REFERENCE
+6.  multiple models   two catalog models of the declared type               -> INVALID_REFERENCE
+7.  unknown quantity  lot of / bundle / pcs, a `pack` token, or a LEADING
+                      `3x` multiplier                                       -> NEEDS_REVIEW
+8.  placeholder zero  price 0 and the title does not say "free"             -> NEEDS_REVIEW
+9.  unconfirmed       no catalog match and no marker for the declared type  -> NEEDS_REVIEW
+10. unmatched         the right component, not in the catalog   -> VALID, modelKey null
+11. matched           exactly one catalog model                 -> VALID, that model
+```
+
+Rule 4 is neutralised by a marker of the **declared** type, so `"Lian Li Lancool 216 PC Case"`
+under a `case` search is a case and not a PC. Rule 7's `pack` is **not**: a fan pack really is a
+pack, on the one component type where Arctic, Noctua and Corsair all sell in 3- and 5-packs.
+Rule 7's multiplier is **leading only** — an `Nx`-anywhere form collides with 8 X3D CPUs,
+`SN850X 2TB/4TB` and `Flare X5`.
+
+**Quantity needs no schema change and gets none.** `recordSightings` computes its aggregates with
+an implicit quantity of 1, so a `quantity` column nothing reads would be a lie in the schema.
+Rule 7 handles it by refusing to contribute.
+
+**Price is never a classification signal.** A CA$2,000 listing may be a PC or an RTX 5090; the
+live 5080 is CA$3,000. Any threshold would be a fabricated number.
+
+### What is proven, and what is not
+
+- **176/176** catalog names, declared as their own component type, resolve to themselves.
+- **0 of 1,408** cross-type pairs produce a `VALID` result carrying a model key.
+- **8** sub-phrase overlaps exist across the sixteen vocabularies, all of them known and pinned;
+  a ninth fails the suite.
+- CPU, measured in Node on a development machine rather than in workerd — the same caveat
+  `worker/evaluation/evaluationCpu.test.ts` carries: **p95 0.20 ms** for a 15-listing window, and
+  **p95 2.95 ms** for the worst legal batch (100 listings × 300-character titles one token under
+  the cap, which is the expensive side of it — a title that *hits* the cap short-circuits at rule
+  0 and costs 0.22 ms). The repo's own invariant is p95 < 8 ms.
+
+### The residuals, named
+
+1. **`"Corsair RM850x 2021"` still pools into `Corsair RM850x`.** Year-suffixed revisions are an
+   unbounded class; enumerating years would prove the suffix list open-ended rather than close it.
+2. **A laptop with every detector stripped still reads as a GPU.** Measured, 1 of 29 constructed
+   whole-machine titles: `"MINT custom x17 R2 Flagship Ecosystem - RTX 5080 (16GB)"` carries no
+   whole-unit token, no system brand and no foreign-component marker. Its live counterpart is
+   caught twice over.
+3. **3 of 24 realistic standalone-component titles are declined** that a human would accept, all
+   from the token `build` or the phrase `gaming PC`. Every one costs a lost reference, never a
+   wrong one.
+
+Both of the first two are pinned as expected-to-fail-this-way rows in
+`worker/normalize/normalizeListing.test.ts`, so the next one is visible rather than discovered in
+an aggregate.
+
+---
+
 ## What a leak of the collector token would let an attacker do
 
 > A leaked `COLLECTOR_TOKEN` lets an attacker insert rows into `listings` and enqueue
 > `evaluation_tasks` under any `source`, `market` and `componentType` they choose, and — for any
-> `(source, listingId)` they can guess — **overwrite every mutable column of an existing listing
-> row**: `title`, `url`, `location_text`, `price_cents`, `component_type`, `market_key`,
-> `content_hash`, **`model_key` (to NULL)**, **`variant_key` (to `''`)**, **`validity` (to
-> `VALID`)** and **`last_seen_at` (to now)**. Measured, all eleven on one request.
-> `first_seen_at` is the one column that survives.
+> `(source, listingId)` they can guess — overwrite every mutable column of an existing listing
+> row. `first_seen_at` is the one column that survives.
 >
-> Three of those matter more than the rest. **`last_seen_at` defeats staleness**, so a leaked
-> token can keep any row alive past `cleanupStaleObservations` indefinitely. **`market_key` is
-> the column `model_stats` is partitioned by.** And **`validity` is the mirror of `model_key`**:
-> `dealRules.decide` sends `INVALID_REFERENCE` straight to `NOT_DEAL / COMPLETE`, so flipping it
-> back to `VALID` returns a permanently-rejected row to the evaluation path — and once
-> normalization lands, `validity === "VALID"` is one of the three conjuncts that let a listing
-> contribute to the benchmark, where `model_key → NULL` removes one. It also lets them burn D1
-> write quota.
+> **The structural protection this paragraph used to claim is gone, and this is the slice that
+> spent it.** PR #13's plan predicted it: "no request to this route can insert a row into
+> `price_observations` or increase a `model_stats` row" was true only while `model_key` was
+> hardcoded `NULL`. Normalization now derives it, so **a leaked token can create a
+> `price_observations` row and increase a `model_stats` row**, by posting a title the server's
+> own rule resolves to a catalog model together with a positive price.
 >
-> It lets them read **no settings, no evaluation results, no aggregates and no user identity**,
-> and not even the error text of a failed write. What it CAN read is narrow and worth stating
-> exactly, because an absolute claim here would be false: the response tells a caller **whether a
-> `(source, listingId)` it guesses already exists** — an unknown id answers `NEW` with
-> `usage.rowsRead: 0`, a known one answers `CHANGED` with `rowsRead: 2` — and **whether a guess
-> at that row's contents is exact**, because `UNCHANGED` is returned only when the content hash
-> matches, and that probe is non-destructive. Measured. The marginal harm is small, since the
-> same token can already overwrite those rows outright. It cannot reach
-> `/api/settings` or `/api/auth/session` — those routes never look at the header it carries.
-> It cannot be used from a browser, from any origin, even a permitted one. And because the route
-> sets `modelKey: null` itself and the wire format has no field for a model key, **no request to
-> this route can insert a row into `price_observations` or increase a `model_stats` row**: in
-> this slice the price benchmark is structurally out of reach.
+> What the server still decides: `model_key` is not a wire field and cannot be chosen directly —
+> it is one of the 176 names in `src/data/catalog.ts` or `NULL`, and only a title the rule
+> resolves to that model produces it. `variant_key` is written as `''` by `recordSightings`'
+> `normalizeVariantKey`. `validity` comes from the same rule, so a listing the rule refuses
+> cannot be marked `VALID`, and `model_key IS NOT NULL` implies `validity = 'VALID'`.
+> `price_cents` is still computed by the server from `priceText`.
+>
+> **What that leaves is the real exposure, stated plainly: a leaked token can move a model's
+> benchmark.** `model_stats` holds only `(count, total_price_cents)` — **an untrimmed running
+> mean. There is no outlier filter anywhere in the Worker; PLAN.md section 4 specifies an IQR
+> trim and it is not built.** One fabricated row added to a pool of `count` genuine ones shifts
+> the average by **`1/(count + 1)`** of the gap between the fabricated price and the current
+> mean, and `MINIMUM_REFERENCE_COUNT = 5` is the only bar. The route can also still *decrease* a
+> contribution by re-posting a known id, which the e2e exercises as its control.
+>
+> It still reads no settings, no evaluation results, no user identity, and not even the error
+> text of a failed write. **What it can read has grown, and an absolute claim here would be
+> false.** As before, the response tells a caller whether a `(source, listingId)` it guesses
+> already exists, and whether a guess at that row's contents is exact, because `UNCHANGED` is
+> returned only on a content-hash match. **New in this slice: `contributions` now distinguishes
+> `recorded` / `restored` / `removed`, which were structurally unreachable while every row
+> reported `skipped-no-model` — so the response now also tells a caller whether a guessed
+> `(source, listingId)` is currently contributing to a benchmark.** The `rowsRead` figures the
+> previous version of this paragraph quoted are not carried over: once a listing contributes, the
+> CHANGED path runs three more statements, and no one has measured what `usage.rowsRead` reports
+> then. It cannot reach `/api/settings` or `/api/auth/session`, and cannot be used from a
+> browser, from any origin.
+>
+> The mitigation is now the token's secrecy, rotation and `wrangler tail` visibility — not the
+> shape of the route.
 
-Two riders:
+One rider:
 
-- **The structural-benchmark property expires** the moment normalization makes ingest produce a
-  non-null `modelKey`. That mitigation belongs to the normalization slice and must not be
-  assumed to exist.
 - **The route can already *decrease* a contribution.** Re-posting a known `(source, listingId)`
-  that currently contributes takes `recordSightings`' `removed` path. That is unreachable
-  today and is deliberately exercised as the end-to-end control, so the next slice cannot change
-  it without noticing.
+  that currently contributes takes `recordSightings`' `removed` path. It is deliberately
+  exercised as the end-to-end control, which **moved to listing `1812246723463464`** — a real
+  GPU the catalog does not list, so the rule answers `VALID` with a null key — because
+  `915010494744438` now contributes on its own and can no longer stand in for a listing whose
+  contribution must disappear.
+
+The rider this block used to carry first — that the structural-benchmark property *expires* when
+normalization lands — is spent, not deleted: the paragraph above is what replaced it.
 
 ### The credential boundary
 
@@ -357,20 +525,20 @@ abort a scan" is a property this route must not undo.
 
 This is the first thing that ever puts rows into `evaluation_tasks` in production, and the
 existing 30-minute monitoring cron drains them immediately. `dealRules.decide` runs the
-maximum-price leg **before** the evidence gate, so it needs no model key:
+maximum-price leg **before** the evidence gate, so it needs no model key — and normalization
+narrows what that leg can see, without closing it:
 
-| settings mode | what the drain emits for un-normalized listings |
-|---|---|
-| `DISCOUNT` | all `NEEDS_REVIEW / insufficient-evidence` — safe |
-| **`MAXIMUM_PRICE`** | **`DEAL / within-maximum / COMPLETE` for every listing at or below the maximum — including a `CA$0` listing** |
-| `BOTH` | `NOT_DEAL` above the maximum, `NEEDS_REVIEW / insufficient-evidence` below it — safe |
+| the listing | before normalization | now |
+|---|---|---|
+| wrong component, whole system, trade-only, for parts, a wanted ad | reached the drain as `VALID` | `INVALID_REFERENCE` → `NOT_DEAL / COMPLETE`, before any rule runs |
+| an ambiguous `CA$0` | `DEAL / within-maximum` under `MAXIMUM_PRICE` | `NEEDS_REVIEW`, so it cannot be a `DEAL` |
+| a real component **the catalog does not list**, priced under the maximum | `DEAL / within-maximum` | **unchanged: still `DEAL / within-maximum`** — it is `VALID` with a null model key |
 
-All three rows measured against the real `evaluateBatch` and the real `dealRules`.
-
-**Until normalization lands, leave the evaluation mode on `DISCOUNT` or `BOTH`, not
-`MAXIMUM_PRICE`.** Alerting is deferred, so today a `DEAL` verdict changes a database column and
-nothing else — but the notification channel is the next thing being built, and the most
-DEAL-looking row in the database would be the free listing this project was already bitten by.
+**Leave the evaluation mode on `DISCOUNT` or `BOTH`, not `MAXIMUM_PRICE`.** The instruction
+stands. The third row is why: the catalog is current-generation only and most real supply is
+older, so a genuine but uncatalogued card under the maximum still reads as a deal on no evidence
+at all. Alerting is deferred, so today a `DEAL` verdict changes a database column and nothing
+else — but the notification channel is the next thing being built.
 
 `decide`'s ordering is **not** changed here. Gating the maximum-price leg on a non-null model key
 is the evaluation layer's contract and needs its own adversarial pass.

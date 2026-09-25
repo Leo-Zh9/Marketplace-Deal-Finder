@@ -87,9 +87,15 @@ const post = (
     dependencies,
   );
 
+/**
+ * EVERY FIXTURE TITLE MUST EVIDENCE A PSU, because COMPONENT_TYPE above is "psu". Normalization
+ * runs on the way in now, and "graphics card" under a `psu` declaration is a FOREIGN COMPONENT
+ * -- which would flip five expectations in this file to `skipped-invalid`. `power supply` is the
+ * psu marker; the plain id keeps every title distinct.
+ */
 const listing = (id: string, overrides: Record<string, unknown> = {}) => ({
   listingId: id,
-  title: `title for ${id}`,
+  title: `power supply ${id}`,
   priceText: "CA$3,000",
   locationText: "Ottawa, Ontario",
   url: `https://www.facebook.com/marketplace/item/${id}`,
@@ -171,7 +177,7 @@ describe("POST /api/listings", () => {
       // The '' sentinel, applied by recordSightings. A NULL here would break ON CONFLICT and
       // every `WHERE variant_key = ?`.
       variant_key: "",
-      title: "title for L-901",
+      title: "power supply L-901",
       price_cents: 300000,
       location_text: "Ottawa, Ontario",
       url: "https://www.facebook.com/marketplace/item/L-901",
@@ -182,11 +188,15 @@ describe("POST /api/listings", () => {
   });
 
   /**
-   * L2 asserts THE WHOLE seven-key contributions map, not one key. MEASURED: `skipped-no-price`
-   * is structurally UNREACHABLE while `modelKey` is always null, because `skipReason` tests the
-   * model key first -- so a test asserting `skipped-no-price: 1` for the unparseable price would
-   * be asserting a number that is always 0. `pricesUnparsed` is the only signal for it, and a
-   * non-zero `skipped-invalid` would mean `validity` stopped being VALID.
+   * L2 asserts THE WHOLE seven-key contributions map, not one key.
+   *
+   * `skipped-invalid: 1` IS THE CA$0 LISTING, and it is not incidental. Rule 8 of the
+   * normalization rule refuses a CA$0 price that nothing in the title calls free -- a
+   * placeholder, not an amount -- so that listing is stored NEEDS_REVIEW and does not reach the
+   * benchmark. It did not reach it before either; what changed is WHY. `skipped-no-price` is
+   * still 0 here, but no longer structurally so: it is reachable now for a listing that resolves
+   * to a catalog model and whose price did not parse, and none of these three does. The
+   * unparseable "Free" is still counted by `pricesUnparsed` alone.
    */
   it("L2: CA$0 is zero, an unparseable price is null, and neither reaches the benchmark", async () => {
     const response = await post(
@@ -200,7 +210,11 @@ describe("POST /api/listings", () => {
     expect(response.status).toBe(200);
     const body = (await response.json()) as Record<string, unknown>;
     expect(body.pricesUnparsed).toBe(1);
-    expect(body.contributions).toEqual({ ...EMPTY_CONTRIBUTIONS, "skipped-no-model": 3 });
+    expect(body.contributions).toEqual({
+      ...EMPTY_CONTRIBUTIONS,
+      "skipped-invalid": 1,
+      "skipped-no-model": 2,
+    });
 
     const prices = await rows<{ listing_id: string; price_cents: number | null }>(
       "SELECT listing_id, price_cents FROM listings ORDER BY listing_id",
@@ -365,7 +379,8 @@ describe("POST /api/listings", () => {
       envelope([
         listing("L-901", {
           listingId: "a".repeat(64),
-          title: "t".repeat(300),
+          // EXACTLY 300: "power supply " is 13 characters and the field maximum is 300.
+          title: `power supply ${"t".repeat(287)}`,
           url: `https://e.invalid/${"u".repeat(512 - 18)}`,
           locationText: "l".repeat(120),
           priceText: "C".repeat(32),
@@ -654,10 +669,10 @@ describe("POST /api/listings", () => {
   it("L12: a repeated listing id is last-wins, and the counts say so", async () => {
     const response = await post(
       envelope([
-        listing("L-901", { title: "the first title" }),
+        listing("L-901", { title: "the first power supply" }),
         listing("L-902"),
         listing("L-903"),
-        listing("L-901", { title: "the last title" }),
+        listing("L-901", { title: "the last power supply" }),
       ]),
     );
 
@@ -666,7 +681,7 @@ describe("POST /api/listings", () => {
     const stored = await database.db
       .prepare("SELECT title FROM listings WHERE listing_id = 'L-901'")
       .first<{ title: string }>();
-    expect(stored?.title).toBe("the last title");
+    expect(stored?.title).toBe("the last power supply");
   });
 
   it("L13: a missing binding is a 503 -- but only AFTER the credential is checked", async () => {
@@ -755,6 +770,88 @@ describe("POST /api/listings", () => {
     );
     expect(stored.map((row) => row.listing_id)).toEqual(["L-901", "L-903"]);
     expect(warn).toHaveBeenCalledOnce();
+  });
+
+  /**
+   * T41r-T43r: NORMALIZATION AT THE ROUTE, over the real handler and the real D1.
+   *
+   * Three PSU-domain titles, one per outcome the rule can produce, chosen so that NOT WIRING
+   * `normalizeListing` IN AT ALL answers `{skipped-no-model: 3}` -- which is what every test
+   * above this point still accepts. These three are the ones that go red for it.
+   */
+  const psuDomainBatch = () =>
+    envelope([
+      // VALID / matched: a catalog PSU at a positive price. The only contributing row.
+      listing("L-904", { title: "Corsair RM850x Shift power supply", priceText: "CA$189" }),
+      // INVALID_REFERENCE / wanted-ad: names a catalog PSU and must NOT carry its key.
+      listing("L-905", { title: "WTB Corsair AX1600i power supply", priceText: "CA$1,600" }),
+      // VALID / model-unmatched: a real PSU the catalog does not list.
+      listing("L-906", { title: "power supply L-906", priceText: "CA$75" }),
+    ]);
+
+  it("T41r: three PSU titles produce one contribution, one invalid and one unmatched", async () => {
+    const response = await post(psuDomainBatch());
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as Record<string, unknown>;
+    expect(body.contributions).toEqual({
+      ...EMPTY_CONTRIBUTIONS,
+      recorded: 1,
+      "skipped-invalid": 1,
+      "skipped-no-model": 1,
+    });
+
+    const stored = await rows<{ listing_id: string; model_key: string | null; validity: string }>(
+      "SELECT listing_id, model_key, validity FROM listings ORDER BY listing_id",
+    );
+    expect(stored).toEqual([
+      { listing_id: "L-904", model_key: "Corsair RM850x Shift", validity: "VALID" },
+      // NOT `Corsair AX1600i`: a wanted ad is not selling the thing it names.
+      { listing_id: "L-905", model_key: null, validity: "INVALID_REFERENCE" },
+      { listing_id: "L-906", model_key: null, validity: "VALID" },
+    ]);
+  });
+
+  it("T42r: exactly one price observation and one aggregate row reach D1", async () => {
+    await post(psuDomainBatch());
+
+    const observations = await rows<Record<string, unknown>>("SELECT * FROM price_observations");
+    expect(observations).toHaveLength(1);
+    expect(observations[0]).toMatchObject({
+      listing_id: "L-904",
+      market_key: MARKET_KEY,
+      model_key: "Corsair RM850x Shift",
+      // The '' sentinel, never NULL: SUBTRACT_OLD's correlated EXISTS matches on it.
+      variant_key: "",
+      price_cents: 18900,
+    });
+
+    const stats = await rows<Record<string, unknown>>("SELECT * FROM model_stats");
+    expect(stats).toHaveLength(1);
+    expect(stats[0]).toMatchObject({
+      market_key: MARKET_KEY,
+      model_key: "Corsair RM850x Shift",
+      variant_key: "",
+      count: 1,
+      total_price_cents: 18900,
+    });
+  });
+
+  /**
+   * T43r: the database-level invariant the whole design rests on. A non-VALID listing keeping
+   * the key its title happened to name would store `model_key = 'Corsair AX1600i'` for a PSU
+   * nobody is selling -- and `dealRules` would then judge against it the moment `validity` were
+   * ever flipped back.
+   */
+  it("T43r: no stored listing has a model key without being VALID", async () => {
+    await post(psuDomainBatch());
+
+    const row = await database.db
+      .prepare(
+        "SELECT COUNT(*) AS n FROM listings WHERE model_key IS NOT NULL AND validity <> 'VALID'",
+      )
+      .first<{ n: number }>();
+    expect(row?.n).toBe(0);
   });
 
   /**
