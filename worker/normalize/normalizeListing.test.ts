@@ -410,6 +410,13 @@ const STANDALONE_COMPONENTS: [Listing["componentType"], string][] = [
   ["cpu_cooler", "Noctua NH-D15 fits both AM4 and AM5"],
   ["ram", "Corsair Vengeance 32GB 2x16"],
   ["cpu", "AMD 9600X processor"],
+  // THREE MORE ON THE FINAL REVIEW, for a family this corpus could not see at all: `desktop` is a
+  // whole-unit token on all nine types but the markers that neutralise it exist only on cpu and
+  // ram, so ordinary retail phrasing is refused on the other seven. `"desktop graphics card"` is
+  // how retail distinguishes a desktop GPU from a laptop one.
+  ["gpu", "GeForce RTX 5080 desktop graphics card"],
+  ["psu", "Corsair RM850x desktop power supply"],
+  ["storage", "Samsung 990 Pro 2TB desktop SSD"],
 ];
 
 /**
@@ -584,7 +591,12 @@ describe("normalizeListing -- the measured cost and the measured residual", () =
    * F5a. THE COST, ABSOLUTE AND RE-DERIVABLE. The declined set is asserted by name, not by
    * count: a count alone would stay green while the eight swapped for eight different ones.
    *
-   * THE NUMBER HAS MOVED TWICE AND BOTH MOVES ARE THE POINT. It was reported as 3 when it was
+   * IT HAS NOW MOVED THREE TIMES, AND THE THIRD IS THE CLEAREST CASE FOR THE CORPUS EXISTING.
+   * The `desktop <component>` retail family was refused on seven component types from the moment
+   * `desktop` was admitted, and this corpus held NO instance of it -- so the cost figure could
+   * not see it, and nothing went red. An unnamed residual is not a smaller residual.
+   *
+   * THE NUMBER HAS MOVED TWICE BEFORE THAT AND BOTH MOVES ARE THE POINT. It was reported as 3 when it was
    * 4 -- that count omitted the fan pack, which is ruling 2's deliberate choice. It is now 8 of
    * 28, because four shapes the corpus did not cover were added once the quantity vocabulary
    * grew: age phrasing (`two months old`), compatibility copy (`fits both AM4 and AM5`), a kit
@@ -593,8 +605,8 @@ describe("normalizeListing -- the measured cost and the measured residual", () =
    * costs. Every one is a LOST reference, never a wrong one -- but a vocabulary whose comment
    * claims no cost at all is the thing this corpus exists to prevent.
    */
-  it("F5a: exactly 8 of 28 realistic standalone titles are declined, and these are the eight", () => {
-    expect(STANDALONE_COMPONENTS).toHaveLength(28);
+  it("F5a: exactly 11 of 31 realistic standalone titles are declined, and these are the eleven", () => {
+    expect(STANDALONE_COMPONENTS).toHaveLength(31);
     const declined = STANDALONE_COMPONENTS.filter(([componentType, title]) => {
       const result = normalizeListing({ title, priceCents: 6300, componentType });
       return !(result.validity === "VALID" && result.modelKey !== null);
@@ -609,6 +621,9 @@ describe("normalizeListing -- the measured cost and the measured residual", () =
       "Noctua NH-D15 fits both AM4 and AM5",
       "Corsair Vengeance 32GB 2x16",
       "AMD 9600X processor",
+      "GeForce RTX 5080 desktop graphics card",
+      "Corsair RM850x desktop power supply",
+      "Samsung 990 Pro 2TB desktop SSD",
     ]);
   });
 

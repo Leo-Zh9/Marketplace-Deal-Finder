@@ -322,9 +322,15 @@ same shape reached RAM, and **pipe-delimited spec lists are the live data's own 
 of the 15 production listings are one. So `desktop` is neutralised only by a marker phrase that
 starts at or after the end of a matched model's span: retail wording trails the product, a spec
 list leads it. **Scoped to `desktop` alone** — the general rule regresses `"PC Case - Fractal
-North"`, where `pc case` leads and the model follows, which is ordinary case phrasing. The named
-cost: with no catalog match there is no span to trail, so `"AMD Ryzen 5 5600 Desktop Processor"` —
-a real CPU the catalog does not list — is refused rather than stored with a null key.
+North"`, where `pc case` leads and the model follows, which is ordinary case phrasing.
+
+**The named cost has two halves, because word order is the only signal available.** A title that
+LEADS with the retail category is refused whether or not the catalog knows the model:
+`"AMD Ryzen 5 5600 Desktop Processor"` (uncatalogued, so there is no span for the marker to
+trail) and `"Desktop Processor Core i9-14900K"` or `"Desktop Memory Corsair Vengeance 32GB DDR5"`
+(catalogued, but the category leads). The second half is inherent: `"Desktop Processor: Core
+i9-14900K"` is token-identical in shape to `"Desktop | Processor: Core i9-14900K"`, which is the
+prebuilt the rule exists to refuse. Lost references, never wrong ones.
 
 **The measurement that accompanied the `desktop` repair was blind to word order**, because every
 collision title it tested puts the retail wording after the model. The corpora caught what the
@@ -378,16 +384,19 @@ live 5080 is CA$3,000. Any threshold would be a fabricated number.
   pinned; an eleventh fails the suite.
 - CPU, measured in Node on a development machine rather than in workerd — the same caveat
   `worker/evaluation/evaluationCpu.test.ts` carries, and re-measured after the vocabularies grew:
-  **p95 0.22 ms** for a 15-listing window, and **p95 3.3 ms** (3.29–3.36 over three consecutive
-  runs) for the worst legal batch — 100 listings × 300-character titles one token under the cap,
+  **p95 0.21–0.23 ms** for a 15-listing window, and **p95 3.2–3.9 ms** (3.25–3.38 over four
+  consecutive runs on one machine, 3.52 and 3.88 measured independently on another and on an adversarial
+  title) for the worst legal batch — 100 listings × 300-character titles one token under the cap,
   which is the expensive side of it, since a title that *hits* the cap short-circuits at rule 0
-  and costs 0.21 ms. The repo's own invariant is p95 < 8 ms, and the test asserts against it
-  rather than against these figures.
+  and costs 0.21 ms. **Read the spread, not the midpoint: 3.2–3.9 ms is dev-machine variance
+  across two machines and two title shapes, not a precision this measurement supports.** The
+  repo's own invariant is p95 < 8 ms and the test asserts against that, never against these
+  figures.
 
 ### The residuals, named — and the corpora they are measured from
 
 **Every figure below is measured from a corpus committed in
-`worker/normalize/normalizeListing.test.ts`** — `STANDALONE_COMPONENTS` (28 titles),
+`worker/normalize/normalizeListing.test.ts`** — `STANDALONE_COMPONENTS` (31 titles),
 `WHOLE_MACHINES` (30), `BOARD_PARTNER_TITLES` (6), `ACCEPTED_BRAND_WORD_TITLES` (8),
 `FREE_PHRASINGS` (19) and `SKU_SUFFIX_PHRASINGS` (21).
 
@@ -411,12 +420,13 @@ having improved by one. That old set's gap is how a laptop's whole price reached
    can never be a count word here. Both put N units' price into a one-unit benchmark, which makes
    genuine listings look like deals. The second is a **permanent** residual rather than an
    oversight; the first would cost the collisions listed above to close.
-4. **8 of 28 realistic standalone-component titles are declined** that a human would accept:
+4. **11 of 31 realistic standalone-component titles are declined** that a human would accept:
    three from the token `build` or the phrase `gaming PC`; one from the deliberate choice that a
    fan pack really is a pack; three from the quantity words (`"two months old"`,
    `"fits both AM4 and AM5"`, and `"32GB 2x16"`, which PLAN.md:54 calls one kit); and one from the
-   multiplier bound (`"AMD 9600X processor"` — a bare SKU with one word in front of it). Every one
-   costs a lost reference, never a wrong one. **The figure has moved twice and both moves are the
+   multiplier bound (`"AMD 9600X processor"` — a bare SKU with one word in front of it); and three
+   from the `desktop <component>` retail phrasing in residual 8. Every one costs a lost reference,
+   never a wrong one. **The figure has moved twice and both moves are the
    point:** it was reported as 3 when it was 4, and the four quantity shapes were simply not in
    the corpus until the vocabulary that declines them was reviewed.
 5. **A model name truncated to `<letters> x <digits>`** — `"G.Skill Flare X5"` with nothing after
@@ -441,13 +451,27 @@ having improved by one. That old set's gap is how a laptop's whole price reached
    money-losing direction** — two different products averaged together — and it is the residual
    that is measured rather than closed. The corpus found ten mis-pools in twenty titles when it
    was written cold; three were closed by adding `ii`, `touch` and `argb`.
-8. **A component pulled from a machine of an admitted brand line** — `"RTX 4070 pulled from a
+8. **Ordinary `desktop <component>` retail phrasing is refused on seven of the nine types.**
+   `"GeForce RTX 5080 desktop graphics card"`, `"Corsair RM850x desktop power supply"`,
+   `"Samsung 990 Pro 2TB desktop SSD"` and the same shape on case, case_fan, cpu_cooler and
+   motherboard. `desktop` is a whole-unit token on all nine types while the markers that
+   neutralise it exist only on `cpu` and `ram`; `"desktop graphics card"` is how retail
+   distinguishes a desktop GPU from a laptop one. This arrived with the `desktop` admission, not
+   with the trailing rule, and `STANDALONE_COMPONENTS` held no instance of the family — so the
+   cost figure could not see it and nothing went red. It now carries three.
+
+   **Cheap and safe to close, measured rather than assumed:** adding `"desktop graphics card"` to
+   `MARKERS.gpu` recovers the match while `"Dell Desktop | Graphics card: RTX 5080"` stays
+   refused, because the trailing rule protects any future `desktop *` marker globally. The price
+   is one marker phrase per type plus the overlap rows it adds to the vocabulary audit. Left
+   undone deliberately: seven types' worth of new vocabulary is not a merge-time change.
+9. **A component pulled from a machine of an admitted brand line** — `"RTX 4070 pulled from a
    Razer Blade 16"` — is refused as a whole system. Correct for a laptop part, which is a
    different product from its desktop namesake; a lost reference for a desktop part.
    `ACCEPTED_BRAND_WORD_TITLES` carries one row per admitted word.
 
 Residuals 1, 2, 3 and 5 are pinned as expected-to-behave-this-way rows in `ACCEPTED_EXPOSURE`,
-and 4, 6, 7 and 8 are pinned by the corpora named above, so the next one is visible rather than
+and 4, 6, 7, 8 and 9 are pinned by the corpora named above, so the next one is visible rather than
 discovered in an aggregate.
 
 ---

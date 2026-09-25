@@ -77,6 +77,23 @@ export const BROKEN = [
 /**
  * Whole systems named by BRAND or by a two-word phrase.
  *
+ * THE `desktop <component>` RETAIL PHRASING IS A NAMED RESIDUAL, AND IT IS NOT THE TRAILING
+ * RULE'S DOING -- it arrived with the `desktop` admission itself. `desktop` is a whole-unit token
+ * on all NINE types while the neutralising markers exist only on `cpu` and `ram`, so ordinary
+ * retail phrasing is refused on the other seven: MEASURED,
+ * `"GeForce RTX 5080 desktop graphics card"`, `"Corsair RM850x desktop power supply"`,
+ * `"Samsung 990 Pro 2TB desktop SSD"`, and the same shape on case, case_fan, cpu_cooler and
+ * motherboard. `"desktop graphics card"` is how retail distinguishes a desktop GPU from a laptop
+ * one. Lost references, never wrong ones; `STANDALONE_COMPONENTS` now carries three of them so
+ * the cost figure can see the family at all.
+ *
+ * IT IS CHEAP AND SAFE TO CLOSE, AND MEASURED SO RATHER THAN ASSUMED: adding
+ * `"desktop graphics card"` to `MARKERS.gpu` recovers `"GeForce RTX 5080 desktop graphics card"`
+ * as a match while `"Dell Desktop | Graphics card: RTX 5080"` STAYS refused, because the trailing
+ * rule above protects any future `desktop *` marker globally. The price per type is one marker
+ * phrase plus the T13 overlap rows it creates. NOT DONE HERE: that is seven types' worth of new
+ * vocabulary arriving at merge time, and this slice has learned what new vocabulary costs.
+ *
  * `desktop` IS NOW A TOKEN TOO, and the argument that kept it out was true of the BARE token and
  * stopped being true the moment the marker mechanism could cover it. It used to fire on the
  * catalog's own product wording -- `"AMD Ryzen 7 9800X3D Desktop Processor"` and `"Kingston Fury
@@ -358,10 +375,15 @@ const containsAnyPhrase = (values: readonly string[], phrases: readonly string[]
  * span follows it, which is ordinary case phrasing rather than a spec list. `pc`, `computer` and
  * `tower` keep their position-free neutralisation.
  *
- * THE COST, NAMED: with no catalog match there is no span to trail, so
- * `"AMD Ryzen 5 5600 Desktop Processor"` -- a real CPU the catalog does not list -- is refused as
- * a whole system rather than stored as an unmatched component. A lost reference, never a wrong
- * one, and the direction every tie in this file breaks.
+ * THE COST, NAMED, AND IT HAS TWO HALVES. Word order is the only signal available, so any title
+ * that LEADS with the retail category is refused -- including one naming a catalogued model:
+ *   `"AMD Ryzen 5 5600 Desktop Processor"`         (uncatalogued: no span for the marker to trail)
+ *   `"Desktop Processor Core i9-14900K"`           (CATALOGUED, but the category leads)
+ *   `"Desktop Memory Corsair Vengeance 32GB DDR5"` (the same on ram)
+ * The second half is inherent rather than incidental: `"Desktop Processor: Core i9-14900K"` is
+ * token-identical in shape to `"Desktop | Processor: Core i9-14900K"`, which is the prebuilt this
+ * rule exists to refuse. Both halves are lost references, never wrong ones, which is the
+ * direction every tie in this file breaks.
  */
 const COVERED_ONLY_WHEN_TRAILING = new Set(["desktop"]);
 
