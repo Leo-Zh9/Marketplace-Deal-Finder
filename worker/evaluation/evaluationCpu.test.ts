@@ -23,11 +23,23 @@
  * deserialisation of the response, which a real Worker does. Both are bounded by a 15-row
  * result; at this headroom the conclusion survives them.
  *
+ * AND THE SECOND ONE, WHICH THIS FILE USED TO GET WRONG IN ITS OWN TERMS. The paragraph above
+ * says "That is Cloudflare's own definition; CPU time excludes I/O" -- and then the timer read
+ * `performance.now()`, which is ELAPSED time and therefore includes every millisecond the process
+ * spent descheduled waiting for a core. It now reads CONSUMED CPU (worker/testing/cpuClock.ts),
+ * which is what the sentence always meant. MEASURED, same fixed work, p95: idle wall 5.233 ms vs
+ * cpu 5.227 ms -- identical; under 16x CPU load wall 33.418 ms vs cpu 17.621 ms. The old
+ * instrument reported the machine's load as if it were the code's cost.
+ *
+ * WHAT REMAINS TRUE AND MUST STAY SAID: these are Node measurements on a development machine, not
+ * workerd. The quantity is now the right KIND -- CPU rather than elapsed -- on the wrong runtime.
+ *
  * C1-C3 are the tests that actually pin the row budget, and they are deterministic. C2 is the one
  * that cannot be faked: a fixture with a small eligible set and a growing INELIGIBLE corpus is
  * structurally incapable of seeing the sort a single-statement claim would introduce.
  */
 
+import { cpuMilliseconds } from "../testing/cpuClock";
 import { marketKey } from "../storage/marketKey";
 import type { Market } from "../storage/marketKey";
 import { createTestDatabase, truncateAll, type TestDatabase } from "../testing/d1";
@@ -500,9 +512,11 @@ describe("evaluation CPU -- measurement", () => {
 
     const stub = replayDatabase(capture);
     const sample = async () => {
-      const start = performance.now();
+      // CONSUMED CPU, not elapsed time -- worker/testing/cpuClock.ts says why, and it is the same
+      // correction: the 8 ms this file's own invariant names is a CPU budget.
+      const start = cpuMilliseconds();
       await evaluateBatch(stub, input);
-      return performance.now() - start;
+      return cpuMilliseconds() - start;
     };
 
     for (let index = 0; index < 800; index += 1) {
@@ -514,6 +528,13 @@ describe("evaluation CPU -- measurement", () => {
     }
     samples.sort((a, b) => a - b);
 
+    // READ THESE NUMBERS AT THE PRECISION THEY HAVE, WHICH IS NOT THE PRECISION THEY PRINT.
+    // `process.cpuUsage()` resolves to 1 microsecond (measured), and a single sample here is
+    // ~5 us -- so an individual sample is quantised in ~20 % steps and the fourth decimal place
+    // below is noise. It does not touch the verdict: the assertion is p95 < 8 ms and p95 is about
+    // 0.007 ms, a margin of roughly 1,000x, so no plausible quantisation error can move it. If a
+    // future change brought this within an order of magnitude of the budget, the instrument would
+    // have to change before the assertion could be trusted.
     const p50 = percentile(samples, 0.5);
     const p95 = percentile(samples, 0.95);
     const p99 = percentile(samples, 0.99);

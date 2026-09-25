@@ -12,13 +12,18 @@
  * part of the route, which also pays `JSON.parse` of the body and 100 SHA-256 content hashes.
  * All three assertions below are against the same 8 ms.
  *
- * HONEST LIMITATION, THE SAME ONE evaluationCpu.test.ts CARRIES: these are Node measurements on
- * a development machine, not workerd. At this headroom -- roughly 39x under the invariant on
- * real traffic -- the conclusion survives it, and the real bound is structural anyway: MAX_TOKENS
- * caps the work per title regardless of how long the title is.
+ * HONEST LIMITATION, THE SAME ONE evaluationCpu.test.ts CARRIES, AND NOW SHARPER: these are Node
+ * measurements on a development machine, not workerd. What changed is the QUANTITY -- every timer
+ * here reads CONSUMED CPU (worker/testing/cpuClock.ts) rather than elapsed wall time, because the
+ * limit these are measured against is a CPU limit and elapsed time is CPU time plus every
+ * millisecond spent descheduled. So the measurement is now the right KIND of quantity, still on
+ * the wrong runtime. At this headroom -- roughly 39x under the invariant on real traffic -- the
+ * conclusion survives it, and the real bound is structural anyway: MAX_TOKENS caps the work per
+ * title regardless of how long the title is.
  */
 
 import { componentCatalog } from "../../src/data/catalog";
+import { cpuMilliseconds } from "../testing/cpuClock";
 import type { Listing } from "../storage/types";
 import { CATALOG_COMPONENT_ID, MAX_TOKENS, buildModelIndex, tokenize } from "./catalogIndex";
 import { normalizeListing } from "./normalizeListing";
@@ -60,16 +65,35 @@ const UNCAPPED_TITLE = `${"abcd1234 ".repeat(31)}efgh`;
 let sink = 0;
 
 /**
- * Block-timed: `inner` calls per clock read, `reps` reads, sorted, p50/p95 returned per call.
- * The 30 warm-up blocks let the JIT settle before anything is recorded.
+ * Block-timed: `inner` calls per CONSUMED-CPU read, `reps` reads, sorted, p50/p95 returned per
+ * call. The 30 warm-up blocks let the JIT settle before anything is recorded -- and they are not
+ * optional now, because `process.cpuUsage()` counts V8's background compiler threads too.
+ *
+ * `cpuMilliseconds`, NOT `performance.now()`. See worker/testing/cpuClock.ts: the budget is a CPU
+ * budget and elapsed time is CPU time plus everything the process spent waiting for a core.
+ *
+ * `inner` IS THE OTHER HALF OF THE FIX AND IT IS NOT A KNOB TO TURN WHEN A RUN GOES RED. A sample
+ * is the MEAN over `inner` blocks, so a single GC pause is divided by `inner` instead of becoming
+ * the whole sample. MEASURED on the T40c batch, idle, same machine, p50 / p95 / max in ms:
+ *
+ *   inner=1  reps=200   3.118 / 5.047 / 7.434      <- what T40c used to do
+ *   inner=4  reps=40    3.108 / 5.523 / 6.752
+ *   inner=8  reps=40    3.041 / 3.377 / 3.517
+ *   inner=16 reps=40    3.022 / 3.051 / 3.052
+ *
+ * THE P50 IS THE SAME 3.0-3.1 ms IN EVERY ROW. The cost being measured never changed; only the
+ * estimator's noise did, and at inner=1 the p95 of 40 samples is "the second-worst GC pause"
+ * rather than a cost. Raising `inner` does not lower the number the assertion sees on real work
+ * -- a mutation that makes normalization genuinely slower raises the MEAN, which is exactly what
+ * a block average measures.
  */
 const measure = (work: () => number, inner: number, reps = 60): { p50: number; p95: number } => {
   for (let warm = 0; warm < 30; warm += 1) sink += work();
   const samples: number[] = [];
   for (let rep = 0; rep < reps; rep += 1) {
-    const start = performance.now();
+    const start = cpuMilliseconds();
     for (let index = 0; index < inner; index += 1) sink += work();
-    samples.push((performance.now() - start) / inner);
+    samples.push((cpuMilliseconds() - start) / inner);
   }
   samples.sort((a, b) => a - b);
   return {
@@ -150,8 +174,10 @@ describe("normalization CPU", () => {
       return consumed;
     };
 
-    const capped = measure(batch(CAPPED_TITLE), 1, 40);
-    const uncapped = measure(batch(UNCAPPED_TITLE), 1, 40);
+    // inner=8: see `measure`. At inner=1 this was the only block-timed measurement in the file
+    // that did not average, and it was the only one that flaked.
+    const capped = measure(batch(CAPPED_TITLE), 8, 40);
+    const uncapped = measure(batch(UNCAPPED_TITLE), 8, 40);
     console.log(
       `normalizeListing over the worst legal batch (100 x 300 chars): ` +
         `capped at 64 tokens p50 ${capped.p50.toFixed(4)} ms, p95 ${capped.p95.toFixed(4)} ms; ` +
