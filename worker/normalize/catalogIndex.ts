@@ -123,6 +123,20 @@ const OPTIONAL_LEADING = new Set(["geforce", "nvidia", "radeon", "amd", "intel"]
  * Tokens that turn an otherwise-complete model name into a DIFFERENT vendor SKU. G2 refuses a
  * match followed by one of these, so `"RTX 5070 Ti Super"` does not pool into `RTX 5070 Ti`.
  *
+ * SEVEN CANDIDATES WERE MEASURED AND REFUSED, and the reason matters more than the list: ALL TEN
+ * passed the whole suite. A green suite is a claim about the suite, not about real listings --
+ * the same blindness that let `nitro` through as a system phrase. So each was judged on whether
+ * the word has a DESCRIPTIVE use that follows a model name:
+ *   `atx`      -- a form factor, not a variant: `"MSI MAG B650 Tomahawk WiFi ATX motherboard"`
+ *                 is the catalog model, and the collector's own fixture has that shape.
+ *   `expo`     -- a memory profile the catalog kits already carry.
+ *   `core`     -- collides with Intel's `Core` naming.
+ *   `a`        -- the English article. `"GeForce RTX 5080 a great deal"` would stop matching.
+ *   `fe`       -- a Founders Edition is the same die and the same comparison product.
+ *   `tg`, `platinum` -- could not be established as DIFFERENT from the catalog entry rather than
+ *                 the name of it, and refusing the product the catalog lists is the wrong error.
+ * Each refusal costs a pinned mis-pool, stated in ACCEPTED_EXPOSURE rather than left unmeasured.
+ *
  * AN OPEN-ENDED BLOCKLIST, NOT A CLOSED ONE. It closed five real mis-pools found under review
  * (`NH-U12S redux`, `NH-D15 chromax`, `RX 9070 GRE`, `RTX 5090 D`, `H7 Flow RGB`), and
  * `"Corsair RM850x 2021"` -> `Corsair RM850x` still stands: year-suffixed revisions are an
@@ -142,6 +156,14 @@ const SUFFIX_WORDS = new Set([
   "chromax",
   "rgb",
   "d",
+  // ADDED AFTER A CORPUS WAS WRITTEN FOR THIS LIST RATHER THAN FROM IT -- see
+  // SKU_SUFFIX_PHRASINGS in normalizeListing.test.ts, which found 10 mis-pools in 20 real
+  // variant titles. Each of these three is a genuine SKU differentiator with no descriptive use
+  // this project could name, and each was measured against all 176 catalog names, the 15 live
+  // titles and every title the suite pins as a match.
+  "ii",
+  "touch",
+  "argb",
 ]);
 
 /** A prefix trie node; the exported index is its root. */
@@ -200,7 +222,11 @@ export const buildModelIndex = (models: readonly string[]): ModelIndex => {
  *       mid-run on the `7700x` of `7700x3d` and pools an X3D chip into the non-X3D model.
  * G2 -- the token AFTER the match must not be a vendor SKU suffix. See SUFFIX_WORDS.
  */
-const walkFrom = (index: ModelIndex, tokens: readonly Token[], start: number): string | null => {
+const walkFrom = (
+  index: ModelIndex,
+  tokens: readonly Token[],
+  start: number,
+): { model: string; depth: number } | null => {
   let node = index;
   let depth = 0;
   let terminalDepth = -1;
@@ -222,7 +248,7 @@ const walkFrom = (index: ModelIndex, tokens: readonly Token[], start: number): s
   if (!tokens[start + terminalDepth - 1].endsRun) return null;
   const after = tokens[start + terminalDepth];
   if (after !== undefined && SUFFIX_WORDS.has(after.value)) return null;
-  return terminalModel;
+  return { model: terminalModel, depth: terminalDepth };
 };
 
 /**
@@ -233,14 +259,31 @@ const walkFrom = (index: ModelIndex, tokens: readonly Token[], start: number): s
  * walk never yields two nested spans holding DIFFERENT models. Do not re-add either without a
  * test that can go red.
  */
-export const matchCatalogModels = (index: ModelIndex, tokens: readonly Token[]): string[] => {
-  const found = new Set<string>();
+export interface ModelSpan {
+  model: string;
+  /** Inclusive token index where the match begins. */
+  start: number;
+  /** EXCLUSIVE token index where it ends. */
+  end: number;
+}
+
+/**
+ * Every admissible match WITH its token span. `matchCatalogModels` is this, de-duplicated down to
+ * the names; the spans exist because rule 8 has to ask whether one PARTICULAR token belongs to
+ * the item being named, which a list of names cannot answer.
+ */
+export const matchCatalogSpans = (index: ModelIndex, tokens: readonly Token[]): ModelSpan[] => {
+  const spans: ModelSpan[] = [];
   for (let start = 0; start < tokens.length; start += 1) {
-    const model = walkFrom(index, tokens, start);
-    if (model !== null) found.add(model);
+    const hit = walkFrom(index, tokens, start);
+    if (hit !== null) spans.push({ model: hit.model, start, end: start + hit.depth });
   }
-  return [...found];
+  return spans;
 };
+
+export const matchCatalogModels = (index: ModelIndex, tokens: readonly Token[]): string[] => [
+  ...new Set(matchCatalogSpans(index, tokens).map((span) => span.model)),
+];
 
 /**
  * THE NAMED TRAP: the Worker calls it `case_fan` (worker/storage/types.ts) and the catalog calls

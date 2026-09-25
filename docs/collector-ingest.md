@@ -259,12 +259,21 @@ miss, and a miss is safe.
 
 Each start position is walked greedily, and a hit is admissible only if all three guards pass:
 
+**Rule 8 asks what the word `free` is attached to, and that is deliberate rather than a list.** A
+denylist of the other thing — shipping, pickup, delivery — was built and replaced: it needed
+patching twice inside one review round, because the tokenizer splits `pick up` into two tokens,
+and a word list cannot tell `"free … pick up only"` — a free card collected in person — from
+`"free pick up"`. Requiring the token after `free` to be the item closes the family with nothing
+to maintain. Its errors land in the safe direction by construction: a free listing cannot reach a
+benchmark at all (`recordSightings` requires `priceCents > 0`), so refusing one costs no reference
+and only removes a spurious `DEAL`.
+
 | guard | rule | what it prevents |
 |---|---|---|
 | deepest terminal | take the deepest complete name, not the first | `RM850x Shift` collapsing into `RM850x` |
 | no extension | the walk must not continue past the last complete name | `"Noctua NH-D15 G3"` → `NH-D15` |
 | end of run | the last matched token must end its character run | `"Ryzen 7 7700X3D"` → `Ryzen 7 7700X` |
-| no SKU suffix | the next token is not `ti`/`super`/`xt`/`xtx`/`gre`/`redux`/`le`/`chromax`/`rgb`/`d` | `"RTX 5070 Ti Super"` → `RTX 5070 Ti` |
+| no SKU suffix | the next token is not one of thirteen variant words (`ti`, `super`, `xt`, `xtx`, `gre`, `redux`, `le`, `chromax`, `rgb`, `d`, `ii`, `touch`, `argb`) | `"RTX 5070 Ti Super"` → `RTX 5070 Ti` |
 
 Two or more distinct models in one title is a refusal, not a choice.
 
@@ -284,8 +293,8 @@ Two or more distinct models in one title is a refusal, not a choice.
                       token, or an `Nx` multiplier in the first two tokens
                       or the last two                                       -> NEEDS_REVIEW
 8.  placeholder zero  price 0 and nothing says the ITEM is free: `free` must
-                      LEAD the title and no shipping/pickup/delivery word
-                      may appear ANYWHERE in it                             -> NEEDS_REVIEW
+                      LEAD the title and the NEXT token must belong to the
+                      item -- a marker phrase, or the matched model itself   -> NEEDS_REVIEW
 9.  unconfirmed       no catalog match and no marker for the declared type  -> NEEDS_REVIEW
 10. unmatched         the right component, not in the catalog   -> VALID, modelKey null
 11. matched           exactly one catalog model                 -> VALID, that model
@@ -361,8 +370,8 @@ live 5080 is CA$3,000. Any threshold would be a fabricated number.
 
 **Every figure below is measured from a corpus committed in
 `worker/normalize/normalizeListing.test.ts`** — `STANDALONE_COMPONENTS` (28 titles),
-`WHOLE_MACHINES` (30), `BOARD_PARTNER_TITLES` (6), `ACCEPTED_BRAND_WORD_TITLES` (8) and
-`FREE_PHRASINGS` (15).
+`WHOLE_MACHINES` (30), `BOARD_PARTNER_TITLES` (6), `ACCEPTED_BRAND_WORD_TITLES` (8),
+`FREE_PHRASINGS` (17) and `SKU_SUFFIX_PHRASINGS` (20).
 
 **These are not the corpora the earlier figures came from, and the numbers are not continuous
 with them.** The previous "3 of 24" and "1 of 29" were quoted from sets that lived only in a
@@ -394,19 +403,28 @@ having improved by one. That old set's gap is how a laptop's whole price reached
    the corpus until the vocabulary that declines them was reviewed.
 5. **A model name truncated to `<letters> x <digits>`** — `"G.Skill Flare X5"` with nothing after
    it — reads as a trailing count. A lost reference, in the safe direction.
-6. **A genuinely free item phrased tail-first** (`"GeForce RTX 5080, free to a good home"`) and a
-   free item that is also collection-only (`"FREE GeForce RTX 5080 pick up only"`) are both
-   `NEEDS_REVIEW`. Rule 8 requires `free` to LEAD the title and no shipping or pickup word to
-   appear anywhere; a token denylist cannot tell `"free … pick up only"` from `"free pick up"`.
-   Lost references, in the safe direction, and `FREE_PHRASINGS` is the committed corpus that
-   makes the whole family re-measurable rather than one word per review round.
-7. **A component pulled from a machine of an admitted brand line** — `"RTX 4070 pulled from a
+6. **A genuinely free item is `NEEDS_REVIEW` whenever anything sits between `free` and the item**
+   — `"Free to a good home GeForce RTX 5080"`, or the same phrase written tail-first. Rule 8
+   requires the token after a leading `free` to be the item. A free listing cannot reach a
+   benchmark in any case, so this costs a `DEAL` verdict rather than a reference.
+   `FREE_PHRASINGS` (17 real phrasings) is the committed corpus that keeps the family
+   re-measurable; it found two live defects on its first run.
+7. **Seven real SKU-variant phrasings still pool into their base model** — a year suffix
+   (`RM850x 2021`), a form factor (`Focus GX-850 ATX 3.0`), an `A-RGB` that tokenizes as two
+   words, `North XL TG`, a `DDR5 EXPO` kit, `SF1000 Platinum` and `4000D Airflow Core`. Each is a
+   word deliberately NOT added to the suffix list, for a reason stated per row in
+   `SKU_SUFFIX_PHRASINGS`: it is a form factor, or a feature the catalog entry already has, or a
+   word that may name the catalog entry itself rather than a variant of it. **This is the
+   money-losing direction** — two different products averaged together — and it is the residual
+   that is measured rather than closed. The corpus found ten mis-pools in twenty titles when it
+   was written cold; three were closed by adding `ii`, `touch` and `argb`.
+8. **A component pulled from a machine of an admitted brand line** — `"RTX 4070 pulled from a
    Razer Blade 16"` — is refused as a whole system. Correct for a laptop part, which is a
    different product from its desktop namesake; a lost reference for a desktop part.
    `ACCEPTED_BRAND_WORD_TITLES` carries one row per admitted word.
 
 Residuals 1, 2, 3 and 5 are pinned as expected-to-behave-this-way rows in `ACCEPTED_EXPOSURE`,
-and 4, 6 and 7 are pinned by the corpora named above, so the next one is visible rather than
+and 4, 6, 7 and 8 are pinned by the corpora named above, so the next one is visible rather than
 discovered in an aggregate.
 
 ---

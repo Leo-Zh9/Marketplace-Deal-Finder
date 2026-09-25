@@ -17,7 +17,6 @@ import type { Listing } from "../storage/types";
 import { tokenValues, tokenize } from "./catalogIndex";
 import {
   BROKEN,
-  FREE_IS_NOT_THE_ITEM,
   MARKERS,
   MULTIPLE,
   MULTI_UNIT,
@@ -144,6 +143,11 @@ const CASES: Case[] = [
  *   residual on whole machines is 1 of 29, not 0 of 29.
  *
  * If either row starts failing, the rule got BETTER; delete the row and say so.
+ */
+/**
+ * ... and SKU_SUFFIX_PHRASINGS below carries seven more, all of the same kind: a variant suffix
+ * the list does not hold, pooling into the base model. They live there rather than here because
+ * the corpus they were measured from is the thing that keeps them honest.
  */
 const ACCEPTED_EXPOSURE: Case[] = [
   ["T36a: a year-suffixed revision pools into the base model", "Corsair RM850x 2021 power supply", 17900, "psu", "VALID", "Corsair RM850x", "matched"],
@@ -321,23 +325,22 @@ describe("normalizeListing -- every vocabulary element, one at a time", () => {
   );
 
   /**
-   * T23c: each disqualifier word, placed at the END of the title rather than beside the `free`.
-   * The frame is deliberately the one the FIRST version of this guard passed and the defect
-   * walked through: a leading `free`, the word far away from it, and a real CA$0 price.
-   *
-   * WHAT THIS TEST CANNOT DO, SAID PLAINLY: it iterates the same words the production set holds,
-   * so it proves each listed word works and is blind to every word NOT listed -- which is
-   * exactly how `pickup` was missed. `FREE_PHRASINGS` below is the independent corpus that
-   * covers that gap; this test covers only the members.
+   * T23d: THE TWO WAYS index 1 CAN BE THE ITEM, one test each, because the predicate is a
+   * disjunction and either half alone passes the other's case. The marker half admits a free
+   * component the catalog does not list; the model-span half admits one whose title starts with
+   * the brand rather than with a marker word.
    */
-  it.each([["shipping"], ["ship"], ["ships"], ["delivery"], ["delivered"], ["pickup"], ["postage"]])(
-    "T23c: a title whose free-ness is about %s does not make the item free",
-    (word) => {
-      expect(
-        normalizeListing({ title: `Free GeForce RTX 5080 - ${word} included`, priceCents: 0, componentType: "gpu" }),
-      ).toEqual({ modelKey: null, variantKey: null, validity: "NEEDS_REVIEW", reason: "ambiguous-zero-price" });
-    },
-  );
+  it("T23d: index 1 inside a MARKER phrase counts as the item", () => {
+    expect(
+      normalizeListing({ title: "Free graphics card - no longer needed", priceCents: 0, componentType: "gpu" }),
+    ).toEqual({ modelKey: null, variantKey: null, validity: "VALID", reason: "model-unmatched" });
+  });
+
+  it("T23d: index 1 inside a MATCHED MODEL span counts as the item", () => {
+    expect(
+      normalizeListing({ title: "Free Lian Li Lancool 216", priceCents: 0, componentType: "case" }),
+    ).toEqual({ modelKey: "Lian Li Lancool 216", variantKey: null, validity: "VALID", reason: "matched" });
+  });
 
   it("T23c control: a leading 'free' followed by the item itself still counts", () => {
     expect(
@@ -483,21 +486,73 @@ const ACCEPTED_BRAND_WORD_TITLES: [Listing["componentType"], string][] = [
  * wrong answer rather than as a word nobody thought of.
  */
 const FREE_PHRASINGS: [string, "usable" | "refused"][] = [
+  // `free` leads AND the next token is the item -- a marker word or the model itself.
   ["Free GeForce RTX 5080", "usable"],
   ["Free RTX 5070 graphics card", "usable"],
   ["Free! GeForce RTX 5080", "usable"],
-  ["Free to a good home GeForce RTX 5080", "usable"],
   ["Free GeForce RTX 5080 no longer needed", "usable"],
-  ["GeForce RTX 5080 - free shipping", "refused"],
+  // THE FOUR ROWS THE DENYLIST GOT WRONG AND THE QUALIFIER GETS RIGHT: the item is free and the
+  // sentence goes on to say how it travels. A word-list could not tell these from the next four.
+  ["FREE GeForce RTX 5080 pick up only", "usable"],
+  ["Free GeForce RTX 5080 - will ship", "usable"],
+  ["Free GeForce RTX 5080, delivery available", "usable"],
+  ["Free GeForce RTX 5080 - collection only", "usable"],
+  // `free` leads but is attached to something that is not the item.
   ["Free local pickup - GeForce RTX 5080", "refused"],
-  ["FREE GeForce RTX 5080 pick up only", "refused"],
   ["Free porch pickup GeForce RTX 5080", "refused"],
   ["Free collection - GeForce RTX 5080", "refused"],
-  ["Free GeForce RTX 5080 - will ship", "refused"],
-  ["Free GeForce RTX 5080, delivery available", "refused"],
   ["Free ships anywhere GeForce RTX 5080", "refused"],
+  ["Free shipping on this GeForce RTX 5080", "refused"],
+  // `free` does not lead at all.
+  ["GeForce RTX 5080 - free shipping", "refused"],
   ["GeForce RTX 5080 with free item included", "refused"],
   ["GeForce RTX 5080, free to a good home", "refused"],
+  // THE NAMED COST: a real free item with anything between `free` and the item.
+  ["Free to a good home GeForce RTX 5080", "refused"],
+];
+
+/**
+ * REAL SKU-SUFFIX PHRASINGS, WRITTEN FROM THE PRODUCT LINES AND NOT FROM `SUFFIX_WORDS`.
+ *
+ * A missing entry in that list is a MIS-POOL, not a miss: it silently averages two different
+ * products together, which is the one failure this phase exists to prevent. The per-element test
+ * for the list (T20) iterates a copy of the list, so it can only ever confirm the members --
+ * blind to exactly the entry nobody thought of. This corpus is the independent half.
+ *
+ * ITS JOB IS TO MAKE THE RESIDUAL KNOWN, NOT TO FINISH AN OPEN-ENDED LIST. Written cold it found
+ * TEN mis-pools in twenty titles. Three were closed by adding `ii`, `touch` and `argb`, each
+ * measured free against the 176 names, the 15 live titles and every title this suite pins as a
+ * match. Six remain ACCEPTED EXPOSURE, pinned below with the reason each word was refused, and a
+ * seventh -- the year suffix -- was already a standing decision. An unmeasured residual is --
+ * an unmeasured residual is what `Corsair RM850x 2021` was before anyone looked.
+ */
+const SKU_SUFFIX_PHRASINGS: [Listing["componentType"], string, "refused" | "pooled"][] = [
+  // Closed by the list as it stands.
+  ["gpu", "MSI RTX 5070 Ti Super gaming card", "refused"],
+  ["gpu", "Radeon RX 9070 GRE graphics card", "refused"],
+  ["cpu_cooler", "Noctua NH-U12S redux CPU cooler", "refused"],
+  ["cpu_cooler", "Noctua NH-D15 chromax black cpu cooler", "refused"],
+  ["case", "NZXT H7 Flow RGB case", "refused"],
+  ["ram", "Corsair Vengeance 32GB DDR5 RGB", "refused"],
+  ["case_fan", "Noctua NF-A12x25 LS-PWM case fan", "refused"],
+  // Closed by a DIFFERENT rule -- the heatsink variants read as a foreign component.
+  ["storage", "Samsung 990 Pro 2TB with Heatsink", "refused"],
+  ["storage", "WD Black SN850X 2TB Heatsink nvme", "refused"],
+  // Closed by the three words this corpus added.
+  ["motherboard", "MSI MAG B650 Tomahawk WiFi II motherboard", "refused"],
+  ["case", "Hyte Y70 Touch case", "refused"],
+  ["cpu_cooler", "Thermalright Peerless Assassin 120 SE ARGB cooler", "refused"],
+  // ACCEPTED EXPOSURE. Each pools into the base model; each word was refused for a named reason.
+  ["psu", "Corsair RM850x 2021 power supply", "pooled"], // years are unbounded, by decision
+  ["psu", "Seasonic Focus GX-850 ATX 3.0 power supply", "pooled"], // `atx` is a form factor
+  ["cpu_cooler", "Arctic Liquid Freezer III 360 A-RGB", "pooled"], // splits to `a` + `rgb`
+  ["case", "Fractal North XL TG Dark computer case", "pooled"], // `tg` may name the base product
+  ["ram", "G.Skill Trident Z5 Neo 32GB DDR5 EXPO memory kit", "pooled"], // kits already carry EXPO
+  ["psu", "Corsair SF1000 Platinum power supply", "pooled"], // may be the catalog entry's own name
+  ["case", "Corsair 4000D Airflow Core case", "pooled"], // `core` collides with Intel Core
+  // NOT A MIS-POOL, and listed so nobody "fixes" it: a Founders Edition is the same die and the
+  // same comparison product as the board-partner cards. Refusing it would cost a real reference.
+  ["gpu", "GeForce RTX 5080 Founders Edition", "pooled"],
 ];
 
 describe("normalizeListing -- the measured cost and the measured residual", () => {
@@ -568,20 +623,40 @@ describe("normalizeListing -- the measured cost and the measured residual", () =
   });
 
   /**
-   * R1b. THE FREE FAMILY, FROM THE SELLER'S SIDE RATHER THAN THE CODE'S. Two of these rows --
-   * `pick up only` and `porch pickup` -- were VALID with a model key when this corpus was
-   * written, at a real CA$0, which under MAXIMUM_PRICE is the exact verdict PR #6 exists to
-   * prevent.
+   * R1b. THE FREE FAMILY, FROM THE SELLER'S SIDE RATHER THAN THE CODE'S -- written from what a
+   * seller writes, not from what the code denies, which is the only way a corpus can find a word
+   * nobody thought of. It did: `porch pickup` and `pick up only` were both VALID with a model key
+   * at a real CA$0 when it was written, which under MAXIMUM_PRICE is the verdict PR #6 exists to
+   * prevent. The denylist that followed then got FOUR of these rows wrong in the other direction
+   * -- an item that is free and also collected in person is still free -- which is why the
+   * predicate asks what `free` is attached to instead of listing what it must not be.
    */
   it("R1c: every real free phrasing lands on the right side of rule 8", () => {
-    expect(FREE_PHRASINGS).toHaveLength(15);
+    expect(FREE_PHRASINGS).toHaveLength(17);
     for (const [title, expected] of FREE_PHRASINGS) {
       const result = normalizeListing({ title, priceCents: 0, componentType: "gpu" });
       const actual = result.validity === "VALID" && result.modelKey !== null ? "usable" : "refused";
       expect(actual, title).toBe(expected);
     }
     // Not satisfiable by refusing everything: five rows must still come back with a model key.
-    expect(FREE_PHRASINGS.filter(([, e]) => e === "usable")).toHaveLength(5);
+    expect(FREE_PHRASINGS.filter(([, e]) => e === "usable")).toHaveLength(8);
+  });
+
+  /**
+   * R6. THE SUFFIX RESIDUAL, MEASURED. Seven of the eight pooling rows are mis-pools and are
+   * ACCEPTED EXPOSURE (the eighth, the Founders Edition, is correct); the assertion is per row, so closing one shows up as a failure asking for the
+   * comment to be updated, and a NEW mis-pool shows up as a row that was refused and no longer is.
+   */
+  it("R6: every real SKU-suffix phrasing lands where the measurement says, pooled ones included", () => {
+    expect(SKU_SUFFIX_PHRASINGS).toHaveLength(20);
+    for (const [componentType, title, expected] of SKU_SUFFIX_PHRASINGS) {
+      const result = normalizeListing({ title, priceCents: 6300, componentType });
+      expect(result.modelKey === null ? "refused" : "pooled", title).toBe(expected);
+    }
+    // Not satisfiable by refusing everything, nor by matching everything. EIGHT rows pool:
+    // seven are mis-pools and accepted exposure, and the eighth -- the Founders Edition -- is
+    // the correct answer, because it is the same product as the board-partner cards.
+    expect(SKU_SUFFIX_PHRASINGS.filter(([, , e]) => e === "pooled")).toHaveLength(8);
   });
 
   it("F5c: no board-partner brand word refuses a real component listing", () => {
@@ -608,7 +683,7 @@ describe("normalizeListing -- properties of the vocabularies", () => {
    * here until it is removed, neutralised, or -- as with `pack` -- deliberately allowed to win.
    * The four SYSTEM_PHRASES rows are harmless: both paths give `whole-system`.
    */
-  it("T13: exactly fifteen sub-phrase overlaps exist across the seventeen vocabularies", () => {
+  it("T13: exactly fifteen sub-phrase overlaps exist across the sixteen vocabularies", () => {
     const vocabularies: [string, readonly string[]][] = [
       ...(Object.entries(MARKERS) as [string, readonly string[]][]).map(
         ([type, phrases]) => [`MARKERS.${type}`, phrases] as [string, readonly string[]],
@@ -620,9 +695,8 @@ describe("normalizeListing -- properties of the vocabularies", () => {
       ["MULTIPLE", MULTIPLE],
       ["WHOLE_UNIT", [...WHOLE_UNIT]],
       ["MULTI_UNIT", [...MULTI_UNIT]],
-      ["FREE_IS_NOT_THE_ITEM", [...FREE_IS_NOT_THE_ITEM]],
     ];
-    expect(vocabularies).toHaveLength(17);
+    expect(vocabularies).toHaveLength(16);
 
     const sequence = (phrase: string): string[] => tokenValues(tokenize(phrase));
     const isSubPhrase = (inner: string[], outer: string[]): boolean => {

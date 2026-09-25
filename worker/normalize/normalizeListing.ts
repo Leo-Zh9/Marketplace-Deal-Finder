@@ -20,6 +20,7 @@ import {
   MODEL_INDEXES,
   containsPhrase,
   matchCatalogModels,
+  matchCatalogSpans,
   phraseSpans,
   tokenValues,
   tokenize,
@@ -213,50 +214,6 @@ export const MULTIPLE = ["lot of", "bundle", "pair of", "set of", "pcs", "pieces
  */
 export const MULTI_UNIT = new Set(["pack"]);
 
-/**
- * WHAT COUNTS AS EVIDENCE THAT THE ITEM IS FREE, as opposed to the word `free` appearing
- * somewhere in the title. Rule 8 used to test the bare token anywhere, so
- * `"GeForce RTX 5080 - free shipping"` at CA$0 was stored `VALID` WITH a catalog model key --
- * and `dealRules.decide` reads `VALID` plus a zero price under `MAXIMUM_PRICE` as
- * `DEAL / within-maximum`. That is the verdict PR #6 exists to prevent.
- *
- * THE POSITION IS ON THE QUALIFIER AND THE "ANYWHERE" IS ON THE DISQUALIFIER. That asymmetry is
- * the whole design, and the first attempt had it backwards: it tested three words at exactly the
- * SECOND token, so one adjective walked straight through -- `"Free local pickup - GeForce RTX
- * 5080"` at CA$0 was stored VALID with a model key, and "free local pickup" is the commonest
- * form of the phrase on this marketplace. A denylist tested at one position is a denylist of
- * positions, not of words.
- *
- * So: `free` must LEAD the title, and none of the words below may appear ANYWHERE in it. One
- * predicate closes the whole family -- pickup, local pickup, free shipping, ships free, free
- * delivery -- instead of one word per review round.
- *
- * `pick` IS IN THE SET BECAUSE THE TOKENIZER SPLITS `pick up` INTO TWO TOKENS, so `pickup` alone
- * does not cover it -- MEASURED: `"FREE GeForce RTX 5080 pick up only"` walked through the set
- * without it, at a real CA$0. THE HONEST COST OF THAT ENTRY: a genuinely free item that is ALSO
- * collection-only is now refused, because a token denylist cannot tell `free ... pick up only`
- * from `free pick up`. A lost reference, and the reason `FREE_PHRASINGS` is committed beside it.
- *
- * A POSITION-FREE PHRASE LIST WAS DELETED HERE RATHER THAN PATCHED. `FREE_ITEM_PHRASES`
- * (`free to a good home`, `free item`) matched anywhere, so `"GeForce RTX 5080 with free item
- * included"` qualified at CA$0. Anchoring those phrases at position 0 would have made them
- * exactly equivalent to the leading-token test they sit beside, since both begin with `free` --
- * dead vocabulary by the same measure that keeps `nvidia` and `amd` under review. The cost is
- * named: a genuinely free item phrased tail-first (`"GeForce RTX 5080, free to a good home"`) is
- * now NEEDS_REVIEW. A lost reference, never a wrong one.
- */
-export const FREE_IS_NOT_THE_ITEM = new Set([
-  "shipping",
-  "ship",
-  "ships",
-  "delivery",
-  "delivered",
-  "pickup",
-  "pick",
-  "collection",
-  "postage",
-]);
-
 const DIGITS = /^[0-9]+$/;
 const LETTERS = /^[a-z]+$/;
 
@@ -403,10 +360,6 @@ const hasUncovered = (
   return values.some((value, index) => vocabulary.has(value) && !covered.has(index));
 };
 
-/** True when the TITLE says the ITEM itself is free -- not that the shipping or pickup is. */
-export const freeItemEvidence = (values: readonly string[]): boolean =>
-  values[0] === "free" && !values.some((value) => FREE_IS_NOT_THE_ITEM.has(value));
-
 /**
  * ONLY WHOLE_UNIT IS NEUTRALISED BY A MARKER. This is the only place `hasUncovered` is called;
  * SYSTEM_PHRASES here, and MULTIPLE / MULTI_UNIT / both multiplier predicates in rule 7, are
@@ -422,6 +375,42 @@ export const freeItemEvidence = (values: readonly string[]): boolean =>
  * if the mechanism were extended. Their collisions are with catalog MODEL NAMES and with
  * component product lines, which a marker cannot dissolve by construction.
  */
+/**
+ * WHAT COUNTS AS EVIDENCE THAT THE ITEM ITSELF IS FREE, as opposed to the shipping, the pickup
+ * or something bundled with it. Rule 8 used to test the bare token anywhere, so
+ * `"GeForce RTX 5080 - free shipping"` at CA$0 was stored `VALID` WITH a catalog model key --
+ * and `dealRules.decide` reads `VALID` plus a zero price under `MAXIMUM_PRICE` as
+ * `DEAL / within-maximum`. That is the verdict PR #6 exists to prevent.
+ *
+ * THIS IS A QUALIFIER, NOT A DENYLIST, AND THAT IS THE WHOLE POINT. `free` must LEAD the title
+ * and the very next token must belong to the ITEM -- covered by a marker phrase of the declared
+ * type, or inside a matched catalog model's span. A denylist of the other thing was tried and
+ * REPLACED: it needed patching twice inside one review round (`pickup`, then `pick`, because the
+ * tokenizer splits `pick up` in two), and a token denylist cannot tell `"free ... pick up only"`
+ * -- a free graphics card collected in person -- from `"free pick up"`. Enumerating a
+ * natural-language family is instance-shaped by construction; asking what the word `free` is
+ * attached to is not, and it needs no list to maintain.
+ *
+ * THE DIRECTION OF ITS MISTAKES IS THE SAFE ONE. A free listing cannot reach a benchmark at all
+ * -- `recordSightings` requires `priceCents > 0` -- so the only thing `VALID`-at-zero buys is a
+ * `DEAL` verdict. Refusing a zero-price phrasing costs no reference and removes a spurious deal.
+ *
+ * THE NAMED COST, BOTH HALVES: a genuinely free item phrased tail-first
+ * (`"GeForce RTX 5080, free to a good home"`) and one whose title puts anything between `free`
+ * and the item (`"Free to a good home GeForce RTX 5080"`) are both `NEEDS_REVIEW`.
+ */
+export const freeItemEvidence = (
+  values: readonly string[],
+  tokens: readonly Token[],
+  declared: Listing["componentType"],
+): boolean => {
+  if (values[0] !== "free") return false;
+  if (markerCoverage(values, declared).has(1)) return true;
+  return matchCatalogSpans(MODEL_INDEXES[declared], tokens).some(
+    (span) => span.start <= 1 && 1 < span.end,
+  );
+};
+
 export const systemEvidence = (
   values: readonly string[],
   declared: Listing["componentType"],
@@ -510,14 +499,15 @@ export const normalizeListing = (input: {
     return refuse("NEEDS_REVIEW", "unknown-quantity");
   }
 
-  // 8: CA$0 with nothing saying the ITEM is free is a placeholder, not a price.
+  // 8: CA$0 with nothing saying the ITEM is free is a placeholder, not a price. See
+  // `freeItemEvidence`: the word must LEAD and must be attached to the item, not to the postage.
   //
   // MEASURED, because the two comments that used to describe this disagreed: `parsePriceText`
   // returns NULL for the word "Free" and ZERO for "CA$0" -- and Facebook renders a genuinely free
   // item as "CA$0", which is exactly why a real zero can reach this rule and why the exemption
   // below exists at all. The claim that an explicitly free listing never arrives here with 0 was
   // false; worker/api/priceText.ts had it right.
-  if (input.priceCents === 0 && !freeItemEvidence(values)) {
+  if (input.priceCents === 0 && !freeItemEvidence(values, tokens, declared)) {
     return refuse("NEEDS_REVIEW", "ambiguous-zero-price");
   }
 
