@@ -96,9 +96,25 @@ export type VerdictsResult =
  *
  * THE TRIGGER, as a share, the way `runMonitor.ts` phrases its own: revisit when this
  * endpoint's share approaches the 20% of the daily read allowance `runCleanup` already reserves
- * -- i.e. when `corpus x loads-per-day x 5` approaches 1,000,000. At the design's stated ~8,300
- * listing ceiling that is ~24 page loads/day; at 20 loads/day it is a corpus of 10,000. Both
- * readings of one inequality, and both measurable today.
+ * -- i.e. when `corpus x loads-per-day x 5` approaches 1,000,000. At 20 loads/day that is a
+ * corpus of 10,000. BUDGET FROM THE CORPUS, and measure it; do not derive it from ~8,300.
+ *
+ * WHY NOT FROM ~8,300, which this paragraph used to anchor on. `docs/phase-3c-storage.md:125`
+ * derives ~8,300 as a WRITE-budget STEADY STATE of TRACKED listings -- 12 rows written per
+ * listing per day at 48 scans -- and it is NOT a bound on the size of this table, because
+ * NOTHING IN PRODUCTION DELETES FROM `listings`. MEASURED: every `DELETE FROM listings` in the
+ * repository is a test truncate (`worker/testing/d1.ts`, `scripts/e2e-local.sh`, one case in
+ * this file's own suite). Production prunes `price_observations`
+ * (`cleanupStaleObservations` CLEAN_B, `recordSightings` DELETE_OBS), `model_stats`
+ * (CLEAN_SWEEP, `WHERE count = 0`) and `monitor_runs` (PRUNE_RUNS) -- and nothing else. So the
+ * corpus this statement SCANS is cumulative while 8,300 is a steady state of LIVE listings: a
+ * reader budgeting from it under-budgets this read and revisits it too late. The
+ * "20 loads/day -> corpus of 10,000" reading is anchor-free and is the one to use.
+ *
+ * Both readings are one inequality and both are measurable today. The anchor is worth naming
+ * because the paragraph above already refuses the adjacent trap -- `LIMIT 51` bounds the
+ * RESPONSE and not `rows_read` -- and then took a steady-state WRITE figure as a ceiling on a
+ * cumulative SCAN. Two units confused in the same comment that insists on the distinction.
  */
 export const SELECT_VERDICTS = `SELECT l.source, l.listing_id, l.component_type, l.model_key,
        l.variant_key, l.title, l.price_cents, l.location_text, l.url, l.last_seen_at,

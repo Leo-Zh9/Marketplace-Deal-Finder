@@ -167,7 +167,9 @@ function App({ identity, onSignOut, getToken }: AppProps) {
        * saying so -- the market lives in `watch_market`, which this UI cannot read or edit, and
        * the deal rule lives in `search_settings`, which the frontend never calls. Before this
        * slice the whole form was consistently fictional; it is now half real, with no indication
-       * which half. The fix is step 4 (the settings and market UI), not a string here.
+       * which half. The fix is the settings-and-market UI -- the work that lets this form read
+       * and write `search_settings` and `watch_market` instead of starting from
+       * `initialSettings` -- not a string here.
        */
       const result = await marketplaceClient.preview(settings, getToken);
       setListings(result.listings);

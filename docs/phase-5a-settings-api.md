@@ -112,9 +112,24 @@ does not contain (`["GET","HEAD"]`, `["GET","OPTIONS"]`, `["POST"]`, …).
 
 `/api/verdicts` was added by the read-path slice and belongs in this table for the reason the
 table exists: it is the **advertised browser surface**, and a route missing from it answers `403`
-to a cross-origin preflight while every unit test and every `curl` still passes. The collector
-routes (`POST /api/listings`, `GET /api/watch-targets`) are deliberately **absent** — they are
-not browser routes, and a row for either would open a real browser channel silently.
+to a cross-origin preflight. The collector routes (`POST /api/listings`,
+`GET /api/watch-targets`) are deliberately **absent** — they are not browser routes, and a row
+for either would open a real browser channel.
+
+**Each of those three mistakes is guarded, and here is what notices**, measured by making it:
+
+| mistake | what goes red |
+|---|---|
+| drop the `/api/verdicts` row | `V-6`, `V-7`, and the e2e's `pf /api/verdicts GET` (204 → 403) |
+| add `/api/listings` | `V-6`, `X6b`, `X6c` |
+| add `/api/watch-targets` | `V-6`, `X-a`, `X-b` |
+
+That table replaces an earlier claim here that a missing row passes "every unit test and every
+`curl`", and that a collector row would open a channel "silently". **Both were false**, and the
+second was false even before this slice. The belief worth refusing is the one those sentences
+invite — "safe to drop, nothing tests it" — because it is how the `/api/verdicts` row went
+missing from a report in the first place. A row in this table is cheap to verify; assume it is
+unguarded and you will delete it.
 
 Two consequences worth stating plainly:
 
