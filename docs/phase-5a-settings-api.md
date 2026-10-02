@@ -102,11 +102,34 @@ They are granted **per path**, from one table in `worker/index.ts`:
 | `/api/auth/session` | `GET` | `GET, OPTIONS` | `Authorization, Accept` |
 | `/api/status` | `GET` | `GET, OPTIONS` | `Authorization, Accept` |
 | `/api/settings` | `GET`, `PUT` | `GET, PUT, OPTIONS` | `Authorization, Accept, Content-Type` |
+| `/api/verdicts` | `GET` | `GET, OPTIONS` | `Authorization, Accept` |
 
 `Content-Type` is offered to a path **if and only if that path declares a body-bearing method**
-(`PUT`/`POST`/`PATCH`) — not "if it has more than one method". Three table rows cannot tell those
-two rules apart, so `preflightHeadersFor` is exported and tested directly over method sets the
-table does not contain (`["GET","HEAD"]`, `["GET","OPTIONS"]`, `["POST"]`, …).
+(`PUT`/`POST`/`PATCH`) — not "if it has more than one method". The table's rows cannot tell those
+two rules apart — three could not, and four still cannot, since every row but `/api/settings` is
+read-only — so `preflightHeadersFor` is exported and tested directly over method sets the table
+does not contain (`["GET","HEAD"]`, `["GET","OPTIONS"]`, `["POST"]`, …).
+
+`/api/verdicts` was added by the read-path slice and belongs in this table for the reason the
+table exists: it is the **advertised browser surface**, and a route missing from it answers `403`
+to a cross-origin preflight. The collector routes (`POST /api/listings`,
+`GET /api/watch-targets`) are deliberately **absent** — they are not browser routes, and a row
+for either would open a real browser channel.
+
+**Each of those three mistakes is guarded, and here is what notices**, measured by making it:
+
+| mistake | what goes red |
+|---|---|
+| drop the `/api/verdicts` row | `V-6`, `V-7`, and the e2e's `pf /api/verdicts GET` (204 → 403) |
+| add `/api/listings` | `V-6`, `X6b`, `X6c` |
+| add `/api/watch-targets` | `V-6`, `X-a`, `X-b` |
+
+That table replaces an earlier claim here that a missing row passes "every unit test and every
+`curl`", and that a collector row would open a channel "silently". **Both were false**, and the
+second was false even before this slice. The belief worth refusing is the one those sentences
+invite — "safe to drop, nothing tests it" — because it is how the `/api/verdicts` row went
+missing from a report in the first place. A row in this table is cheap to verify; assume it is
+unguarded and you will delete it.
 
 Two consequences worth stating plainly:
 

@@ -16,7 +16,9 @@ const mode = shouldUseLocalDevelopmentIdentity({
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <AuthGate mode={mode} createAdapter={createFirebaseAdapter}>
-      {(identity, onSignOut) => <App identity={identity} onSignOut={onSignOut} />}
+      {(identity, onSignOut, getToken) => (
+        <App identity={identity} onSignOut={onSignOut} getToken={getToken} />
+      )}
     </AuthGate>
   </StrictMode>,
 );

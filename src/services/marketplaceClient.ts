@@ -1,16 +1,24 @@
-import { mockListings } from "../data/mockListings";
+import { requestJsonWithAuth } from "./apiClient";
 import type {
   ComponentType,
+  Listing,
   MonitoringStatus,
   PreviewResult,
   SearchSettings,
 } from "../types";
 
+type GetToken = (forceRefresh: boolean) => Promise<string | null>;
+
 export interface MarketplaceClient {
-  preview(settings: SearchSettings): Promise<PreviewResult>;
+  preview(settings: SearchSettings, getToken: GetToken): Promise<PreviewResult>;
   getMonitoringStatus(): Promise<MonitoringStatus>;
   startMonitoring(settings: SearchSettings): Promise<MonitoringStatus>;
   stopMonitoring(): Promise<MonitoringStatus>;
+}
+
+interface VerdictsResponse {
+  listings: Listing[];
+  truncated: boolean;
 }
 
 const wait = (duration = 450) =>
@@ -50,34 +58,18 @@ const matchesModelSelection = (
 };
 
 export const marketplaceClient: MarketplaceClient = {
-  async preview(settings) {
-    await wait();
+  async preview(settings, getToken) {
+    const body = await requestJsonWithAuth<VerdictsResponse>("/api/verdicts", getToken);
 
-    const scenario = getMockScenario();
-    if (scenario === "error") {
-      throw new Error("Simulated provider error");
-    }
-    if (scenario === "unavailable") {
-      return {
-        listings: [],
-        provider: "UNAVAILABLE",
-        searchedAt: new Date().toISOString(),
-      };
-    }
-
-    const listings = mockListings.filter(
+    const listings = body.listings.filter(
       (listing) =>
         settings.components.includes(listing.componentType) &&
-        matchesModelSelection(
-          listing.componentType,
-          listing.modelKey,
-          settings,
-        ),
+        matchesModelSelection(listing.componentType, listing.modelKey, settings),
     );
 
     return {
       listings,
-      provider: "AVAILABLE",
+      truncated: body.truncated,
       searchedAt: new Date().toISOString(),
     };
   },

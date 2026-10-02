@@ -86,6 +86,14 @@ is "PUT is allowed on /api/settings"          204 "$(pf /api/settings PUT)"
 is "PUT is REFUSED on /api/status"            403 "$(pf /api/status PUT)"
 is "content-type is REFUSED on /api/status"   403 "$(pf /api/status GET content-type)"
 is "DELETE is refused on /api/settings"       403 "$(pf /api/settings DELETE)"
+# THE MIRROR OF THE TWO COLLECTOR ROWS BELOW. /api/verdicts is a BROWSER route, so its row in
+# ROUTE_METHODS must exist -- MEASURED: deleting that row leaves every unit test in
+# worker/index.test.ts green and leaves `GET /api/verdicts` answering 200 over curl, because
+# curl never preflights and `npm run dev` reaches the Worker through Vite's same-origin /api
+# proxy. Production cross-origin is the only place it bites.
+is "GET is ALLOWED on /api/verdicts"          204 "$(pf /api/verdicts GET)"
+is "  ...content-type is still refused"       403 "$(pf /api/verdicts GET content-type)"
+is "  ...and PUT is refused"                  403 "$(pf /api/verdicts PUT)"
 
 echo "== settings write path =="
 sql "DELETE FROM search_settings; DELETE FROM search_revisions;" >/dev/null
@@ -387,6 +395,65 @@ has "  ...and falls back to 60000"             '"delayMs":60000' "$(cat /tmp/e2e
 collect
 is "a delay of 0 still exits 0"                0 "$COLLECTOR_EXIT"
 has "  ...and reports the 0 it was given"      '"delayMs":0' "$(cat /tmp/e2e-collector.out)"
+
+echo "== the browser read path: does the page get the verdicts? =="
+# THE VERDICT IS SEEDED WITH SQL, NOT DRAINED. This slice's claim is "the read serves what is
+# in the column", and a real drain here would need search_settings re-seeded -- which the
+# comment at the top of the collector section measures as marking the CA$0 fixture listing
+# DEAL. Whether a verdict is CORRECT is evaluateBatch's suite; whether it REACHES THE PAGE is
+# this block.
+vd() { $CURL -s -o /tmp/e2e.body -w '%{http_code}' "$@" "$BASE/api/verdicts" --max-time 15; }
+sql "UPDATE evaluation_tasks SET status='COMPLETE', verdict='DEAL' WHERE listing_id='915010494744438';
+     UPDATE evaluation_tasks SET status='PENDING', verdict=NULL WHERE listing_id='1807946430653887';" >/dev/null
+# THE NAIVE ROW IS STILL WRONG, AND THE DIFFERENTIAL BELOW IS WHAT REPLACES IT.
+# MEASURED: `-H "X-Collector-Token: $COLLECTOR_TOKEN"` on this route answers 200, not 401,
+# because the gate runs against 127.0.0.1 with APP_ENV=local and `authenticateRequest` admits
+# the LOOPBACK DEVELOPMENT IDENTITY before it reads a single header
+# (worker/auth/verifyFirebaseToken.ts:144-158). A row asserting 401 there would have been a
+# check whose claim is wider than what it can measure.
+#
+# But the claim IS makeable here. That branch is gated on
+# `APP_ENV === "local" && isLoopbackHostname(new URL(request.url).hostname)`, and its own
+# comment records that in workerd `request.url` is built from the incoming Host -- so a Host
+# header turns the branch off, with no second worker and no extra --var.
+#
+# IT IS A DIFFERENTIAL WITH A LIVE CONTROL, and all three rows are load-bearing:
+#   1. with and without the collector token, this route answers IDENTICALLY -- the token buys
+#      nothing. Goes red if anyone moves /api/verdicts onto authorizeCollector, because the
+#      token row would then be a 200 while the tokenless row stayed a refusal.
+#   2. what it answers identically IS a refusal, not a read. Without this, row 1 would pass on
+#      "both 200" -- which is what a collector-credentialled route would look like.
+#   3. the SAME token on /api/watch-targets still returns real data, so row 1 is not passing
+#      because the Host override broke everything.
+# MEASURED CODE, so nobody re-pins it: 503 AUTH_CONFIG_MISSING, not 401 AUTH_TOKEN_MISSING,
+# because wrangler.local.jsonc sets no FIREBASE_PROJECT_ID. Row 2 therefore asserts "a refusal"
+# rather than a number, and survives someone configuring one.
+hv() { $CURL -s -o /tmp/e2e.body -w '%{http_code}' -H "Host: api.example.test" "$@" --max-time 15; }
+# NAMED CODES ONLY. `case *) refused` treated curl's own `000` -- connection refused, dead port,
+# timeout -- as a refusal BY THE WORKER, so against a worker that never started rows 1 and 2
+# would both pass vacuously and only row 3 would go red. A vacuously-passing assertion is the
+# defect this whole gate exists to catch.
+refusal() { case "$1" in 401|403|503) echo refused;; 200) echo read;; *) echo "unreachable($1)";; esac; }
+VD_NO_TOKEN=$(hv "$BASE/api/verdicts")
+VD_WITH_TOKEN=$(hv -H "X-Collector-Token: $COLLECTOR_TOKEN" "$BASE/api/verdicts")
+is "the collector token changes NOTHING here" "$VD_NO_TOKEN" "$VD_WITH_TOKEN"
+is "  ...and what it changes nothing to is a refusal" refused "$(refusal "$VD_WITH_TOKEN")"
+is "  ...while that SAME token still opens its own route" 200 \
+   "$(hv -H "X-Collector-Token: $COLLECTOR_TOKEN" "$BASE/api/watch-targets")"
+is "the loopback identity reads it"            200 "$(vd -H "Origin: $ORIGIN")"
+has "  ...and the DEAL reached the wire"       '"status":"DEAL"' "$(body)"
+has "  ...with the comma price in cents"       '"priceCents":300000' "$(body)"
+has "  ...and the unjudged row says PENDING"   '"status":"PENDING"' "$(body)"
+# The CA$0 listing is stored with price_cents 0, and 0 is not null: `cents || null` would
+# serve it as unpriced.
+has "  ...and CA\$0 is ZERO on the wire"       '"priceCents":0' "$(body)"
+has "  ...and the page knows it is complete"   '"truncated":false' "$(body)"
+# THE ORDER IS THE PRODUCT. The DEAL must be first even though it is not the newest row.
+is "  ...and the DEAL sorts first"             915010494744438 \
+   "$(python3 -c "import json,sys;print(json.load(open('/tmp/e2e.body'))['listings'][0]['listingId'])")"
+h=$($CURL -s -D- -o /dev/null -H "Origin: $EVIL" "$BASE/api/verdicts" --max-time 15 | grep -ci "access-control-allow-origin: $EVIL")
+is "  ...and an evil origin is never reflected" 0 "$h"
+is "  ...and an evil origin is refused"        403 "$(code -H "Origin: $EVIL" "$BASE/api/verdicts")"
 
 ingest_tables
 

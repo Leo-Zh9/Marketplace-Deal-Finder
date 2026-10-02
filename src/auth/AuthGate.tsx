@@ -16,6 +16,7 @@ export interface AuthGateProps {
   children: (
     identity: AuthenticatedIdentity,
     onSignOut: (() => void) | undefined,
+    getToken: GetToken,
   ) => ReactNode;
 }
 
@@ -54,12 +55,14 @@ const defaultRequestSession = (getToken: GetToken) =>
 const ApprovedShell = ({
   identity,
   onSignOut,
+  getToken,
   render,
 }: {
   identity: AuthenticatedIdentity;
   onSignOut: (() => void) | undefined;
+  getToken: GetToken;
   render: AuthGateProps["children"];
-}) => <>{render(identity, onSignOut)}</>;
+}) => <>{render(identity, onSignOut, getToken)}</>;
 
 /** Copy and affordance come from the server's error code, not from the kind alone. */
 const serviceErrorFor = (error: unknown): { message: string; retryable: boolean } => {
@@ -290,6 +293,7 @@ export const AuthGate = ({
     <ApprovedShell
       identity={effectiveState.identity}
       onSignOut={adapter === null ? undefined : signOut}
+      getToken={adapter === null ? noToken : adapter.getToken}
       render={children}
     />
   );

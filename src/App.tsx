@@ -47,12 +47,22 @@ const hasErrors = (errors: ValidationErrors) =>
 
 type PendingAction = "preview" | "start" | "stop" | null;
 
+type GetToken = (forceRefresh: boolean) => Promise<string | null>;
+
+/**
+ * `getToken` IS REQUIRED AND HAS NO DEFAULT, and that is the whole guard on it. With a
+ * `= noToken` default, `main.tsx` silently dropping the prop left the entire frontend suite
+ * green -- and nothing imports `main.tsx`, so no test can ever cover that link. Required makes
+ * it a `tsc` error instead. `AuthGate` always supplies one (the adapter's, or the tokenless
+ * provider in local development), so no caller ever needed the default.
+ */
 interface AppProps {
   identity?: AuthenticatedIdentity | null;
   onSignOut?: () => void;
+  getToken: GetToken;
 }
 
-function App({ identity, onSignOut }: AppProps = {}) {
+function App({ identity, onSignOut, getToken }: AppProps) {
   const [settings, setSettings] = useState<SearchSettings>(initialSettings);
   const [radiusMode, setRadiusMode] = useState<"2" | "5" | "10" | "25" | "custom">("25");
   const [errors, setErrors] = useState<ValidationErrors>({});
@@ -60,6 +70,7 @@ function App({ identity, onSignOut }: AppProps = {}) {
   const [monitoringStatus, setMonitoringStatus] = useState(initialMonitoringStatus);
   const [pendingAction, setPendingAction] = useState<PendingAction>(null);
   const [hasPreviewed, setHasPreviewed] = useState(false);
+  const [truncated, setTruncated] = useState(false);
   const [previewedAt, setPreviewedAt] = useState<string | null>(null);
   const [requestError, setRequestError] = useState<string | null>(null);
 
@@ -146,11 +157,25 @@ function App({ identity, onSignOut }: AppProps = {}) {
     setPendingAction("preview");
     setRequestError(null);
     try {
-      const result = await marketplaceClient.preview(settings);
+      /*
+       * FOUR OF THIS FORM'S SIX FIELDS GATE A READ THAT IGNORES THEM, and that is worth saying
+       * out loud now that half the form is real. `GET /api/verdicts` takes NO parameters: the
+       * component and model selections are applied to its response client-side, and the
+       * location, the radius, the minimum discount and the maximum price reach nothing. Location
+       * and radius are nevertheless REQUIRED to press this button (validate() refuses without
+       * them), so a user in Vancouver at 2 km previews Toronto listings with nothing on screen
+       * saying so -- the market lives in `watch_market`, which this UI cannot read or edit, and
+       * the deal rule lives in `search_settings`, which the frontend never calls. Before this
+       * slice the whole form was consistently fictional; it is now half real, with no indication
+       * which half. The fix is the settings-and-market UI -- the work that lets this form read
+       * and write `search_settings` and `watch_market` instead of starting from
+       * `initialSettings` -- not a string here.
+       */
+      const result = await marketplaceClient.preview(settings, getToken);
       setListings(result.listings);
+      setTruncated(result.truncated);
       setPreviewedAt(result.searchedAt);
       setHasPreviewed(true);
-      setMonitoringStatus((current) => ({ ...current, provider: result.provider }));
     } catch (error: unknown) {
       setRequestError(
         requestErrorMessage(
@@ -244,8 +269,8 @@ function App({ identity, onSignOut }: AppProps = {}) {
           <p className="eyebrow">Deal monitoring</p>
           <h1>Find better PC component deals.</h1>
           <p>
-            Set what you are looking for and preview nearby Facebook Marketplace
-            listings before monitoring begins.
+            Set what you are looking for and preview the Facebook Marketplace
+            listings your collector has already found.
           </p>
         </section>
 
@@ -422,18 +447,22 @@ function App({ identity, onSignOut }: AppProps = {}) {
               <div className="results-heading">
                 <div>
                   <p className="eyebrow">Preview</p>
-                  <h2>Nearby listings</h2>
+                  <h2>Matching listings</h2>
                 </div>
                 {hasPreviewed && (
-                  <p>{listings.length} result{listings.length === 1 ? "" : "s"}</p>
+                  <p>
+                    {listings.length}
+                    {truncated && listings.length > 0 ? "+" : ""} result
+                    {listings.length === 1 ? "" : "s"}
+                  </p>
                 )}
               </div>
 
               {pendingAction === "preview" ? (
                 <div className="loading-state">
                   <span className="spinner" aria-hidden="true" />
-                  <strong>Searching Facebook Marketplace…</strong>
-                  <p>Looking for the newest matching listings.</p>
+                  <strong>Reading your collected listings…</strong>
+                  <p>Fetching the latest verdicts from your database.</p>
                 </div>
               ) : monitoringStatus.provider === "UNAVAILABLE" ? (
                 <div className="empty-state empty-state--warning">
@@ -447,11 +476,40 @@ function App({ identity, onSignOut }: AppProps = {}) {
                   <h3>Your preview will appear here</h3>
                   <p>Select components and a location, then preview the latest listings.</p>
                 </div>
+              ) : listings.length === 0 && truncated ? (
+                /*
+                 * A NON-EMPTY DATABASE MUST NOT BE REPORTED AS EMPTY, and without this branch it
+                 * was. The server bounds the page at 50 rows deal-first and the component/model
+                 * filter runs HERE, in the browser, AFTER that bound -- so when the 50 rows it
+                 * sent are all of a component the user is not watching, the page said
+                 * "0+ results / No matching listings found" and then advised two things that
+                 * cannot help: select more components (the user's own component is not on the
+                 * page) and wait for the next collection run (the listings are already
+                 * collected). `migrations/0005` seeds a cpu target AND a gpu target, so two
+                 * component types share one page from the very first collection run; this is not
+                 * a large-corpus problem.
+                 *
+                 * `truncated` is the fact that falsifies the old message and it was already in
+                 * state, unused by this branch. THE REAL FIX IS SERVER-SIDE FILTERING -- a
+                 * `component_type IN (...)` predicate bound from the request, so the bound
+                 * applies to the filtered set instead of ahead of it. Named, not built: it
+                 * changes the endpoint's contract and its cost model. Until then this branch is
+                 * what keeps the page from lying, and it offers NO next action because there is
+                 * no user action that helps.
+                 */
+                <div className="empty-state empty-state--warning">
+                  <div className="empty-icon" aria-hidden="true">!</div>
+                  <h3>Nothing on this page matched</h3>
+                  <p>
+                    The server sent a partial page of listings and none of them matched your
+                    selection. There may be matching listings it did not send.
+                  </p>
+                </div>
               ) : listings.length === 0 ? (
                 <div className="empty-state">
                   <div className="empty-icon" aria-hidden="true">0</div>
                   <h3>No matching listings found</h3>
-                  <p>Try selecting more models or increasing the search radius.</p>
+                  <p>Try selecting more components or models, or wait for the next collection run.</p>
                 </div>
               ) : (
                 <>
@@ -460,7 +518,7 @@ function App({ identity, onSignOut }: AppProps = {}) {
                   )}
                   <div className="listing-list">
                     {listings.map((listing) => (
-                      <ListingCard key={listing.listingId} listing={listing} />
+                      <ListingCard key={`${listing.source}:${listing.listingId}`} listing={listing} />
                     ))}
                   </div>
                 </>
@@ -472,7 +530,7 @@ function App({ identity, onSignOut }: AppProps = {}) {
 
       <footer className="app-footer">
         <p>Marketplace Deal Finder · Private prototype</p>
-        <p>Phase 1 uses sample listing data. No marketplace requests are made.</p>
+        <p>Listings and verdicts are read from your own collection database.</p>
       </footer>
     </div>
   );
