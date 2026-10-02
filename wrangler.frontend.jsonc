@@ -1,0 +1,31 @@
+{
+  // THE DASHBOARD'S DEPLOY CONFIG. The API Worker is `wrangler.jsonc`; this is the static site
+  // that calls it, and the two are separate Workers with separate names and separate URLs.
+  //
+  // WHY THIS FILE EXISTS. The dashboard was deployed for months with no committed config, by
+  // hand-written `wrangler deploy` invocations. That is how it came to be serving a build whose
+  // Content-Security-Policy still contained the literal string `REPLACE_WITH_WORKER_ORIGIN` --
+  // a policy that silently blocks every API call and the Google sign-in frame, with symptoms
+  // that look nothing like a missed substitution step.
+  //
+  // DEPLOYING IS NOT `wrangler deploy` ALONE. `dist/_headers` ships two CSP placeholders that
+  // the build does not fill in. docs/phase-2-deployment-setup.md step 6 is the procedure and it
+  // is not optional:
+  //
+  //   1. export the five VITE_* values (see .env.example; they are public, not secrets)
+  //   2. npm run build
+  //   3. substitute REPLACE_WITH_WORKER_ORIGIN and REPLACE_WITH_FIREBASE_AUTH_DOMAIN in
+  //      dist/_headers -- hosts, no scheme; the policy already carries https://
+  //   4. verify: grep -c REPLACE_WITH dist/_headers  ->  0
+  //   5. npx --no-install wrangler deploy -c wrangler.frontend.jsonc
+  //
+  // `assets.directory` is resolved relative to THIS FILE, which is why it is "./dist" and why
+  // the earlier out-of-tree config failed with ENOENT on a path under /tmp.
+  "name": "marketplace-deal-finder",
+  "compatibility_date": "2026-09-10",
+  "assets": {
+    "directory": "./dist",
+    // The app is a single-page router: an unknown path must serve index.html, not 404.
+    "not_found_handling": "single-page-application"
+  }
+}
