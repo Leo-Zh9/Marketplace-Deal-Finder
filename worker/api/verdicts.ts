@@ -1,7 +1,17 @@
 /**
  * GET /api/verdicts -- the evaluated listings the page shows: every stored listing with the
- * verdict 3D committed for it, the market average that verdict rested on, newest-first inside
- * a deal-first ordering, bounded.
+ * verdict 3D committed for it, the market average AS IT STANDS NOW, newest-first inside a
+ * deal-first ordering, bounded.
+ *
+ * "AS IT STANDS NOW", NOT "THE AVERAGE THAT VERDICT RESTED ON". The earlier wording claimed
+ * more than this read can deliver: the basis of a verdict is never persisted -- 3D commits
+ * `verdict` and not `reason`, and nothing stores the aggregate it was computed against -- and
+ * `evaluateBatch.ts:98-100` states that NOTHING REQUEUES A TASK WHEN THE MARKET CHANGES. So an
+ * older DEAL steady-states beside a comparison drawn from a market that has since moved, and
+ * the page can read `Deal / vs. market average 4.0% above`. That is a true statement of two
+ * separately-true facts, and it is the cost of serving a verdict and a live aggregate together.
+ * Serving the basis instead would need it persisted, which is a 3D change this slice does not
+ * make. Do not restore the stronger wording without that column.
  */
 
 import { referenceAverageCents } from "../evaluation/dealRules";
@@ -53,6 +63,43 @@ export type VerdictsResult =
       code: "VERDICTS_STORAGE_FAILED" | "VERDICTS_ROWS_UNUSABLE";
     };
 
+/**
+ * THE PLAN, THE GROWTH TERM AND THE LEVER, in the idiom `migrations/0002` already uses for its
+ * own three statements. MEASURED on miniflare D1 via `EXPLAIN QUERY PLAN`:
+ *
+ *   SCAN l USING INDEX sqlite_autoindex_listings_1
+ *   SEARCH t USING INDEX sqlite_autoindex_evaluation_tasks_1 (source=? AND listing_id=?) LEFT-JOIN
+ *   SEARCH p USING INDEX sqlite_autoindex_price_observations_1 (source=? AND listing_id=?) LEFT-JOIN
+ *   SEARCH s USING INDEX sqlite_autoindex_model_stats_1 (market_key=? AND model_key=? AND variant_key=?) LEFT-JOIN
+ *   USE TEMP B-TREE FOR ORDER BY
+ *
+ * A full scan of `listings` plus one primary-key seek per row into each of the three joined
+ * tables. `rows_read` is LINEAR IN THE CORPUS and each POPULATED joined table adds exactly one
+ * more multiple of it. MEASURED, `rows_read` at corpus 200 and 400 (identical ratios at both,
+ * so the term is linear and not a fixture artefact):
+ *
+ *   listings alone ................... 2x corpus
+ *   + evaluation_tasks ............... 3x
+ *   + price_observations ............. 4x
+ *   + model_stats .................... 5x   <-- production's shape
+ *
+ * So budget 5 x corpus per page load. `LIMIT 51` BOUNDS THE RESPONSE AND NOT `rows_read`;
+ * saying otherwise would be a claim wider than the measurement.
+ *
+ * NO INDEX FIXES THIS, and the reason is structural rather than a missing index: the leading
+ * term of the ORDER BY is a CASE over a JOINED table's column, which no index on `listings` can
+ * serve. Four variants were measured on a 2,000-row corpus -- an index on
+ * `listings(last_seen_at)`, one on `evaluation_tasks(verdict)`, both together, and
+ * `last_seen_at` clustered into heartbeat buckets -- and every one left `rows_read` unchanged
+ * with a byte-identical plan. THE LEVER IS A DENORMALISED VERDICT COLUMN ON `listings`, which
+ * is a migration AND a second writer, not an index.
+ *
+ * THE TRIGGER, as a share, the way `runMonitor.ts` phrases its own: revisit when this
+ * endpoint's share approaches the 20% of the daily read allowance `runCleanup` already reserves
+ * -- i.e. when `corpus x loads-per-day x 5` approaches 1,000,000. At the design's stated ~8,300
+ * listing ceiling that is ~24 page loads/day; at 20 loads/day it is a corpus of 10,000. Both
+ * readings of one inequality, and both measurable today.
+ */
 export const SELECT_VERDICTS = `SELECT l.source, l.listing_id, l.component_type, l.model_key,
        l.variant_key, l.title, l.price_cents, l.location_text, l.url, l.last_seen_at,
        t.verdict AS verdict,
@@ -109,6 +156,35 @@ export const discountPercentFrom = (
     ? null
     : ((averageCents - priceCents) / averageCents) * 100;
 
+/**
+ * THE SAME GATE `decide` APPLIES TO THE SAME TWO VALUES, and it is not defence in depth.
+ * `dealRules.ts:190-198` refuses to judge on a `count` or `total` that is negative or not a safe
+ * integer, and answers `invalid-reference-aggregate` rather than `insufficient-evidence`
+ * precisely because "waiting repairs 4; waiting never repairs -1, a non-integer, or a negative
+ * total". This path had no such gate: `referenceAverageCents` gates only on `count <= 0`
+ * (dealRules.ts:124-128) and the presentation gate below tests only
+ * `count >= MINIMUM_REFERENCE_COUNT`, which BOTH `6` and the non-integer `5.5` pass. So
+ * `reference_count: 6, reference_total_cents: -600000` served `averagePriceCents: -100000` and
+ * the card rendered "Market average  -$1,000.00".
+ *
+ * REACHABILITY IS BETTER THAN "SOMEONE WROTE A CORRUPT ROW", AND MEASURED: two of the three
+ * corrupt states are manufactured BY THE EXCLUSION ARITHMETIC IN THE STATEMENT ABOVE out of
+ * rows that satisfy every `CHECK` on `model_stats` (`count >= 0`, `total_price_cents >= 0`,
+ * `count > 0 OR total_price_cents = 0`). `s.total_price_cents - p.price_cents` goes negative as
+ * soon as the observation and the aggregate drift apart -- the divergence 3C's own doc keeps a
+ * drift-detection section for -- and `s.count - 1` goes negative on a perfectly legal `(0, 0)`
+ * aggregate. The third needs no drift at all: `count` is INTEGER *affinity*, so `5.5` passes
+ * `count >= 0`, reads back as `5.5`, and then passes `>= MINIMUM_REFERENCE_COUNT`. All three are
+ * pinned by V-22.
+ *
+ * IT WARNS RATHER THAN ONLY WITHHOLDING. Withholding in silence is indistinguishable from thin
+ * evidence on the wire and on the page, which is the exact miscoding `decide`'s two separate
+ * reasons exist to prevent -- it "sends an operator looking for more observations when
+ * observations were never the problem".
+ */
+const corruptAggregate = (value: number | null): boolean =>
+  value !== null && (!Number.isSafeInteger(value) || value < 0);
+
 const catalogComponent = (value: string): ComponentType | null =>
   Object.hasOwn(CATALOG_COMPONENT_ID, value)
     ? CATALOG_COMPONENT_ID[value as keyof typeof CATALOG_COMPONENT_ID]
@@ -122,10 +198,16 @@ export const toWireListing = (row: VerdictRow): WireListing | null => {
   }
 
   const count = row.reference_count;
-  const averageCents =
-    count !== null && count >= MINIMUM_REFERENCE_COUNT
-      ? referenceAverageCents(row.reference_total_cents, count)
-      : null;
+  const total = row.reference_total_cents;
+  let averageCents: number | null = null;
+  if (corruptAggregate(count) || corruptAggregate(total)) {
+    console.warn(
+      `verdicts: listing ${row.listing_id} has a corrupt reference aggregate ` +
+        `(count ${String(count)}, total ${String(total)}); withholding the market average`,
+    );
+  } else if (count !== null && count >= MINIMUM_REFERENCE_COUNT) {
+    averageCents = referenceAverageCents(total, count);
+  }
   const discountPercent = discountPercentFrom(row.price_cents, averageCents);
 
   return {

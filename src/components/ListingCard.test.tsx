@@ -46,8 +46,8 @@ describe("ListingCard", () => {
   });
 
   it.each([
-    ["DEAL", "Deal", "Meets your deal rule."],
-    ["NOT_DEAL", "Not a deal", "Does not meet your deal rule."],
+    ["DEAL", "Deal", "Judged a deal."],
+    ["NOT_DEAL", "Not a deal", "Judged not a deal."],
     ["NEEDS_REVIEW", "Needs review", "Could not be judged automatically -- check this one yourself."],
     ["PENDING", "Pending", "Waiting to be evaluated."],
   ] as Array<[EvaluationStatus, string, string]>)(
@@ -69,14 +69,18 @@ describe("ListingCard", () => {
   });
 
   /**
-   * BOTH SIGNS, because the orchestrator's show-everything ruling puts NOT_DEAL rows on screen
-   * and a price above the market average is then the common case. The label must be true of a
-   * negative number, so it is "vs. market average" and not "Estimated discount".
+   * BOTH DIRECTIONS, AS A WORD. The show-everything ruling puts NOT_DEAL rows on screen, so a
+   * price ABOVE the market average is the common case -- and the signed form rendered
+   * "vs. market average  -50.0%" for a listing fifty percent MORE expensive, which is the one
+   * thing on this card that could change a buying decision for the worse. "Estimated discount"
+   * was at least wrong in only one direction; a bare negative under a neutral label is
+   * ambiguous in both. The third column is the string that must NOT survive: a minus sign on
+   * this line is the defect, so the revert is pinned from both sides.
    */
   it.each([
-    ["below the average", 150000, "50.0%"],
-    ["above the average", 450000, "-50.0%"],
-  ])("states the comparison for a price %s", (_label, priceCents, rendered) => {
+    ["below the average", 150000, "50.0% below", "-50.0%"],
+    ["above the average", 450000, "50.0% above", "-50.0%"],
+  ])("states the comparison for a price %s", (_label, priceCents, rendered, forbidden) => {
     render(
       <ListingCard
         listing={row({
@@ -91,6 +95,7 @@ describe("ListingCard", () => {
     );
     expect(screen.getByText("vs. market average")).toBeInTheDocument();
     expect(screen.getByText(rendered)).toBeInTheDocument();
+    expect(screen.queryByText(forbidden)).not.toBeInTheDocument();
   });
 
   /**

@@ -80,7 +80,7 @@ describe("Marketplace Deal Finder", () => {
     );
     expect(screen.getByText("Deal")).toBeInTheDocument();
     expect(screen.getByText("$3,000.00")).toBeInTheDocument();
-    expect(screen.getByText("Meets your deal rule.")).toBeInTheDocument();
+    expect(screen.getByText("Judged a deal.")).toBeInTheDocument();
   });
 
   it("shows a bounded page as bounded, a null price as unpriced, and every status", async () => {
@@ -143,6 +143,68 @@ describe("Marketplace Deal Finder", () => {
     expect(screen.getByRole("heading", { name: "from ebay" })).toBeInTheDocument();
     spy.mockRestore();
     expect(errors.filter((message) => message.includes("same key"))).toEqual([]);
+  });
+
+  /** The four steps every preview test repeats, so the two below are about their own subject. */
+  const previewWatchingGpu = async (user: ReturnType<typeof userEvent.setup>) => {
+    await user.click(screen.getByRole("checkbox", { name: /^GPU:/i }));
+    await user.type(screen.getByLabelText("Search location"), "Toronto");
+    await user.click(screen.getByRole("button", { name: "Toronto, ON" }));
+    await user.click(screen.getByRole("button", { name: "Preview listings" }));
+  };
+
+  /**
+   * A NON-EMPTY DATABASE REPORTED AS EMPTY -- the defect, not a decoration.
+   * The server bounds the page at 50 rows deal-first and the component filter runs in the
+   * browser AFTER that bound, so a page made entirely of a component the user is not watching
+   * filtered down to nothing and the page said "0+ results / No matching listings found" and
+   * then advised two things that cannot help. `migrations/0005` seeds a cpu target AND a gpu
+   * target, so two component types share one page from the first collection run onwards: this
+   * is reachable immediately, not at some future corpus.
+   *
+   * ALL FOUR CLAIMS ARE ASSERTED, the two that must appear and the two that must not, because
+   * "No matching listings found" is the authoritative falsehood and the two next actions are
+   * what make it expensive.
+   */
+  it("says the page was partial when a bounded page filtered down to nothing", async () => {
+    const user = userEvent.setup();
+    stubVerdicts({
+      listings: [
+        wireListing({ listingId: "cpu-a", componentType: "cpu", modelKey: "Ryzen 9 9950X3D" }),
+        wireListing({ listingId: "cpu-b", componentType: "cpu", modelKey: "Ryzen 7 9800X3D" }),
+      ],
+      truncated: true,
+    });
+    render(<App getToken={noToken} />);
+    await previewWatchingGpu(user);
+
+    expect(await screen.findByText("Nothing on this page matched")).toBeInTheDocument();
+    expect(
+      screen.getByText(/There may be matching listings it did not send/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("No matching listings found")).not.toBeInTheDocument();
+    expect(screen.queryByText(/wait for the next collection run/)).not.toBeInTheDocument();
+    // A bound of zero must not advertise itself as a bound: "0+" claims a 51st row exists.
+    expect(screen.getByText("0 results")).toBeInTheDocument();
+    expect(screen.queryByText("0+ results")).not.toBeInTheDocument();
+  });
+
+  /**
+   * THE CONTROL, and it is what stops the branch above swallowing the ordinary case: when the
+   * server says the page is COMPLETE, an empty result really is empty and "wait for the next
+   * collection run" is the right advice. Without this row, `truncated` could be dropped from
+   * the condition and nothing would notice.
+   */
+  it("keeps the ordinary empty state when the server sent a complete page", async () => {
+    const user = userEvent.setup();
+    stubVerdicts({ listings: [], truncated: false });
+    render(<App getToken={noToken} />);
+    await previewWatchingGpu(user);
+
+    expect(await screen.findByText("No matching listings found")).toBeInTheDocument();
+    expect(screen.getByText(/wait for the next collection run/)).toBeInTheDocument();
+    expect(screen.queryByText("Nothing on this page matched")).not.toBeInTheDocument();
+    expect(screen.getByText("0 results")).toBeInTheDocument();
   });
 
   it("starts and stops the mock monitor", async () => {

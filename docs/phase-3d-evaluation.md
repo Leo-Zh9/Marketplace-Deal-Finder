@@ -246,5 +246,12 @@ historical price table to replay from.
   not at all. The time to revisit any one task grows linearly with the population; if that ever
   becomes a problem the right lever is a re-check interval on `evaluated_at`, not a change to the
   ordering.
-- **The frontend's `EvaluationStatus` uses `"NOT_A_DEAL"` while 3D's `Verdict` uses `"NOT_DEAL"`.**
-  Phase 5 owns that mapping.
+- **The frontend's `EvaluationStatus` used `"NOT_A_DEAL"` while 3D's `Verdict` uses `"NOT_DEAL"`.**
+  **Settled by the read-path slice, and settled by renaming rather than by mapping**: the
+  frontend union, `statusLabels`, `statusHints` and the `.status-badge--not_deal` CSS class all
+  now carry the database's spelling, so there is no translation layer to keep honest. The thing
+  to know if anyone reintroduces one: `statusFor` in `worker/api/verdicts.ts` **fails closed**,
+  folding every unrecognised verdict string — `"NOT_A_DEAL"` included — to `NEEDS_REVIEW`. That
+  is correct for a corrupt column and it means a reintroduced mapping bug would be **quiet**:
+  every affected card would read "Needs review" rather than throwing or showing a blank badge.
+  Rename both sides or neither.

@@ -157,6 +157,18 @@ function App({ identity, onSignOut, getToken }: AppProps) {
     setPendingAction("preview");
     setRequestError(null);
     try {
+      /*
+       * FOUR OF THIS FORM'S SIX FIELDS GATE A READ THAT IGNORES THEM, and that is worth saying
+       * out loud now that half the form is real. `GET /api/verdicts` takes NO parameters: the
+       * component and model selections are applied to its response client-side, and the
+       * location, the radius, the minimum discount and the maximum price reach nothing. Location
+       * and radius are nevertheless REQUIRED to press this button (validate() refuses without
+       * them), so a user in Vancouver at 2 km previews Toronto listings with nothing on screen
+       * saying so -- the market lives in `watch_market`, which this UI cannot read or edit, and
+       * the deal rule lives in `search_settings`, which the frontend never calls. Before this
+       * slice the whole form was consistently fictional; it is now half real, with no indication
+       * which half. The fix is step 4 (the settings and market UI), not a string here.
+       */
       const result = await marketplaceClient.preview(settings, getToken);
       setListings(result.listings);
       setTruncated(result.truncated);
@@ -438,7 +450,8 @@ function App({ identity, onSignOut, getToken }: AppProps) {
                 {hasPreviewed && (
                   <p>
                     {listings.length}
-                    {truncated ? "+" : ""} result{listings.length === 1 ? "" : "s"}
+                    {truncated && listings.length > 0 ? "+" : ""} result
+                    {listings.length === 1 ? "" : "s"}
                   </p>
                 )}
               </div>
@@ -460,6 +473,35 @@ function App({ identity, onSignOut, getToken }: AppProps) {
                   <div className="empty-icon" aria-hidden="true">⌕</div>
                   <h3>Your preview will appear here</h3>
                   <p>Select components and a location, then preview the latest listings.</p>
+                </div>
+              ) : listings.length === 0 && truncated ? (
+                /*
+                 * A NON-EMPTY DATABASE MUST NOT BE REPORTED AS EMPTY, and without this branch it
+                 * was. The server bounds the page at 50 rows deal-first and the component/model
+                 * filter runs HERE, in the browser, AFTER that bound -- so when the 50 rows it
+                 * sent are all of a component the user is not watching, the page said
+                 * "0+ results / No matching listings found" and then advised two things that
+                 * cannot help: select more components (the user's own component is not on the
+                 * page) and wait for the next collection run (the listings are already
+                 * collected). `migrations/0005` seeds a cpu target AND a gpu target, so two
+                 * component types share one page from the very first collection run; this is not
+                 * a large-corpus problem.
+                 *
+                 * `truncated` is the fact that falsifies the old message and it was already in
+                 * state, unused by this branch. THE REAL FIX IS SERVER-SIDE FILTERING -- a
+                 * `component_type IN (...)` predicate bound from the request, so the bound
+                 * applies to the filtered set instead of ahead of it. Named, not built: it
+                 * changes the endpoint's contract and its cost model. Until then this branch is
+                 * what keeps the page from lying, and it offers NO next action because there is
+                 * no user action that helps.
+                 */
+                <div className="empty-state empty-state--warning">
+                  <div className="empty-icon" aria-hidden="true">!</div>
+                  <h3>Nothing on this page matched</h3>
+                  <p>
+                    The server sent a partial page of listings and none of them matched your
+                    selection. There may be matching listings it did not send.
+                  </p>
                 </div>
               ) : listings.length === 0 ? (
                 <div className="empty-state">

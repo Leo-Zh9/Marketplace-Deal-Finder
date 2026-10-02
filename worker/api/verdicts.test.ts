@@ -209,8 +209,14 @@ describe("GET /api/verdicts", () => {
     expect(outcome.referenceAverageCents).toBe(AVERAGE);
 
     const body = await read();
-    // THE CROSS-CHECK, both ways: the page prints the number the verdict rested on, AND that
-    // number is the one the fixture built -- so the assertion cannot pass by both sides losing.
+    // THE CROSS-CHECK, both ways: the read and `evaluateBatch` derive the SAME figure from the
+    // SAME aggregate, AND that figure is the one the fixture built -- so the assertion cannot
+    // pass by both sides losing. WHAT IT DOES NOT CLAIM, because the read cannot: that the page
+    // prints the average THIS VERDICT WAS JUDGED AGAINST. Nothing persists that -- 3D commits
+    // `verdict` and not `reason` -- and `evaluateBatch.ts:98-100` records that nothing requeues
+    // a task when the market moves, so the two agree here only because this fixture reads the
+    // aggregate at the same instant the evaluator did. In production they drift apart, which is
+    // the cost stated at the top of `verdicts.ts`.
     expect(body.listings[0].evaluation.averagePriceCents).toBe(outcome.referenceAverageCents);
     expect(body.listings[0].evaluation.averagePriceCents).toBe(AVERAGE);
   });
@@ -329,6 +335,60 @@ describe("GET /api/verdicts", () => {
       location: "location-beta",
       url: "https://example.com/url-beta",
     });
+  });
+
+  /**
+   * THE CORRUPT-AGGREGATE GATE, WHICH `decide` HAS AND THIS PATH DID NOT. Without it,
+   * `reference_count: 6, reference_total_cents: -600000` served `averagePriceCents: -100000`
+   * and the card rendered "Market average  -$1,000.00".
+   *
+   * EVERY FIXTURE HERE SATISFIES EVERY `CHECK` ON `model_stats`
+   * (`count >= 0`, `total_price_cents >= 0`, `count > 0 OR total_price_cents = 0`), which is the
+   * part worth knowing: two of the three corrupt states are manufactured BY THIS FILE'S OWN
+   * EXCLUSION ARITHMETIC out of rows the schema accepts, not by a hand-written corrupt row.
+   * `s.total_price_cents - p.price_cents` goes negative the moment the observation and the
+   * aggregate drift apart -- the divergence 3C's own doc has a drift-detection section for --
+   * and `s.count - 1` goes negative on a legal `(0, 0)` aggregate. The third, a non-integer
+   * count, stores directly: `count` is INTEGER *affinity*, so 5.5 passes `count >= 0` and reads
+   * back as 5.5, which then passes `>= MINIMUM_REFERENCE_COUNT`.
+   *
+   * WHICH ASSERTION IS LOAD-BEARING DIFFERS BY FIXTURE, and saying so is the point. For the
+   * first two the WITHHELD AVERAGE is the killer -- both land above the gate with a usable-
+   * looking number. For `a legal zero aggregate` the average is withheld either way, because
+   * -1 is below the gate; there the WARNING is the only observable, and it is the one that
+   * stops a corrupt aggregate being reported as thin evidence, which is exactly the miscoding
+   * `decide`'s two separate reasons exist to prevent.
+   */
+  it.each([
+    [
+      "a non-integer count above the gate",
+      async () => stats(MINIMUM_REFERENCE_COUNT + 0.5, AVERAGE * (MINIMUM_REFERENCE_COUNT + 1)),
+    ],
+    [
+      "a negative total from drift between the aggregate and the observation",
+      async () => {
+        await stats(MINIMUM_REFERENCE_COUNT + 1, 100);
+        await observation("corrupt", AVERAGE);
+      },
+    ],
+    [
+      "a negative count from a legal zero aggregate",
+      async () => {
+        await stats(0, 0);
+        await observation("corrupt", AVERAGE);
+      },
+    ],
+  ])("V-22: withholds and warns on %s", async (_label, seed) => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await listing({ listing_id: "corrupt", price_cents: HALF_AVERAGE });
+    await seed();
+
+    const body = await read();
+    expect(body.listings[0].evaluation.averagePriceCents).toBeUndefined();
+    expect(body.listings[0].evaluation.discountPercent).toBeUndefined();
+    // The card still renders -- a corrupt aggregate costs the comparison, never the listing.
+    expect(body.listings[0].listingId).toBe("corrupt");
+    expect(warn).toHaveBeenCalled();
   });
 
   it("V-13: serves the sentinel variant as null and a real one verbatim", async () => {

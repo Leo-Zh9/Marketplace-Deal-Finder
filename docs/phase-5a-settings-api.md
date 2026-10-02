@@ -102,11 +102,19 @@ They are granted **per path**, from one table in `worker/index.ts`:
 | `/api/auth/session` | `GET` | `GET, OPTIONS` | `Authorization, Accept` |
 | `/api/status` | `GET` | `GET, OPTIONS` | `Authorization, Accept` |
 | `/api/settings` | `GET`, `PUT` | `GET, PUT, OPTIONS` | `Authorization, Accept, Content-Type` |
+| `/api/verdicts` | `GET` | `GET, OPTIONS` | `Authorization, Accept` |
 
 `Content-Type` is offered to a path **if and only if that path declares a body-bearing method**
-(`PUT`/`POST`/`PATCH`) — not "if it has more than one method". Three table rows cannot tell those
-two rules apart, so `preflightHeadersFor` is exported and tested directly over method sets the
-table does not contain (`["GET","HEAD"]`, `["GET","OPTIONS"]`, `["POST"]`, …).
+(`PUT`/`POST`/`PATCH`) — not "if it has more than one method". The table's rows cannot tell those
+two rules apart — three could not, and four still cannot, since every row but `/api/settings` is
+read-only — so `preflightHeadersFor` is exported and tested directly over method sets the table
+does not contain (`["GET","HEAD"]`, `["GET","OPTIONS"]`, `["POST"]`, …).
+
+`/api/verdicts` was added by the read-path slice and belongs in this table for the reason the
+table exists: it is the **advertised browser surface**, and a route missing from it answers `403`
+to a cross-origin preflight while every unit test and every `curl` still passes. The collector
+routes (`POST /api/listings`, `GET /api/watch-targets`) are deliberately **absent** — they are
+not browser routes, and a row for either would open a real browser channel silently.
 
 Two consequences worth stating plainly:
 

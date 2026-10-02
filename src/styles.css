@@ -1139,7 +1139,13 @@ input[aria-invalid="true"] {
   background: var(--success-soft);
 }
 
-.status-badge--not_a_deal {
+/* THE DATABASE'S SPELLING, AND IT MUST TRACK `EvaluationStatus`. The class is reached only as
+   `status-badge--${status.toLowerCase()}` (ListingCard.tsx), so when the union was renamed
+   NOT_A_DEAL -> NOT_DEAL this selector stopped matching anything and the commonest badge on the
+   page -- NOT_DEAL is the commonest card under show-everything -- was the only one rendering
+   with no pill background. Nothing in the repository asserts a stylesheet, so no test caught it
+   and no mutation can: review is this line's only gate. Rename both or neither. */
+.status-badge--not_deal {
   color: var(--muted);
   background: #eef1f5;
 }

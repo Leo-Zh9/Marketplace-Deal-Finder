@@ -1325,9 +1325,23 @@ describe("the browser read route's boundary", () => {
     expect(ROUTE_METHODS.get(verdictsPath)).toEqual(["GET"]);
   });
 
-  it("V-8: no identity at all is 401, with no CORS header", async () => {
+  /**
+   * THE NAME USED TO SAY "with no CORS header" AND THE HEADER IS SENT -- the 401 comes from
+   * `authenticateRequest` through `errorResponse(..., cors)`, so an allowed Origin is reflected
+   * on it, exactly as it is on V-9's and V-10's 503s. The old name asserted nothing (the body
+   * of the test only checked the status), so it was a false claim a CORS auditor would have
+   * read as a measurement -- and "fixing the code to match the name" would have left this test
+   * green while the browser discarded the 401 body and the user saw an unexplained failure
+   * instead of a sign-in prompt. Every other row in this block asserts the header; now so does
+   * this one.
+   */
+  it("V-8: no identity at all is 401, and the browser can still read it", async () => {
     const response = await call("/api/verdicts", { headers: { Origin: pagesOrigin } });
     expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "AUTH_TOKEN_MISSING" },
+    });
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe(pagesOrigin);
   });
 
   it("V-9: a missing DB binding is 503, carrying the origin", async () => {
