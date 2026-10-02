@@ -91,6 +91,7 @@ const renderGate = (props: {
   children?: (
     identity: AuthenticatedIdentity,
     onSignOut: (() => void) | undefined,
+    getToken: (forceRefresh: boolean) => Promise<string | null>,
   ) => ReactNode;
 }) =>
   render(
@@ -139,6 +140,54 @@ describe("authentication gate", () => {
     );
     await user.click(screen.getByRole("button", { name: "Sign in with Google" }));
     expect(signIn).toHaveBeenCalledTimes(2);
+  });
+
+  /**
+   * LINK ONE OF THE TOKEN CHAIN. Nothing else looks at the third argument: a children callback
+   * that ignores it compiles (a shorter function is assignable to a longer signature), so
+   * `getToken={noToken}` here left the WHOLE frontend suite green while production answered
+   * 401 on every read, forever. The dashboard gets the ADAPTER's token or this goes red.
+   */
+  it("hands the dashboard the adapter's token, not a null one", async () => {
+    const adapter = createFakeAdapter();
+    const tokens: Array<string | null> = [];
+    renderGate({
+      mode: "firebase",
+      createAdapter: () => adapter,
+      children: (_identity, _onSignOut, getToken) => {
+        void getToken(false).then((token) => tokens.push(token));
+        return <Dashboard />;
+      },
+    });
+    await emit(adapter, { uid: "a", email: "owner@example.com" });
+
+    expect(await screen.findByText("dashboard")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(tokens).toContain("id-token");
+    });
+    expect(tokens).not.toContain(null);
+  });
+
+  /**
+   * And the local-development half: there IS no adapter, so the third argument must be the
+   * tokenless provider rather than undefined -- `App` now requires the prop, so handing it
+   * `undefined` would be a runtime call on a non-function.
+   */
+  it("hands local development a callable tokenless provider", async () => {
+    const tokens: Array<string | null> = [];
+    renderGate({
+      mode: "local-development",
+      requestSession: () => Promise.resolve({ identity: localIdentity }),
+      children: (_identity, _onSignOut, getToken) => {
+        void getToken(false).then((token) => tokens.push(token));
+        return <Dashboard />;
+      },
+    });
+
+    expect(await screen.findByText("dashboard")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(tokens).toEqual([null]);
+    });
   });
 
   it("renders the dashboard with the approved identity", async () => {

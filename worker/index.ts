@@ -7,6 +7,7 @@ import {
 import { authorizeCollector, type CollectorEnvironment } from "./auth/collectorToken";
 import { handlePostListings } from "./api/listings";
 import { handleGetSettings, handlePutSettings } from "./api/settings";
+import { handleGetVerdicts } from "./api/verdicts";
 import { handleGetWatchTargets } from "./api/watchTargets";
 import { handleScheduled, type ScheduledEnvironment } from "./scheduling/scheduled";
 
@@ -46,6 +47,7 @@ export const ROUTE_METHODS = new Map<string, readonly string[]>([
   ["/api/auth/session", ["GET"]],
   ["/api/status", ["GET"]],
   ["/api/settings", ["GET", "PUT"]],
+  ["/api/verdicts", ["GET"]],
 ]);
 
 const BODY_METHODS = new Set(["PUT", "POST", "PATCH"]);
@@ -91,6 +93,11 @@ const errorMessages: Record<string, string> = {
   // COLLECTOR_CONFIG_* comment above already gives: three different fixes behind one code sends
   // an operator to the wrong one.
   WATCH_TARGETS_STORAGE_FAILED: "The watch list could not be read.",
+  VERDICTS_STORAGE_FAILED: "The evaluated listings could not be read.",
+  // DISTINCT FROM THE LINE ABOVE ON PURPOSE: that one means the read failed, this one means the
+  // read succeeded and every row was unpresentable. One sends an operator to D1, the other to
+  // the catalog and the collector.
+  VERDICTS_ROWS_UNUSABLE: "No stored listing could be presented.",
 };
 
 type ExtraHeaders = Record<string, string>;
@@ -338,6 +345,17 @@ export const handleRequest = async (
     return result.ok
       ? json(result.body, result.status, cors)
       : errorResponse(result.code, result.status, cors, result.details);
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/verdicts") {
+    const db = environment.DB;
+    if (db === undefined) return errorResponse("DATABASE_UNAVAILABLE", 503, cors);
+
+    const result = await handleGetVerdicts(db);
+
+    return result.ok
+      ? json(result.body, result.status, cors)
+      : errorResponse(result.code, result.status, cors);
   }
 
   return errorResponse("NOT_FOUND", 404, cors);

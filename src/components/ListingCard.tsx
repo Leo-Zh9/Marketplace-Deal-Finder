@@ -3,9 +3,21 @@ import type { EvaluationStatus, Listing } from "../types";
 
 const statusLabels: Record<EvaluationStatus, string> = {
   DEAL: "Deal",
-  NOT_A_DEAL: "Not a deal",
+  NOT_DEAL: "Not a deal",
   NEEDS_REVIEW: "Needs review",
   PENDING: "Pending",
+};
+
+/**
+ * DERIVED FROM THE STATUS, NEVER SERVED. 3D persists `verdict` and not `reason`
+ * (worker/evaluation/types.ts), so these sentences must claim nothing the status does not
+ * already say -- naming a reason here would invent one.
+ */
+const statusHints: Record<EvaluationStatus, string> = {
+  DEAL: "Meets your deal rule.",
+  NOT_DEAL: "Does not meet your deal rule.",
+  NEEDS_REVIEW: "Could not be judged automatically -- check this one yourself.",
+  PENDING: "Waiting to be evaluated.",
 };
 
 const formatCurrency = (cents: number) =>
@@ -14,6 +26,10 @@ const formatCurrency = (cents: number) =>
     currency: "CAD",
     maximumFractionDigits: 2,
   }).format(cents / 100);
+
+/** `listings.price_cents` is nullable: an unparseable price is stored as NULL. */
+const formatPrice = (cents: number | null) =>
+  cents === null ? "No price listed" : formatCurrency(cents);
 
 const formatRelativeTime = (value: string) => {
   const minutes = Math.max(
@@ -51,11 +67,16 @@ export function ListingCard({ listing }: ListingCardProps) {
             {listing.variantKey ? ` · ${listing.variantKey}` : ""}
           </p>
         </div>
-        <p className="listing-price">{formatCurrency(listing.priceCents)}</p>
+        <p className="listing-price">{formatPrice(listing.priceCents)}</p>
       </div>
 
       {(listing.evaluation.averagePriceCents || listing.evaluation.discountPercent) && (
         <dl className="price-comparison">
+          {/* UNREACHABLE AND KEPT AS DEFENCE IN DEPTH, the same way
+              worker/api/listings.ts:433-435 keeps and labels its own: the endpoint never serves
+              a discount without an average, so the outer guard already covers every case this
+              one can see. MEASURED: no mutation kills it. worker/api/verdicts.test.ts V-20 is
+              what pins the invariant that makes that true, at the layer that could break it. */}
           {listing.evaluation.averagePriceCents && (
             <div>
               <dt>Market average</dt>
@@ -64,24 +85,22 @@ export function ListingCard({ listing }: ListingCardProps) {
           )}
           {listing.evaluation.discountPercent !== undefined && (
             <div>
-              <dt>Estimated discount</dt>
+              {/* NOT "discount": with NOT_DEAL rows on screen a price above the market
+                  average is the common case, and this renders a negative number. The label is
+                  true for both signs. */}
+              <dt>vs. market average</dt>
               <dd>{listing.evaluation.discountPercent.toFixed(1)}%</dd>
             </div>
           )}
         </dl>
       )}
 
-      {listing.evaluation.reason && (
-        <p className="evaluation-reason">{listing.evaluation.reason}</p>
-      )}
+      <p className="evaluation-reason">{statusHints[listing.evaluation.status]}</p>
 
       <div className="listing-card__footer">
         <p>
           <strong>{listing.location ?? "Location unavailable"}</strong>
-          <span>
-            {listing.distanceKm !== null ? `${listing.distanceKm.toFixed(1)} km away · ` : ""}
-            Seen {formatRelativeTime(listing.observedAt)}
-          </span>
+          <span>Seen {formatRelativeTime(listing.observedAt)}</span>
         </p>
         <a href={listing.url} target="_blank" rel="noreferrer">
           View on Facebook

@@ -1225,3 +1225,253 @@ describe("the watch-list route's credential boundary", () => {
     },
   );
 });
+
+/**
+ * THE BROWSER READ ROUTE'S BOUNDARY.
+ *
+ * `GET /api/verdicts` is the mirror image of the two collector routes above: it admits exactly
+ * the two identities `authenticateRequest` admits, it reflects the allowed origin, and it IS in
+ * `ROUTE_METHODS` because a browser is its only caller. Getting that backwards in either
+ * direction is the defect -- and MEASURED, every one of these rows is the only thing in the
+ * repository that notices its own mutation. V-7 above all: deleting the `/api/verdicts` row from
+ * ROUTE_METHODS leaves all 120 pre-existing tests in this file green and the route still
+ * answering 200 to a direct GET.
+ *
+ * THESE CASES LIVE IN THIS FILE ON PURPOSE. They were drafted in a scratch file named
+ * `boundary.probe.test.ts`; `*.probe*` is this repository's own throwaway marker, and shipping
+ * the only guard on the advertised surface in a file whose name says "delete me" is how it gets
+ * deleted.
+ */
+describe("the browser read route's boundary", () => {
+  const collectorToken = "index-suite-verdicts-token-61f0b4ac92de";
+  const verdictsPath = "/api/verdicts";
+
+  let database!: TestDatabase;
+
+  beforeAll(async () => {
+    database = await createTestDatabase();
+    await truncateAll(database.db);
+    await database.db
+      .prepare(
+        `INSERT INTO listings (source, listing_id, market_key, component_type, model_key,
+           variant_key, title, price_cents, location_text, url, validity, content_hash,
+           first_seen_at, last_seen_at)
+         VALUES ('facebook-marketplace','L1','43.5,-79.8|18km','case_fan',NULL,'','Arctic P12',
+                 3200,'Toronto','https://e/x','VALID','h',1,1800000000)`,
+      )
+      .run();
+  }, 120_000);
+
+  afterAll(async () => {
+    await database.dispose();
+  });
+
+  const verdictsEnvironment = (overrides: Partial<Environment> = {}): Environment =>
+    environment({ COLLECTOR_TOKEN: collectorToken, ...overrides });
+
+  it("V-1: an approved Firebase identity reads it, with the origin reflected", async () => {
+    const response = await call(
+      "/api/verdicts",
+      { headers: { Authorization: await bearerFor(), Origin: pagesOrigin } },
+      verdictsEnvironment({ DB: database.db }),
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe(pagesOrigin);
+    const body = (await response.json()) as { listings: Array<{ componentType: string }> };
+    expect(body.listings[0].componentType).toBe("case_fans");
+  });
+
+  it("V-7: the preflight is 204 advertising GET and NO Content-Type", async () => {
+    const response = await call("/api/verdicts", {
+      method: "OPTIONS",
+      headers: {
+        Origin: pagesOrigin,
+        "Access-Control-Request-Method": "GET",
+        "Access-Control-Request-Headers": "authorization, accept",
+      },
+    });
+    expect(response.status).toBe(204);
+    expect(response.headers.get("Access-Control-Allow-Methods")).toBe("GET, OPTIONS");
+    expect(response.headers.get("Access-Control-Allow-Headers")).toBe("Authorization, Accept");
+  });
+
+  it("V-7b: Content-Type is refused on the preflight", async () => {
+    const response = await call("/api/verdicts", {
+      method: "OPTIONS",
+      headers: {
+        Origin: pagesOrigin,
+        "Access-Control-Request-Method": "GET",
+        "Access-Control-Request-Headers": "authorization, content-type",
+      },
+    });
+    expect(response.status).toBe(403);
+  });
+
+  it("V-5: a valid collector token buys nothing here", async () => {
+    const response = await call(
+      "/api/verdicts",
+      { headers: { "X-Collector-Token": collectorToken } },
+      verdictsEnvironment({ DB: database.db }),
+    );
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "AUTH_TOKEN_MISSING" },
+    });
+  });
+
+  it("V-6: the collector paths are still absent from the advertised surface", () => {
+    expect(ROUTE_METHODS.has("/api/listings")).toBe(false);
+    expect(ROUTE_METHODS.has("/api/watch-targets")).toBe(false);
+    expect(ROUTE_METHODS.get(verdictsPath)).toEqual(["GET"]);
+  });
+
+  it("V-8: no identity at all is 401, with no CORS header", async () => {
+    const response = await call("/api/verdicts", { headers: { Origin: pagesOrigin } });
+    expect(response.status).toBe(401);
+  });
+
+  it("V-9: a missing DB binding is 503, carrying the origin", async () => {
+    const response = await call("/api/verdicts", {
+      headers: { Authorization: await bearerFor(), Origin: pagesOrigin },
+    });
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "DATABASE_UNAVAILABLE" },
+    });
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe(pagesOrigin);
+  });
+
+  /**
+   * THE MESSAGE AND THE CORS HEADER ARE BOTH ASSERTED, and neither was before.
+   * MEASURED: with only `toMatchObject({error:{code}})`, deleting the `errorMessages` entry
+   * left 863 tests green -- and that message is the entire argument for giving this route a
+   * distinct code at all ("three different fixes behind one code sends an operator to the wrong
+   * one"). MEASURED separately: dropping `cors` from THIS return path only -- the 200 and the
+   * no-DB 503 keep theirs -- also left 863 green, and a 503 the browser discards is an
+   * unexplained failure rather than a diagnosable one.
+   */
+  it("V-10: a storage failure is its own code, its own message, and readable by the browser", async () => {
+    const broken = {
+      prepare: () => {
+        throw new Error("no such table: listings");
+      },
+    } as unknown as D1Database;
+    const response = await call(
+      "/api/verdicts",
+      { headers: { Authorization: await bearerFor(), Origin: pagesOrigin } },
+      verdictsEnvironment({ DB: broken }),
+    );
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual({
+      error: {
+        code: "VERDICTS_STORAGE_FAILED",
+        message: "The evaluated listings could not be read.",
+      },
+    });
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe(pagesOrigin);
+  });
+
+  /**
+   * THE SECOND 503, AND IT MUST NOT READ LIKE THE FIRST. The read SUCCEEDED here; every row it
+   * returned was unpresentable. V-10 and this row assert two different codes and two different
+   * messages for two different fixes -- D1 for one, the catalog and the collector for the
+   * other. Without this row the `VERDICTS_ROWS_UNUSABLE` entry in `errorMessages` has no
+   * reader and deleting it is invisible, exactly as deleting V-10's entry was (MEASURED: 863
+   * tests green).
+   */
+  it("V-10b: a page where every row is unusable is its own code and message", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const unusableRows = () =>
+      ({
+        prepare: () => ({
+          bind: () => ({
+            all: () =>
+              Promise.resolve({
+                results: [
+                  {
+                    source: "facebook-marketplace",
+                    listing_id: "X",
+                    component_type: "gpuu",
+                    model_key: null,
+                    variant_key: "",
+                    title: "t",
+                    price_cents: 1,
+                    location_text: null,
+                    url: "https://e/x",
+                    last_seen_at: 1,
+                    verdict: null,
+                    reference_count: null,
+                    reference_total_cents: null,
+                  },
+                ],
+                meta: { rows_read: 1, rows_written: 0 },
+              }),
+          }),
+        }),
+      }) as unknown as D1Database;
+
+    const response = await call(
+      verdictsPath,
+      { headers: { Authorization: await bearerFor(), Origin: pagesOrigin } },
+      verdictsEnvironment({ DB: unusableRows() }),
+    );
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual({
+      error: {
+        code: "VERDICTS_ROWS_UNUSABLE",
+        message: "No stored listing could be presented.",
+      },
+    });
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe(pagesOrigin);
+    expect(warn).toHaveBeenCalled();
+  });
+
+  /**
+   * THE ADVERTISED SURFACE IS NOT THE ACTUAL SURFACE, and only this row can tell.
+   * MEASURED: dropping `request.method === "GET" &&` from the route block left the whole worker
+   * suite green (863) while POST, PUT and DELETE answered 200. The e2e's
+   * `pf /api/verdicts PUT -> 403` is a PREFLIGHT assertion driven by ROUTE_METHODS, so it is
+   * blind to the route block. No exploit -- a cross-origin POST still needs `Authorization`,
+   * which forces a preflight -- but "advertised = actual" is this route's whole contract.
+   */
+  it.each(["POST", "PUT", "DELETE", "PATCH"])(
+    "V-11d: %s /api/verdicts is a 404, not a read",
+    async (method) => {
+      const broken = {
+        prepare: () => {
+          throw new Error("the database must not be reached");
+        },
+      } as unknown as D1Database;
+      const response = await call(
+        "/api/verdicts",
+        {
+          method,
+          headers: { Authorization: await bearerFor(), Origin: pagesOrigin },
+          body: "{}",
+        },
+        verdictsEnvironment({ DB: broken }),
+      );
+      expect(response.status).toBe(404);
+      await expect(response.json()).resolves.toMatchObject({ error: { code: "NOT_FOUND" } });
+    },
+  );
+
+  it.each([
+    ["a trailing slash", "/api/verdicts/"],
+    ["a cased spelling", "/api/Verdicts"],
+    ["a longer path with the same prefix", "/api/verdicts-evil"],
+  ])("V-11: %s is not the verdicts route", async (_label, path) => {
+    const broken = {
+      prepare: () => {
+        throw new Error("the database must not be reached");
+      },
+    } as unknown as D1Database;
+    const response = await call(
+      path,
+      { headers: { Authorization: await bearerFor(), Origin: pagesOrigin } },
+      verdictsEnvironment({ DB: broken }),
+    );
+    expect(response.status).toBe(404);
+  });
+});

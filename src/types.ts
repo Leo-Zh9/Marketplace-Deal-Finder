@@ -13,7 +13,7 @@ export type DealRuleType = "discount" | "maximum_price" | "both";
 
 export type EvaluationStatus =
   | "DEAL"
-  | "NOT_A_DEAL"
+  | "NOT_DEAL"
   | "NEEDS_REVIEW"
   | "PENDING";
 
@@ -51,22 +51,20 @@ export interface SearchSettings {
 }
 
 export interface Listing {
+  source: string;
   listingId: string;
   componentType: ComponentType;
   modelKey: string | null;
   variantKey: string | null;
   title: string;
-  priceCents: number;
-  quantity: number;
+  priceCents: number | null;
   location: string | null;
-  distanceKm: number | null;
   url: string;
   observedAt: string;
   evaluation: {
     status: EvaluationStatus;
     averagePriceCents?: number;
     discountPercent?: number;
-    reason?: string;
   };
 }
 
@@ -79,6 +77,6 @@ export interface MonitoringStatus {
 
 export interface PreviewResult {
   listings: Listing[];
-  provider: MonitoringStatus["provider"];
+  truncated: boolean;
   searchedAt: string;
 }
