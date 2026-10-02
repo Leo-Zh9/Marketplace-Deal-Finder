@@ -275,6 +275,62 @@ describe("GET /api/verdicts", () => {
     }
   });
 
+  /**
+   * THE FIVE PASSTHROUGH FIELDS, PINNED AS A CLASS. AN ORCHESTRATOR ADDITION: §8.1's table does
+   * not contain this row, and the measurement that earned it is that `source`, `modelKey`,
+   * `title`, `location` and `url` could EACH be replaced by a constant in `toWireListing` for
+   * 1130/1130 green, with the e2e asserting none of the five either. So the endpoint could have
+   * served a constant for most of the payload the user actually reads and nothing in the
+   * repository would have noticed. `source` surfaced first -- it is on the wire on one stated
+   * ground, that the row's identity is `(source, listing_id)` (migrations/0001) -- but it was
+   * one member of a class, so this row closes the class rather than the member.
+   *
+   * EVERY VALUE IS DISTINCT FROM EVERY OTHER, across both rows and across fields, so this
+   * catches more than a constant: a CROSSED WIRE (`title: row.url`) and a column read from the
+   * WRONG ROW both go red too. Two rows rather than one for the last of those -- MEASURED: with
+   * a single fixture, serving `rows[0].source` for every row survives.
+   *
+   * The expected values are LITERALS here. They are not re-read from the row objects and never
+   * built by calling `toWireListing`: a test that constructs the value under test cannot test
+   * it, and that mistake has already been made twice on this slice.
+   */
+  it("V-21: serves each row's OWN source, model, title, location and url", async () => {
+    await listing({
+      source: "source-alpha",
+      listing_id: "listing-alpha",
+      model_key: "model-alpha",
+      title: "title-alpha",
+      location_text: "location-alpha",
+      url: "https://example.com/url-alpha",
+    });
+    await listing({
+      source: "source-beta",
+      listing_id: "listing-beta",
+      model_key: "model-beta",
+      title: "title-beta",
+      location_text: "location-beta",
+      url: "https://example.com/url-beta",
+    });
+
+    const body = await read();
+    const byId = new Map(body.listings.map((row) => [row.listingId, row]));
+
+    expect(byId.get("listing-alpha")).toMatchObject({
+      source: "source-alpha",
+      modelKey: "model-alpha",
+      title: "title-alpha",
+      location: "location-alpha",
+      url: "https://example.com/url-alpha",
+    });
+    expect(byId.get("listing-beta")).toMatchObject({
+      source: "source-beta",
+      modelKey: "model-beta",
+      title: "title-beta",
+      location: "location-beta",
+      url: "https://example.com/url-beta",
+    });
+  });
+
   it("V-13: serves the sentinel variant as null and a real one verbatim", async () => {
     await listing({ listing_id: "blank", variant_key: "" });
     await listing({ listing_id: "real", variant_key: "12GB" });
