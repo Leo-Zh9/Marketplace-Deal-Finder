@@ -1,9 +1,16 @@
 // @vitest-environment node
 
+import { componentById, componentCatalog } from "../../src/data/catalog";
+import { STORAGE_COMPONENT_ID } from "../normalize/catalogIndex";
 import { createTestDatabase, truncateAll, type TestDatabase } from "../testing/d1";
 import { evaluateBatch } from "../evaluation/evaluateBatch";
 import { MINIMUM_REFERENCE_COUNT } from "../evaluation/types";
-import { handleGetVerdicts, VERDICT_PAGE_SIZE } from "./verdicts";
+import {
+  handleGetVerdicts,
+  SELECT_VERDICTS,
+  SELECT_VERDICTS_FILTERED,
+  VERDICT_PAGE_SIZE,
+} from "./verdicts";
 
 const MARKET = "43.5123,-79.8765|18km";
 const SOURCE = "facebook-marketplace";
@@ -99,8 +106,19 @@ const observation = async (listingId: string, price: number, modelKey = "GeForce
     .bind(SOURCE, listingId, MARKET, modelKey, price)
     .run();
 
-const read = async () => {
-  const result = await handleGetVerdicts(database.db);
+/** No `?all` and no `?pairs`: the unfiltered page, which is what every pre-existing row asserts. */
+const unfiltered = () => new URLSearchParams();
+
+/** The query string the browser builds, from catalog vocabulary, through URLSearchParams. */
+const query = (all: string[], pairs?: string[]) => {
+  const params = new URLSearchParams();
+  params.set("all", JSON.stringify(all));
+  if (pairs !== undefined) params.set("pairs", JSON.stringify(pairs));
+  return params;
+};
+
+const read = async (params: URLSearchParams = unfiltered()) => {
+  const result = await handleGetVerdicts(database.db, params);
   if (!result.ok) throw new Error(`expected ok, got ${result.code}`);
   return result.body;
 };
@@ -455,7 +473,7 @@ describe("GET /api/verdicts", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     await listing({ listing_id: "bad-a", component_type: "gpuu" });
     await listing({ listing_id: "bad-b", last_seen_at: "not-a-time" });
-    const result = await handleGetVerdicts(database.db);
+    const result = await handleGetVerdicts(database.db, unfiltered());
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error("unreachable");
     expect(result.status).toBe(503);
@@ -475,5 +493,237 @@ describe("GET /api/verdicts", () => {
   it("V-17: an empty database is an empty page, not a failure", async () => {
     const body = await read();
     expect(body).toEqual({ listings: [], truncated: false });
+  });
+});
+
+/**
+ * PR #17's DEFECT, AND THE READ COST OF CLOSING IT. The component and model filter used to run in
+ * the BROWSER, after this endpoint's `LIMIT 51` -- so a page made entirely of a component the user
+ * is not watching filtered down to nothing and the page reported a non-empty database as empty.
+ */
+describe("GET /api/verdicts -- the server-side selection filter", () => {
+  /** 60 `cpu` rows NEWER than 3 `gpu` rows: the shape that reproduces the defect. */
+  const seedCpuAheadOfGpu = async () => {
+    for (let index = 0; index < 60; index += 1) {
+      await listing({
+        listing_id: `cpu-${String(index).padStart(2, "0")}`,
+        component_type: "cpu",
+        model_key: "Ryzen 7 9800X3D",
+        last_seen_at: 1_800_001_000 + index,
+      });
+    }
+    for (let index = 0; index < 3; index += 1) {
+      await listing({
+        listing_id: `gpu-${index}`,
+        component_type: "gpu",
+        model_key: "GeForce RTX 5080",
+        last_seen_at: 1_800_000_000 + index,
+      });
+    }
+  };
+
+  it("V-f1: the page holds only the selected component, and the unfiltered control reproduces the defect", async () => {
+    await seedCpuAheadOfGpu();
+
+    // THE DEFECT, unfiltered: 50 rows, none of them the component the user watches, and the page
+    // says it is partial.
+    const before = await read();
+    expect(before.listings).toHaveLength(VERDICT_PAGE_SIZE);
+    expect(before.listings.filter((row) => row.componentType === "gpu")).toHaveLength(0);
+    expect(before.truncated).toBe(true);
+
+    // CLOSED: the bound applies to the FILTERED set instead of ahead of it.
+    const after = await read(query(["gpu"]));
+    expect(after.listings.map((row) => row.listingId)).toEqual(["gpu-2", "gpu-1", "gpu-0"]);
+    expect(after.truncated).toBe(false);
+  });
+
+  /**
+   * V-f2: `?all=` PRESENT-AND-EMPTY WITH A POPULATED `?pairs` IS THE SELECTION §4.1 RECOMMENDS --
+   * one model-named query per model -- and an earlier draft made it a 400. Making absent mean
+   * empty instead would take the seven existing e2e rows red.
+   */
+  it("V-f2: an empty ?all with a populated ?pairs returns exactly the paired rows", async () => {
+    await listing({ listing_id: "wanted", model_key: "GeForce RTX 5080" });
+    await listing({ listing_id: "other-model", model_key: "GeForce RTX 5090" });
+    await listing({ listing_id: "no-model", model_key: null });
+    await listing({ listing_id: "cpu", component_type: "cpu", model_key: "Ryzen 7 9800X3D" });
+
+    const body = await read(query([], ["gpu/GeForce RTX 5080"]));
+    expect(body.listings.map((row) => row.listingId)).toEqual(["wanted"]);
+
+    // ...and both lists empty is the EMPTY LIST, not an error and not "everything".
+    const empty = await read(query([], []));
+    expect(empty).toEqual({ listings: [], truncated: false });
+  });
+
+  /**
+   * V-f3: ABSENT IS NOT EMPTY. An absent `?all` is the unfiltered page -- byte-identical, including
+   * the rows whose `component_type` is outside the catalog, which is what keeps V-2b's warning
+   * reachable. `?pairs` with `?all` absent is a 400 because MEASURED it is a SILENT NO-OP: the page
+   * comes back byte-identical to the unfiltered one.
+   */
+  it("V-f3: an absent ?all is the unfiltered page, and ?pairs without ?all is a 400", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await listing({ listing_id: "gpu-row" });
+    await listing({ listing_id: "cpu-row", component_type: "cpu", model_key: "Ryzen 7 9800X3D" });
+    // AN UNCATALOGUED ROW IS PART OF THE MEASUREMENT, not a stray fixture. Binding the nine
+    // storage ids for an absent filter would make the SQL drop this row, which silences the one
+    // signal an operator has that the collector and the catalog disagree -- and makes
+    // `toWireListing`'s guard, V-2b and V-16b unreachable. "Byte-identical to the unfiltered page"
+    // is only true if this row still reaches the mapper.
+    await listing({ listing_id: "unknown-type", component_type: "gpuu" });
+
+    const absent = await read();
+    expect(absent.listings.map((row) => row.listingId).sort()).toEqual(["cpu-row", "gpu-row"]);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(absent.truncated).toBe(true);
+
+    const pairsOnly = new URLSearchParams();
+    pairsOnly.set("pairs", JSON.stringify(["gpu/GeForce RTX 5080"]));
+    const result = await handleGetVerdicts(database.db, pairsOnly);
+    expect(result).toMatchObject({
+      ok: false,
+      status: 400,
+      code: "INVALID_VERDICTS_QUERY",
+      details: { detail: "pairs requires all" },
+    });
+  });
+
+  /**
+   * V-f4: `gpu/` IS REFUSED AT THE EDGE, and the reason is measured rather than aesthetic:
+   * `COALESCE(model_key,'')` makes that pair select EXACTLY the rows whose model was never
+   * resolved -- the opposite of what narrowing to a model means. The second half of the row is the
+   * control: an unresolved row is excluded under `selected` and included under `all`.
+   */
+  it("V-f4: an empty model half is a 400, and a null model_key is excluded under selected but included under all", async () => {
+    await listing({ listing_id: "resolved", model_key: "GeForce RTX 5080" });
+    await listing({ listing_id: "unresolved", model_key: null });
+
+    const bad = new URLSearchParams();
+    bad.set("all", "[]");
+    bad.set("pairs", JSON.stringify(["gpu/"]));
+    expect(await handleGetVerdicts(database.db, bad)).toMatchObject({
+      ok: false,
+      status: 400,
+      code: "INVALID_VERDICTS_QUERY",
+      details: { detail: "gpu/" },
+    });
+
+    const narrowed = await read(query([], ["gpu/GeForce RTX 5080"]));
+    expect(narrowed.listings.map((row) => row.listingId)).toEqual(["resolved"]);
+    const broad = await read(query(["gpu"]));
+    expect(broad.listings.map((row) => row.listingId).sort()).toEqual(["resolved", "unresolved"]);
+  });
+
+  /**
+   * V-f5: A TYPO IS LOUD. Ignoring an unknown value returns an empty page, which on this screen
+   * reads as "nothing has been collected yet" -- the one state the show-everything rule exists to
+   * prevent.
+   */
+  it.each([
+    ["an unknown component type", ["gpuu"], undefined, "gpuu"],
+    ["a storage spelling on the wire", ["case_fan"], undefined, "case_fan"],
+    ["an unknown model", [], ["gpu/GeForce RTX 9090"], "gpu/GeForce RTX 9090"],
+    ["a model of the WRONG type", [], ["cpu/GeForce RTX 5080"], "cpu/GeForce RTX 5080"],
+    ["a pair with no separator", [], ["gpu"], "gpu"],
+    ["an unknown type in a pair", [], ["gpuu/GeForce RTX 5080"], "gpuu/GeForce RTX 5080"],
+  ])("V-f5: %s is a 400 INVALID_VERDICTS_QUERY", async (_label, all, pairs, detail) => {
+    await listing({ listing_id: "present" });
+    const result = await handleGetVerdicts(database.db, query(all, pairs));
+    expect(result).toMatchObject({
+      ok: false,
+      status: 400,
+      code: "INVALID_VERDICTS_QUERY",
+      details: { detail },
+    });
+  });
+
+  it("V-f5b: a query string that is not a JSON array of strings is a 400", async () => {
+    for (const raw of ["gpu", '{"gpu":1}', "[1]", "[[]]"]) {
+      const params = new URLSearchParams();
+      params.set("all", raw);
+      expect(await handleGetVerdicts(database.db, params), raw).toMatchObject({
+        ok: false,
+        status: 400,
+        code: "INVALID_VERDICTS_QUERY",
+      });
+    }
+  });
+
+  /**
+   * V-f6: THE FOURTH SITE OF THE `case_fan`/`case_fans` TRANSLATION. The wire carries the catalog
+   * spelling and the column holds the storage one; binding the catalog id makes case fans never
+   * appear, with no error anywhere.
+   */
+  it("V-f6: a case_fans selection matches the case_fan rows", async () => {
+    await listing({ listing_id: "fan", component_type: "case_fan", model_key: "Noctua NF-A12x25 PWM" });
+    await listing({ listing_id: "card", component_type: "gpu" });
+
+    const body = await read(query(["case_fans"]));
+    expect(body.listings.map((row) => row.listingId)).toEqual(["fan"]);
+    expect(body.listings[0].componentType).toBe("case_fans");
+
+    const paired = await read(query([], ["case_fans/Noctua NF-A12x25 PWM"]));
+    expect(paired.listings.map((row) => row.listingId)).toEqual(["fan"]);
+  });
+
+  /**
+   * V-f7: THE READ COST, BOUNDED BY A TABLE RATHER THAN BY ONE FIXTURE'S NUMBER. An earlier draft
+   * claimed the filter "never adds more than 3 `rows_read`", which was this fixture's `|all|`
+   * generalised into a bound and is wrong by 3x at the shipped configuration. The property is:
+   * the WHERE adds at most one `rows_read` per element of the lists it evaluates.
+   *
+   * IT BINDS THE SHIPPED STATEMENTS DIRECTLY, because `rows_read` lives on the D1 `meta` the
+   * handler does not return. `SELECT_VERDICTS` and `SELECT_VERDICTS_FILTERED` are the exact strings
+   * `handleGetVerdicts` prepares.
+   */
+  it("V-f7: the filter's rows_read delta never exceeds |all| + |pairs|", async () => {
+    await seedCpuAheadOfGpu();
+    const types = componentCatalog.map((component) => STORAGE_COMPONENT_ID[component.id]);
+    const models = componentById.gpu.models.slice(0, 9).map((model) => `gpu/${model}`);
+
+    const baseline = await database.db
+      .prepare(SELECT_VERDICTS)
+      .bind(VERDICT_PAGE_SIZE + 1)
+      .all();
+    const unfiltered = baseline.meta.rows_read;
+
+    const table: [string[], string[]][] = [
+      [["gpu"], []],
+      [types.slice(0, 3), []],
+      [types, []],
+      [types.slice(0, 8), models.slice(0, 1)],
+      [types, models],
+      [[], models.slice(0, 1)],
+    ];
+    const measured: string[] = [];
+    for (const [all, pairs] of table) {
+      const read = await database.db
+        .prepare(SELECT_VERDICTS_FILTERED)
+        .bind(VERDICT_PAGE_SIZE + 1, JSON.stringify(all), JSON.stringify(pairs))
+        .all();
+      const delta = read.meta.rows_read - unfiltered;
+      measured.push(`|all|=${all.length} |pairs|=${pairs.length} delta=${delta}`);
+      expect(delta, measured[measured.length - 1]).toBeLessThanOrEqual(all.length + pairs.length);
+    }
+    // Anchored, so an empty table cannot satisfy the loop vacuously, and so that the bound is
+    // asserted at the 9-target cap and not only on a small list.
+    expect(measured).toHaveLength(6);
+    expect(unfiltered).toBeGreaterThan(0);
+  });
+
+  /** V-f8: folding `truncated` into the filter would report a bounded filtered page as complete. */
+  it("V-f8: truncated is still true when more than a page of rows MATCH", async () => {
+    for (let index = 0; index < VERDICT_PAGE_SIZE + 10; index += 1) {
+      await listing({
+        listing_id: `gpu-${String(index).padStart(3, "0")}`,
+        model_key: "GeForce RTX 5080",
+        last_seen_at: 1_800_000_000 + index,
+      });
+    }
+    const body = await read(query(["gpu"]));
+    expect(body.listings).toHaveLength(VERDICT_PAGE_SIZE);
+    expect(body.truncated).toBe(true);
   });
 });

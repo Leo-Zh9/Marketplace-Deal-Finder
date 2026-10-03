@@ -268,7 +268,6 @@ main,
 }
 
 .configuration-panel,
-.status-panel,
 .results-panel {
   background: var(--surface);
   border: 1px solid var(--line);
@@ -284,12 +283,6 @@ main,
 .panel-heading,
 .section-heading,
 .results-heading,
-.status-panel__heading {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 18px;
-}
 
 .panel-heading {
   padding-bottom: 23px;
@@ -298,11 +291,69 @@ main,
 
 .panel-heading h2,
 .results-heading h2,
-.status-panel h2 {
-  margin-bottom: 0;
-  color: #111a2c;
-  font-size: 1.25rem;
-  letter-spacing: -0.02em;
+
+/*
+ * THE BUDGET COUNTER AND THE KEPT-SEARCHES LIST ARE THE ONLY ROUTE OUT OF AN OVER-BUDGET SAVE: the
+ * collector REFUSES a list over the cap rather than truncating it, so a save the form will not
+ * accept is fixed by reading this number and pressing one of those Remove buttons. They shipped
+ * with no rule at all, which made them the least legible things on the page.
+ */
+.budget-line {
+  display: inline-block;
+  padding: 5px 11px;
+  margin: 0 0 18px;
+  color: var(--blue-700);
+  background: var(--blue-100);
+  border-radius: 999px;
+  font-size: 0.74rem;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+
+.kept-list {
+  display: grid;
+  gap: 8px;
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+
+.kept-list li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 0.76rem;
+}
+
+.kept-list li > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+}
+
+.kept-list .secondary-button {
+  flex: none;
+  padding: 5px 11px;
+  font-size: 0.72rem;
+}
+
+/*
+ * PRE-EXISTING GAP, FIXED HERE because the model list is now how a search gets narrowed: the filter
+ * box inside every ModelSelector had no rule, so it rendered as a bare input against the panel.
+ */
+.search-field {
+  display: block;
+  margin-bottom: 12px;
+}
+
+.search-field input {
+  width: 100%;
 }
 
 .required-note {
@@ -412,15 +463,13 @@ main,
   gap: 8px;
 }
 
-.model-selector,
-.more-filters {
+.model-selector {
   border: 1px solid var(--line);
   border-radius: 9px;
   background: #fff;
 }
 
-.model-selector summary,
-.more-filters summary {
+.model-selector summary {
   min-height: 54px;
   display: flex;
   align-items: center;
@@ -430,26 +479,21 @@ main,
   list-style: none;
 }
 
-.model-selector summary::-webkit-details-marker,
-.more-filters summary::-webkit-details-marker {
+.model-selector summary::-webkit-details-marker {
   display: none;
 }
 
 .model-selector summary strong,
-.model-selector summary small,
-.more-filters summary strong,
-.more-filters summary small {
+.model-selector summary small {
   display: block;
 }
 
-.model-selector summary strong,
-.more-filters summary strong {
+.model-selector summary strong {
   margin-bottom: 2px;
   font-size: 0.84rem;
 }
 
-.model-selector summary small,
-.more-filters summary small {
+.model-selector summary small {
   color: var(--muted);
   font-size: 0.72rem;
 }
@@ -643,8 +687,7 @@ input[aria-invalid="true"] {
 }
 
 .secondary-button,
-.primary-button,
-.danger-button {
+.primary-button {
   min-height: 42px;
   padding: 9px 15px;
   border-radius: 8px;
@@ -674,12 +717,6 @@ input[aria-invalid="true"] {
 .primary-button:hover:not(:disabled) {
   background: var(--blue-700);
   border-color: var(--blue-700);
-}
-
-.danger-button {
-  color: #fff;
-  background: var(--danger);
-  border: 1px solid var(--danger);
 }
 
 .location-button {
@@ -807,41 +844,6 @@ input[aria-invalid="true"] {
   padding-left: 26px;
 }
 
-.more-filters {
-  margin-top: 24px;
-}
-
-.filter-groups {
-  display: grid;
-  gap: 20px;
-  padding: 18px;
-  border-top: 1px solid var(--line);
-  background: var(--surface-soft);
-}
-
-.filter-group {
-  min-width: 0;
-  padding: 0;
-  border: 0;
-}
-
-.filter-group legend {
-  padding: 0;
-  margin-bottom: 11px;
-  font-size: 0.85rem;
-  font-weight: 750;
-}
-
-.filter-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 11px;
-}
-
-.filter-grid label > span {
-  min-height: 30px;
-}
-
 .form-actions {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -894,83 +896,6 @@ input[aria-invalid="true"] {
   min-width: 0;
   display: grid;
   gap: 18px;
-}
-
-.status-panel {
-  padding: 20px;
-  border-top: 3px solid #26a36a;
-}
-
-.status-panel__heading {
-  align-items: center;
-  padding-bottom: 17px;
-  border-bottom: 1px solid var(--line);
-}
-
-.live-indicator {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  padding: 6px 9px;
-  color: var(--muted);
-  background: #eef1f5;
-  border-radius: 999px;
-  font-size: 0.7rem;
-  font-weight: 800;
-}
-
-.live-indicator > span {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: #919bad;
-}
-
-.live-indicator--active {
-  color: var(--success);
-  background: var(--success-soft);
-}
-
-.live-indicator--active > span {
-  background: #20a466;
-}
-
-.status-list {
-  display: grid;
-  gap: 11px;
-  margin: 17px 0 0;
-}
-
-.status-list > div {
-  display: flex;
-  justify-content: space-between;
-  gap: 20px;
-}
-
-.status-list dt,
-.status-list dd {
-  font-size: 0.76rem;
-}
-
-.status-list dt {
-  color: var(--muted);
-}
-
-.status-list dd {
-  margin-bottom: 0;
-  color: #303b50;
-  font-weight: 700;
-  text-align: right;
-  text-transform: capitalize;
-}
-
-.provider-state--available {
-  color: var(--success) !important;
-}
-
-.provider-state--degraded,
-.provider-state--unavailable {
-  color: var(--warning) !important;
 }
 
 .results-panel {
@@ -1029,11 +954,6 @@ input[aria-invalid="true"] {
   margin-bottom: 0;
   font-size: 0.78rem;
   line-height: 1.55;
-}
-
-.empty-state--warning {
-  background: var(--warning-soft);
-  border-color: #e9d39c;
 }
 
 .empty-icon {
@@ -1322,8 +1242,7 @@ input[aria-invalid="true"] {
   }
 
   .configuration-panel,
-  .results-panel,
-  .status-panel {
+  .results-panel {
     padding: 18px;
     border-radius: 11px;
   }
@@ -1335,13 +1254,17 @@ input[aria-invalid="true"] {
   .location-row,
   .deal-fields,
   .criteria-options,
-  .filter-grid,
   .form-actions {
     grid-template-columns: 1fr;
   }
 
   .location-button {
     width: 100%;
+  }
+
+  .kept-list li {
+    align-items: stretch;
+    flex-direction: column;
   }
 
   .radius-control {

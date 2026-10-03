@@ -8,6 +8,7 @@ import { authorizeCollector, type CollectorEnvironment } from "./auth/collectorT
 import { handlePostListings } from "./api/listings";
 import { handleGetSettings, handlePutSettings } from "./api/settings";
 import { handleGetVerdicts } from "./api/verdicts";
+import { handleGetWatch, handlePutWatch } from "./api/watch";
 import { handleGetWatchTargets } from "./api/watchTargets";
 import { handleScheduled, type ScheduledEnvironment } from "./scheduling/scheduled";
 
@@ -48,6 +49,15 @@ export const ROUTE_METHODS = new Map<string, readonly string[]>([
   ["/api/status", ["GET"]],
   ["/api/settings", ["GET", "PUT"]],
   ["/api/verdicts", ["GET"]],
+  /**
+   * THE BROWSER'S WATCH-LIST ROUTE, and it is a different route from `/api/watch-targets` on a
+   * different credential. This row is what makes `OPTIONS /api/watch` answer 204 advertising
+   * `GET, PUT, OPTIONS` and -- because PUT is a body method, through `preflightHeadersFor` and
+   * nothing else -- `Content-Type`. Without it the browser cannot save cross-origin in production
+   * while every curl check and every unit test still passes, because curl never preflights and
+   * `npm run dev` reaches the Worker through Vite's same-origin /api proxy. X-w1 is the guard.
+   */
+  ["/api/watch", ["GET", "PUT"]],
 ]);
 
 const BODY_METHODS = new Set(["PUT", "POST", "PATCH"]);
@@ -93,6 +103,20 @@ const errorMessages: Record<string, string> = {
   // COLLECTOR_CONFIG_* comment above already gives: three different fixes behind one code sends
   // an operator to the wrong one.
   WATCH_TARGETS_STORAGE_FAILED: "The watch list could not be read.",
+  // DISTINCT FROM THE LINE ABOVE ON PURPOSE, and the distinction is the same one the three
+  // COLLECTOR_CONFIG_* and *_STORAGE_FAILED codes already draw: that one means the READ failed,
+  // this one means the BATCH failed. One sends an operator to the read path, the other to the
+  // write -- and collapsing them would put two fixes behind one code.
+  WATCH_STORAGE_FAILED: "The watch list could not be written.",
+  // NOT SETTINGS_FIELD_UNSUPPORTED's message: these are two different request bodies with two
+  // different field sets, and an operator reading "fields this API cannot store" on a watch save
+  // would go looking in search_revisions.
+  WATCH_FIELD_UNSUPPORTED: "The watch list request contains fields this API cannot store.",
+  INVALID_WATCH: "The watch list in the request is not valid.",
+  // The cap REFUSES rather than truncating, at the collector as well as here: a list over the cap
+  // collects NOTHING on every run, so saving 10 and running 9 would be the worse answer.
+  WATCH_TARGETS_EXCEEDED: "The watch list would hold more searches than the collector can run.",
+  INVALID_VERDICTS_QUERY: "The component or model filter in the request is not valid.",
   VERDICTS_STORAGE_FAILED: "The evaluated listings could not be read.",
   // DISTINCT FROM THE LINE ABOVE ON PURPOSE: that one means the read failed, this one means the
   // read succeeded and every row was unpresentable. One sends an operator to D1, the other to
@@ -351,11 +375,34 @@ export const handleRequest = async (
     const db = environment.DB;
     if (db === undefined) return errorResponse("DATABASE_UNAVAILABLE", 503, cors);
 
-    const result = await handleGetVerdicts(db);
+    const result = await handleGetVerdicts(db, url.searchParams);
 
     return result.ok
       ? json(result.body, result.status, cors)
-      : errorResponse(result.code, result.status, cors);
+      : errorResponse(result.code, result.status, cors, result.details);
+  }
+
+  /**
+   * `/api/watch` IS A BROWSER ROUTE AND `/api/watch-targets` IS NOT, and the two credential
+   * systems stay disjoint in both directions. This one sits BELOW `authenticateRequest`, so it
+   * admits exactly the loopback development identity and a Firebase ID token on APPROVED_EMAILS
+   * -- the same two every other browser route admits -- and a collector token buys nothing here
+   * (X-w2). The collector's own route stays above, on `authorizeCollector`, and stays OUT of
+   * ROUTE_METHODS (X-w3).
+   *
+   * THE DB GUARD IS BEFORE THE HANDLER AND THEREFORE BEFORE ANY VALIDATION, which is why a
+   * missing binding is 503 DATABASE_UNAVAILABLE and no request body reaches an unguarded path.
+   */
+  if (url.pathname === "/api/watch" && (request.method === "GET" || request.method === "PUT")) {
+    const db = environment.DB;
+    if (db === undefined) return errorResponse("DATABASE_UNAVAILABLE", 503, cors);
+
+    const result =
+      request.method === "GET" ? await handleGetWatch(db) : await handlePutWatch(request, db);
+
+    return result.ok
+      ? json(result.body, result.status, cors)
+      : errorResponse(result.code, result.status, cors, result.details);
   }
 
   return errorResponse("NOT_FOUND", 404, cors);

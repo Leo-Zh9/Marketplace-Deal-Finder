@@ -1,8 +1,12 @@
 // @vitest-environment node
 
-import { claimEvaluationTasks } from "../evaluation/evaluateBatch";
-import { loadCurrentSettings, updateSearchSettings } from "../search/settings";
+import { updateSearchSettings } from "../search/settings";
 import { createTestDatabase, truncateAll, type TestDatabase } from "../testing/d1";
+import {
+  claim as claimTasks,
+  fingerprint as fingerprintOf,
+  seedEvaluationCorpus as seedCorpus,
+} from "../testing/evaluationFingerprint";
 import { handleGetWatchTargets } from "./watchTargets";
 
 let database!: TestDatabase;
@@ -46,66 +50,14 @@ const seedTarget = (targetId: string, componentType: string, query: string) =>
     .run();
 
 /**
- * THE CLAIM IS PRECISE, AND IT IS NOT "the files diff clean": the `results`-only fingerprint of
- * search_revisions, search_settings and evaluation_tasks. A `wrangler --json` envelope carries a
- * `meta.duration` that differs between runs and says nothing.
- *
- * It is the WIDE fingerprint: `SELECT *` pins `created_at`, `lease_token` and `lease_expires_at`
- * as well as the verdict columns, so a write that touched only the lease would still show.
+ * THE FINGERPRINT, THE CORPUS AND THE CLAIM COME FROM `worker/testing/evaluationFingerprint.ts`,
+ * which `worker/api/watch.test.ts` also imports. There was one copy per suite and they could
+ * drift until one of them stopped measuring anything; see that file for what the fingerprint
+ * covers, what it deliberately does not, and why the control below must assert non-emptiness.
  */
-const fingerprint = async () => {
-  const revisions = await database.db
-    .prepare("SELECT * FROM search_revisions ORDER BY revision")
-    .all();
-  const settings = await database.db.prepare("SELECT * FROM search_settings ORDER BY id").all();
-  const tasks = await database.db
-    .prepare("SELECT * FROM evaluation_tasks ORDER BY source, listing_id")
-    .all();
-  return {
-    revisions: revisions.results,
-    settings: settings.results,
-    tasks: tasks.results,
-  };
-};
-
-const seedEvaluationCorpus = async () => {
-  await database.db.batch([
-    database.db.prepare(
-      "INSERT INTO search_revisions (revision, mode, minimum_discount_percent, maximum_price_cents, created_at) VALUES (0, 'MAXIMUM_PRICE', NULL, 80000, 1700000000)",
-    ),
-    database.db.prepare(
-      "INSERT INTO search_revisions (revision, mode, minimum_discount_percent, maximum_price_cents, created_at) VALUES (1, 'MAXIMUM_PRICE', NULL, 74900, 1700000100)",
-    ),
-    database.db.prepare("INSERT INTO search_settings (id, current_revision) VALUES (1, 1)"),
-  ]);
-
-  const verdicts = ["DEAL", "NEEDS_REVIEW", "NOT_DEAL"];
-  await database.db.batch(
-    verdicts.map((verdict, index) =>
-      database.db
-        .prepare(
-          `INSERT INTO evaluation_tasks
-             (source, listing_id, status, created_at, evaluated_revision, verdict, evaluated_at,
-              lease_expires_at, lease_token)
-           VALUES ('facebook-marketplace', ?1, 'COMPLETE', 1700000200, 1, ?2, 1700000300, 0, '')`,
-        )
-        .bind(`listing-${index}`, verdict),
-    ),
-  );
-};
-
-const claim = async () => {
-  const current = await loadCurrentSettings(database.db);
-  const claimed = await claimEvaluationTasks(database.db, {
-    source: "facebook-marketplace",
-    batchSize: 15,
-    now: 1700001000,
-    leaseSeconds: 300,
-    leaseToken: "watch-suite-lease",
-    searchRevision: current.settings?.searchRevision ?? 0,
-  });
-  return claimed.tasks.length;
-};
+const fingerprint = () => fingerprintOf(database.db);
+const seedEvaluationCorpus = () => seedCorpus(database.db);
+const claim = () => claimTasks(database.db);
 
 describe("GET /api/watch-targets", () => {
   /**
@@ -153,6 +105,16 @@ describe("GET /api/watch-targets", () => {
     await seedEvaluationCorpus();
     expect(await claim()).toBe(0);
 
+    // THESE THREE LINES ARE NOT OPTIONAL, AND THEY ARE WHY THE CONTROL IS A CONTROL. MEASURED:
+    // replacing the shared helper with one returning `{revisions:[],settings:[],tasks:[]}` left
+    // BOTH W-1 and this test green -- a mutation satisfied by both sides losing, in a helper two
+    // suites share. The `not.toEqual` sees a gutted fingerprint, and the non-emptiness assertions
+    // see one that is merely empty for this fixture.
+    const before = await fingerprint();
+    expect(before.revisions.length).toBeGreaterThan(0);
+    expect(before.settings.length).toBeGreaterThan(0);
+    expect(before.tasks.length).toBeGreaterThan(0);
+
     await updateSearchSettings(database.db, {
       mode: "MAXIMUM_PRICE",
       minimumDiscountPercent: null,
@@ -161,6 +123,7 @@ describe("GET /api/watch-targets", () => {
     });
 
     expect(await claim()).toBe(3);
+    expect(await fingerprint()).not.toEqual(before);
   });
 
   it("W-2: targets come back ordered by target_id, camelCase, with the market alongside", async () => {

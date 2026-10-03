@@ -780,6 +780,11 @@ describe("the ingest route's credential boundary", () => {
     ["GET", "/api/status"],
     ["GET", "/api/settings"],
     ["PUT", "/api/settings"],
+    // X-w2: THE BROWSER'S WATCH ROUTE IS ON THE OTHER CREDENTIAL. `/api/watch-targets` admits the
+    // collector secret and `/api/watch` must not: routing it through `authorizeCollector` would
+    // give the collector's token the operator's WRITE on the watch list.
+    ["GET", "/api/watch"],
+    ["PUT", "/api/watch"],
   ])(
     "X4: a VALID collector token buys nothing on %s %s",
     async (method, path) => {
@@ -1319,6 +1324,51 @@ describe("the browser read route's boundary", () => {
     });
   });
 
+  /**
+   * V-12: THE ROUTE MUST HAND THE HANDLER THE REAL QUERY STRING. MEASURED: replacing
+   * `url.searchParams` with `new URLSearchParams()` in the route left BOTH worker suites green
+   * (184 tests) while every filtered request silently returned the unfiltered page -- PR #17's
+   * defect back, with the server-side filter in place and provably doing nothing. The handler
+   * tests pass their own params, so this is the only place that link is observable.
+   */
+  it("V-12: the query string reaches the handler, so a non-matching selection is an empty page", async () => {
+    const filtered = (all: string[]) => {
+      const params = new URLSearchParams();
+      params.set("all", JSON.stringify(all));
+      return `/api/verdicts?${params.toString()}`;
+    };
+
+    const matching = await call(
+      filtered(["case_fans"]),
+      { headers: { Authorization: await bearerFor(), Origin: pagesOrigin } },
+      verdictsEnvironment({ DB: database.db }),
+    );
+    expect(matching.status).toBe(200);
+    expect((await matching.json() as { listings: unknown[] }).listings).toHaveLength(1);
+
+    const nonMatching = await call(
+      filtered(["cpu"]),
+      { headers: { Authorization: await bearerFor(), Origin: pagesOrigin } },
+      verdictsEnvironment({ DB: database.db }),
+    );
+    expect(nonMatching.status).toBe(200);
+    await expect(nonMatching.json()).resolves.toEqual({ listings: [], truncated: false });
+
+    const invalid = await call(
+      "/api/verdicts?all=%5B%22gpuu%22%5D",
+      { headers: { Authorization: await bearerFor(), Origin: pagesOrigin } },
+      verdictsEnvironment({ DB: database.db }),
+    );
+    expect(invalid.status).toBe(400);
+    await expect(invalid.json()).resolves.toEqual({
+      error: {
+        code: "INVALID_VERDICTS_QUERY",
+        message: "The component or model filter in the request is not valid.",
+        detail: "gpuu",
+      },
+    });
+  });
+
   it("V-6: the collector paths are still absent from the advertised surface", () => {
     expect(ROUTE_METHODS.has("/api/listings")).toBe(false);
     expect(ROUTE_METHODS.has("/api/watch-targets")).toBe(false);
@@ -1486,6 +1536,254 @@ describe("the browser read route's boundary", () => {
       { headers: { Authorization: await bearerFor(), Origin: pagesOrigin } },
       verdictsEnvironment({ DB: broken }),
     );
+    expect(response.status).toBe(404);
+  });
+});
+
+/**
+ * THE BROWSER'S WATCH ROUTE. It is a DIFFERENT route from `/api/watch-targets` on a DIFFERENT
+ * credential, and the two must stay disjoint in both directions: X-w2 (two rows in the X4 table
+ * above) proves a collector token buys nothing here, and X-a/X-b prove no browser channel exists
+ * there. The path prefix is shared, which is the one mechanical risk -- X-w6 is the guard on it.
+ *
+ * EVERY ROW BELOW GOES THROUGH `handleRequest`, because §6.6 of the plan was the one NOT RUN item
+ * in the server half: the handler tests call the handlers directly and are blind to the route
+ * wiring, the preflight and the DB guard.
+ */
+describe("the browser watch route", () => {
+  const collectorToken = "index-suite-browser-watch-token-7c1e9a";
+  const watchPath = "/api/watch";
+
+  let database!: TestDatabase;
+
+  beforeAll(async () => {
+    database = await createTestDatabase();
+  }, 120_000);
+
+  afterAll(async () => {
+    await database.dispose();
+  });
+
+  beforeEach(async () => {
+    await truncateAll(database.db);
+    await database.db
+      .prepare(
+        "INSERT INTO watch_market (id, location, latitude, longitude, radius_km) VALUES (1,'toronto',43.6532,-79.3832,25)",
+      )
+      .run();
+    // A row whose `component_type` is OUTSIDE the catalog: the inversion cannot place it, so it
+    // is both preservable and always part of the residue. A broad row of a CATALOG type would be
+    // preserved just as well, but it would come back as a SELECTED TYPE on the next read rather
+    // than as a kept search -- which is the inversion working as designed, and would make this
+    // row assert something other than what it says.
+    await database.db
+      .prepare(
+        "INSERT INTO watch_targets (target_id, component_type, query) VALUES ('legacy-ebay','ebay','gpu deals')",
+      )
+      .run();
+  });
+
+  const watchEnvironment = (overrides: Partial<Environment> = {}): Environment =>
+    environment({ COLLECTOR_TOKEN: collectorToken, ...overrides });
+
+  const validBody = {
+    components: ["case_fans"],
+    models: { case_fans: { mode: "all", values: [], query: "case fan" } },
+    location: { slug: "toronto", latitude: 43.6532, longitude: -79.3832 },
+    radiusKm: 25,
+    preservedTargetIds: ["legacy-ebay"],
+  };
+
+  /**
+   * X-w1: THE ROUTE_METHODS ROW, AND IT IS THE ONLY GUARD ON IT. Omitting the row leaves every
+   * handler test green and leaves `curl` working -- curl never preflights, and `npm run dev`
+   * reaches the Worker through Vite's same-origin /api proxy -- while the real browser cannot save
+   * cross-origin in production. `Content-Type` is offered because PUT is a body method, through
+   * `preflightHeadersFor` and nothing else.
+   */
+  it("X-w1: the preflight is 204 advertising GET, PUT, OPTIONS and Content-Type", async () => {
+    const put = await call(watchPath, {
+      method: "OPTIONS",
+      headers: {
+        Origin: pagesOrigin,
+        "Access-Control-Request-Method": "PUT",
+        "Access-Control-Request-Headers": "authorization, accept, content-type",
+      },
+    });
+    expect(put.status).toBe(204);
+    expect(put.headers.get("Access-Control-Allow-Methods")).toBe("GET, PUT, OPTIONS");
+    expect(put.headers.get("Access-Control-Allow-Headers")).toBe(
+      "Authorization, Accept, Content-Type",
+    );
+    expect(put.headers.get("Access-Control-Allow-Origin")).toBe(pagesOrigin);
+
+    const get = await call(watchPath, {
+      method: "OPTIONS",
+      headers: { Origin: pagesOrigin, "Access-Control-Request-Method": "GET" },
+    });
+    expect(get.status).toBe(204);
+
+    const remove = await call(watchPath, {
+      method: "OPTIONS",
+      headers: { Origin: pagesOrigin, "Access-Control-Request-Method": "DELETE" },
+    });
+    expect(remove.status).toBe(403);
+  });
+
+  /**
+   * X-w3: THE COLLECTOR'S ROUTE GAINS NOTHING FROM THIS SLICE. Adding a ROUTE_METHODS row for it
+   * would answer 204 advertising `GET, OPTIONS` -- a real browser channel -- while every other
+   * test here stayed green.
+   */
+  it("X-w3: /api/watch-targets is still absent from the advertised surface and its preflight is 403", async () => {
+    expect(ROUTE_METHODS.has("/api/watch-targets")).toBe(false);
+    expect(ROUTE_METHODS.get(watchPath)).toEqual(["GET", "PUT"]);
+
+    const response = await call("/api/watch-targets", {
+      method: "OPTIONS",
+      headers: { Origin: pagesOrigin, "Access-Control-Request-Method": "GET" },
+    });
+    expect(response.status).toBe(403);
+    expect(response.headers.get("Access-Control-Allow-Methods")).toBeNull();
+  });
+
+  /**
+   * X-w4: THE DB GUARD IS BEFORE THE HANDLER, SO IT IS BEFORE ANY VALIDATION. A request body never
+   * reaches a path with no binding, and the operator reads "the database is not configured" rather
+   * than a validation error about a list that could not have been written anyway.
+   */
+  it("X-w4: a missing DB binding is 503 DATABASE_UNAVAILABLE on both methods", async () => {
+    for (const method of ["GET", "PUT"] as const) {
+      const response = await call(watchPath, {
+        method,
+        headers: {
+          Authorization: await bearerFor(),
+          Origin: pagesOrigin,
+          ...(method === "PUT" ? { "Content-Type": "application/json" } : {}),
+        },
+        ...(method === "PUT" ? { body: JSON.stringify(validBody) } : {}),
+      });
+      expect(response.status, method).toBe(503);
+      await expect(response.json()).resolves.toEqual({
+        error: {
+          code: "DATABASE_UNAVAILABLE",
+          message: "The database is not configured.",
+        },
+      });
+      expect(response.headers.get("Access-Control-Allow-Origin")).toBe(pagesOrigin);
+    }
+  });
+
+  /**
+   * X-w5: THE WHOLE ROUTE, OVER HTTP, INTO D1 AND BACK -- including the `case_fans`/`case_fan`
+   * translation, which was the uncaught `TypeError` before `STORAGE_COMPONENT_ID` existed: a bare
+   * 500 carrying none of `securityHeaders`.
+   */
+  it("X-w5: an approved identity writes the list and reads it back", async () => {
+    const written = await call(
+      watchPath,
+      {
+        method: "PUT",
+        headers: {
+          Authorization: await bearerFor(),
+          Origin: pagesOrigin,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(validBody),
+      },
+      watchEnvironment({ DB: database.db }),
+    );
+    expect(written.status).toBe(200);
+    expect(written.headers.get("Access-Control-Allow-Origin")).toBe(pagesOrigin);
+    expect(written.headers.get("X-Content-Type-Options")).toBe("nosniff");
+
+    const stored = await database.db
+      .prepare("SELECT target_id, component_type, query FROM watch_targets ORDER BY target_id")
+      .all<{ target_id: string; component_type: string; query: string }>();
+    expect(stored.results).toEqual([
+      { target_id: "case_fans-case-fan", component_type: "case_fan", query: "case fan" },
+      { target_id: "legacy-ebay", component_type: "ebay", query: "gpu deals" },
+    ]);
+
+    const read = await call(
+      watchPath,
+      { headers: { Authorization: await bearerFor(), Origin: pagesOrigin } },
+      watchEnvironment({ DB: database.db }),
+    );
+    expect(read.status).toBe(200);
+    const body = (await read.json()) as {
+      selection: { components: string[]; radiusKm: number };
+      keptSearches: { targetId: string }[];
+    };
+    expect(body.selection.components).toEqual(["case_fans"]);
+    expect(body.selection.radiusKm).toBe(25);
+    expect(body.keptSearches.map((row) => row.targetId)).toEqual(["legacy-ebay"]);
+  });
+
+  /**
+   * X-w5b: a refusal carries its `details` through `errorResponse`, which is what lets the form
+   * mark the offending field instead of showing a generic failure. Dropping `result.details` from
+   * the route's error return leaves the status and the code right and the UI blind.
+   */
+  it("X-w5b: a refusal carries code, message AND details to the browser", async () => {
+    const response = await call(
+      watchPath,
+      {
+        method: "PUT",
+        headers: {
+          Authorization: await bearerFor(),
+          Origin: pagesOrigin,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ ...validBody, radiusKm: 12.5 }),
+      },
+      watchEnvironment({ DB: database.db }),
+    );
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({
+      error: {
+        code: "INVALID_WATCH",
+        message: "The watch list in the request is not valid.",
+        field: "radiusKm",
+        detail: "12.5",
+      },
+    });
+  });
+
+  /**
+   * X-w6: THE SHARED PREFIX IS THE MECHANICAL RISK. `/api/watch-targets` starts with `/api/watch`,
+   * so a `startsWith` route match -- the edit anyone would call a simplification -- would put the
+   * collector's route behind the browser's credential and hand a Firebase identity the write.
+   */
+  it.each([
+    ["a trailing slash", "/api/watch/"],
+    ["a cased spelling", "/api/Watch"],
+    ["the collector's path", "/api/watch-targets"],
+    ["a longer path with the same prefix", "/api/watch-evil"],
+  ])("X-w6: %s is not the browser watch route", async (_label, path) => {
+    const untouchable = {
+      prepare: () => {
+        throw new Error("the database must not be reached");
+      },
+      batch: () => {
+        throw new Error("the database must not be reached");
+      },
+    } as unknown as D1Database;
+    const response = await call(
+      path,
+      {
+        method: "PUT",
+        headers: {
+          Authorization: await bearerFor(),
+          Origin: pagesOrigin,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(validBody),
+      },
+      watchEnvironment({ DB: untouchable }),
+    );
+    // 404 for a path that is not a route; the collector's own path is a GET-only collector route,
+    // so a PUT there is a 404 too -- what matters is that neither reaches this handler.
     expect(response.status).toBe(404);
   });
 });

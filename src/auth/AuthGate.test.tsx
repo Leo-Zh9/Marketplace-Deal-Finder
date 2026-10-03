@@ -1,7 +1,6 @@
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useEffect, type ReactNode } from "react";
-import { resetMarketplaceState } from "../services/marketplaceClient";
 import { AuthGate } from "./AuthGate";
 import {
   ApiRequestError,
@@ -13,10 +12,13 @@ import {
 
 // The Firebase SDK is never imported here: only firebaseAdapter.ts imports it,
 // and only main.tsx imports firebaseAdapter.
-vi.mock("../services/marketplaceClient", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../services/marketplaceClient")>();
-  return { ...actual, resetMarketplaceState: vi.fn() };
-});
+//
+// THIS FILE NO LONGER MOCKS `../services/marketplaceClient`, because `AuthGate` no longer imports
+// it. The one function it called -- `resetMarketplaceState` -- rolled back the monitoring lifecycle,
+// and with that fiction deleted there is no client-side state belonging to a previous identity: every
+// request is a fresh fetch with the caller's current token. The two assertions that counted its
+// calls are gone with it; what they were really guarding -- that an account change swaps the
+// dashboard and a routine token refresh does NOT remount it -- is asserted directly below.
 
 const firebaseIdentity: AuthenticatedIdentity = {
   email: "owner@example.com",
@@ -106,7 +108,6 @@ const renderGate = (props: {
 
 beforeEach(() => {
   mountCount = 0;
-  vi.mocked(resetMarketplaceState).mockClear();
 });
 
 describe("authentication gate", () => {
@@ -374,13 +375,9 @@ describe("authentication gate", () => {
     await emit(adapter, { uid: "a", email: "a@example.com" });
     expect(await screen.findByText("a@example.com")).toBeInTheDocument();
 
-    const resetsAfterFirstSignIn = vi.mocked(resetMarketplaceState).mock.calls.length;
     await emit(adapter, { uid: "b", email: "b@example.com" });
     expect(await screen.findByText("b@example.com")).toBeInTheDocument();
     expect(screen.queryByText("a@example.com")).not.toBeInTheDocument();
-    expect(vi.mocked(resetMarketplaceState).mock.calls.length).toBeGreaterThan(
-      resetsAfterFirstSignIn,
-    );
   });
 
   it("re-checks the Worker on a routine token refresh without remounting", async () => {
@@ -392,7 +389,6 @@ describe("authentication gate", () => {
     expect(await screen.findByText("dashboard")).toBeInTheDocument();
 
     const mountsAfterSignIn = mountCount;
-    const resetsAfterSignIn = vi.mocked(resetMarketplaceState).mock.calls.length;
 
     await emit(adapter, { uid: "a", email: "owner@example.com" });
     await waitFor(() => {
@@ -402,7 +398,6 @@ describe("authentication gate", () => {
     expect(screen.getByText("dashboard")).toBeInTheDocument();
     expect(screen.queryByText("Checking your access…")).not.toBeInTheDocument();
     expect(mountCount).toBe(mountsAfterSignIn);
-    expect(vi.mocked(resetMarketplaceState).mock.calls.length).toBe(resetsAfterSignIn);
   });
 
   it("keeps the dashboard mounted through a transient background failure", async () => {

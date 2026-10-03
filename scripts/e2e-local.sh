@@ -94,6 +94,16 @@ is "DELETE is refused on /api/settings"       403 "$(pf /api/settings DELETE)"
 is "GET is ALLOWED on /api/verdicts"          204 "$(pf /api/verdicts GET)"
 is "  ...content-type is still refused"       403 "$(pf /api/verdicts GET content-type)"
 is "  ...and PUT is refused"                  403 "$(pf /api/verdicts PUT)"
+# THE BROWSER'S WATCH ROUTE, and the row for the COLLECTOR's /api/watch-targets stays a 403 below.
+# MEASURED: omitting the ROUTE_METHODS row for /api/watch leaves every unit test green and leaves
+# curl working -- curl never preflights, and `npm run dev` reaches the Worker through Vite's
+# same-origin /api proxy -- while a real browser cannot save cross-origin in production.
+# content-type is offered because PUT is a body method, and `preflightHeadersFor` is path-scoped,
+# so it is offered on the GET preflight of this path too.
+is "GET is ALLOWED on /api/watch"             204 "$(pf /api/watch GET)"
+is "  ...and so is PUT"                       204 "$(pf /api/watch PUT)"
+is "  ...with content-type on the PUT"        204 "$(pf /api/watch PUT content-type)"
+is "  ...while DELETE is refused"             403 "$(pf /api/watch DELETE)"
 
 echo "== settings write path =="
 sql "DELETE FROM search_settings; DELETE FROM search_revisions;" >/dev/null
@@ -350,8 +360,8 @@ sql "DELETE FROM watch_targets;
 # right value, which is blind to whether the real one waits; the two throttle rows below assert
 # the REPORTED `delayMs`, not elapsed time; and at a delay of 0 a real `setTimeout(0)` and a
 # `Promise.resolve()` are behaviourally identical. So `collector/main.ts` supplied the one
-# dependency nothing observed: replacing its sleep with `() => Promise.resolve()` left 156 unit
-# tests AND all 79 assertions in this file green with the throttle between searches GONE. That is
+# dependency nothing observed: replacing its sleep with `() => Promise.resolve()` left THE WHOLE
+# UNIT SUITE AND THE WHOLE OF THIS GATE green with the throttle between searches GONE. That is
 # nine back-to-back searches from the operator's residential IP -- the failure that already blocks
 # Cloudflare and would end the Facebook half of the product.
 #
@@ -454,6 +464,186 @@ is "  ...and the DEAL sorts first"             915010494744438 \
 h=$($CURL -s -D- -o /dev/null -H "Origin: $EVIL" "$BASE/api/verdicts" --max-time 15 | grep -ci "access-control-allow-origin: $EVIL")
 is "  ...and an evil origin is never reflected" 0 "$h"
 is "  ...and an evil origin is refused"        403 "$(code -H "Origin: $EVIL" "$BASE/api/verdicts")"
+
+echo "== server-side filtering: the selection travels in the URL =="
+# THE CORPUS HERE IS THE COLLECTOR'S OWN FOUR gpu ROWS, which is what makes the cpu row below a
+# real negative rather than an empty database. PR #17's defect was that this filter ran in the
+# BROWSER, after the server's LIMIT 50.
+vdq() { $CURL -s -o /tmp/e2e.body -w '%{http_code}' -H "Origin: $ORIGIN" "$BASE/api/verdicts?$1" --max-time 15; }
+models() { python3 -c "
+import json
+rows=json.load(open('/tmp/e2e.body'))['listings']
+print('' if not rows else ','.join(sorted({r['modelKey'] or 'null' for r in rows})))
+"; }
+is "a gpu selection returns the gpu rows"     200 "$(vdq 'all=%5B%22gpu%22%5D')"
+has "  ...including the 5080"                 '"modelKey":"GeForce RTX 5080"' "$(body)"
+is "a cpu selection over a gpu corpus is 200" 200 "$(vdq 'all=%5B%22cpu%22%5D')"
+# AN EMPTY PAGE THAT KNOWS IT IS COMPLETE. This is the state that used to read "0+ results /
+# Nothing on this page matched" because the bound applied ahead of the filter.
+is "  ...and an EMPTY, COMPLETE page"         '{"listings":[],"truncated":false}' "$(body)"
+is "an empty ?all with a model pair is 200"   200 "$(vdq 'all=%5B%5D&pairs=%5B%22gpu%2FGeForce+RTX+5080%22%5D')"
+# EXACTLY that model, and non-empty: an empty result would satisfy "all rows match" vacuously.
+is "  ...returning only that model's rows"    'GeForce RTX 5080' "$(models)"
+is "an absent ?all is the unfiltered page"    200 "$(code -H "Origin: $ORIGIN" "$BASE/api/verdicts")"
+atleast "  ...and it is wider than one model" 2 "$(python3 -c "import json;print(len(json.load(open('/tmp/e2e.body'))['listings']))")"
+is "an unknown component type is refused"     400 "$(vdq 'all=%5B%22gpuu%22%5D')"
+has "  ...by its own code"                    '"code":"INVALID_VERDICTS_QUERY"' "$(body)"
+is "an empty model half is refused"           400 "$(vdq 'all=%5B%5D&pairs=%5B%22gpu%2F%22%5D')"
+is "?pairs without ?all is refused"           400 "$(vdq 'pairs=%5B%22gpu%2FGeForce+RTX+5080%22%5D')"
+
+echo "== the browser's watch route: the form is what drives collection =="
+# THE DEAL RULE MUST NOT MOVE. `searchRevision` is evaluateBatch's staleness key and a bump
+# re-opens EVERY task in the corpus; editing what you hunt says nothing about whether an
+# already-judged listing was a deal. Captured before the first PUT and asserted after the last.
+WATCH_REV_COUNT=$(val 'SELECT COUNT(*) FROM search_revisions')
+WATCH_REV_MAX=$(val 'SELECT COALESCE(MAX(revision),-1) FROM search_revisions')
+
+# EVERY BODY BELOW IS A SINGLE-QUOTED LITERAL, and that is not style. MEASURED: building one with
+# `"{\"components\":...,$VAR}"` inside a nested command substitution reaches curl mangled -- the
+# worker answers 400 INVALID_JSON -- so a row asserting a 400 PASSES FOR THE WRONG REASON. The one
+# body that must be built at runtime is passed through a FILE, where no shell quoting touches it.
+wput() { code -X PUT -H "Origin: $ORIGIN" -H "Content-Type: application/json" -d "$1" "$BASE/api/watch"; }
+wputf() { code -X PUT -H "Origin: $ORIGIN" -H "Content-Type: application/json" -d @"$1" "$BASE/api/watch"; }
+
+# THE PRESERVATION RULE IS NOT RE-IMPLEMENTED HERE, AND THAT IS THE POINT. This used to carry a
+# THIRD copy of the browser's half of it, and the copy had DIVERGED -- it was missing the "is this
+# query a catalog model of its own type?" term -- so it preserved a row the real client discards and
+# therefore could not see the two-save data loss `W-twice` now pins. There are two implementations
+# of that rule and there should be two: the server's `preservableIds` and the client's
+# `preservableTargets`. This turns the LAST GET RESPONSE into the next PUT body by echoing the
+# wire's own `keptSearches`, which for an UNTOUCHED LOAD is exactly the client's kept list -- a
+# property of the inversion, asserted by W-kept-agree. It holds at that width and no wider: every
+# residue row is a non-model, which preservability needs but is not satisfied by on its own (it also
+# needs the derivation not to be writing the row). Untouched is the only shape used here.
+watchbody() { python3 -c "
+import json
+state = json.load(open('/tmp/e2e.body'))
+sel = state['selection']
+json.dump({'components': sel['components'], 'models': sel['models'], 'location': sel['location'],
+           'radiusKm': sel['radiusKm'],
+           'preservedTargetIds': [row['targetId'] for row in state['keptSearches']]},
+          open('/tmp/e2e.watchbody', 'w'))
+"; }
+# TWO BROAD ROWS FOR ONE TYPE, so preservation has something to keep AND something to drop. Both
+# are free-text queries the form cannot author, which is the only kind preservation protects.
+sql "DELETE FROM watch_targets;
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('keep-me','gpu','radeon deals');
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('drop-me','gpu','rtx');
+     UPDATE watch_market SET location='waterloo', latitude=43.4643, longitude=-80.5204, radius_km=10 WHERE id=1;" >/dev/null
+
+# THE QUERY IS `radeon`, NOT `graphics card`, AND THAT CHOICE IS THE WHOLE TEST. MEASURED: with the
+# body carrying `graphics card` -- which is also gpu's catalog `searchTerm` -- dropping the query
+# echo from the GET left this gate 155/155 GREEN, because the echoed value and the re-derived one
+# coincide. `radeon` is a free-text query the form cannot author, which is exactly what production's
+# nine rows are, so the echo becomes observable.
+is "a valid PUT is accepted"                  200 "$(wput '{"components":["gpu"],"models":{"gpu":{"mode":"all","values":[],"query":"radeon"}},"location":{"slug":"toronto","latitude":43.6532,"longitude":-79.3832},"radiusKm":25,"preservedTargetIds":["keep-me"]}')"
+is "  ...and the derived row reached D1"      'gpu-radeon|gpu|radeon' \
+   "$(val "SELECT target_id || '|' || component_type || '|' || query FROM watch_targets WHERE target_id='gpu-radeon'")"
+is "  ...and the market with it"              'toronto|43.6532,-79.3832|25' \
+   "$(val "SELECT location || '|' || latitude || ',' || longitude || '|' || radius_km FROM watch_market")"
+# PRESERVATION OVER HTTP: the echoed row is untouched and the unechoed one is gone.
+is "  ...the kept row is untouched"           'keep-me|gpu|radeon deals' \
+   "$(val "SELECT target_id || '|' || component_type || '|' || query FROM watch_targets WHERE target_id='keep-me'")"
+is "  ...the unkept row is removed"           0 "$(val "SELECT COUNT(*) FROM watch_targets WHERE target_id='drop-me'")"
+is "  ...leaving exactly two rows"            2 "$(val 'SELECT COUNT(*) FROM watch_targets')"
+is "the GET reads the same selection back"    200 "$(code -H "Origin: $ORIGIN" "$BASE/api/watch")"
+has "  ...echoing the stored query"           '"query":"radeon"' "$(body)"
+has "  ...naming the kept row"                '"targetId":"keep-me"' "$(body)"
+has "  ...and the radius"                     '"radiusKm":25' "$(body)"
+# THE SINGLETON SURVIVES a second market: a plain INSERT would be a second row and CHECK (id = 1)
+# would make it a 503 instead.
+is "a second PUT with another market"         200 "$(wput '{"components":["gpu"],"models":{"gpu":{"mode":"all","values":[],"query":"radeon"}},"location":{"slug":"waterloo","latitude":43.4643,"longitude":-80.5204},"radiusKm":10,"preservedTargetIds":["keep-me"]}')"
+is "  ...leaves ONE market row"               1 "$(val 'SELECT COUNT(*) FROM watch_market')"
+is "  ...pointing at the new market"          waterloo "$(val 'SELECT location FROM watch_market')"
+# ALL NINE TYPES SURVIVE THE ROUTE, and `case_fans` is the one whose spellings differ: the catalog
+# id on the wire, the worker id in the column. Binding the catalog spelling makes that target a
+# 400 INVALID_LISTINGS on every collector run.
+is "a case_fans PUT is accepted"              200 "$(wput '{"components":["case_fans"],"models":{"case_fans":{"mode":"all","values":[],"query":"case fan"}},"location":{"slug":"toronto","latitude":43.6532,"longitude":-79.3832},"radiusKm":25,"preservedTargetIds":["keep-me"]}')"
+is "  ...storing the WORKER spelling"         case_fan "$(val "SELECT component_type FROM watch_targets WHERE target_id='case_fans-case-fan'")"
+is "  ...and reading back the CATALOG one"    200 "$(code -H "Origin: $ORIGIN" "$BASE/api/watch")"
+has "  ...as case_fans"                       '"case_fans"' "$(body)"
+# THE GET'S OWN OUTPUT RE-PUTs: the read and the write agree on one vocabulary.
+watchbody
+is "  ...and the GET's own output re-PUTs"     200 "$(wputf /tmp/e2e.watchbody)"
+# AND THE FREE-TEXT QUERY SURVIVED THE ROUND TRIP. The gpu row at this point is `keep-me`'s
+# 'radeon deals' -- a hand-written query the form cannot author -- which the GET echoed as gpu's
+# broad query. Without the echo the re-PUT sends gpu's catalog `searchTerm` instead, rewrites the
+# row to 'graphics card' and reports 200: the 9 -> 6 row loss this slice exists to prevent, at the
+# width this gate can see. The id is re-derived from the query, which is harmless -- MEASURED,
+# nothing in the repository parses `target_id`.
+is "  ...with the free-text query intact"     'gpu-radeon-deals|gpu|radeon deals' \
+   "$(val "SELECT target_id || '|' || component_type || '|' || query FROM watch_targets WHERE component_type='gpu'")"
+is "  ...and no re-derived row beside it"     0 "$(val "SELECT COUNT(*) FROM watch_targets WHERE query='graphics card'")"
+# THE CAP REFUSES AND WRITES NOTHING. MAX_TARGETS_PER_RUN refuses rather than truncating, so a
+# saved list of ten collects NOTHING on every run.
+WATCH_BEFORE_CAP=$(val 'SELECT COUNT(*) FROM watch_targets')
+# THE TEN NAMES ARE REAL CATALOG MODELS. An invented name is a DIFFERENT 400 -- INVALID_WATCH
+# naming the value -- so the status row would pass while the cap went untested; the `has` below is
+# what caught exactly that on this row's first run.
+is "a body deriving ten targets is refused"   400 "$(wput '{"components":["gpu"],"models":{"gpu":{"mode":"selected","values":["GeForce RTX 5090","GeForce RTX 5080","GeForce RTX 5070 Ti","GeForce RTX 5070","GeForce RTX 5060 Ti 16GB","GeForce RTX 5060 Ti 8GB","GeForce RTX 5060","Radeon RX 9070 XT","Radeon RX 9070","Radeon RX 9060 XT 16GB"]}},"location":{"slug":"toronto","latitude":43.6532,"longitude":-79.3832},"radiusKm":25,"preservedTargetIds":[]}')"
+has "  ...naming the cap"                     '"code":"WATCH_TARGETS_EXCEEDED"' "$(body)"
+is "  ...and writing nothing"                 "$WATCH_BEFORE_CAP" "$(val 'SELECT COUNT(*) FROM watch_targets')"
+# BAD BODIES ARE LOUD, AND preservedTargetIds IS REQUIRED: defaulting it to [] would make any save
+# from a client that does not know the field a silent delete of every kept search.
+is "an absent preservedTargetIds is refused"  400 "$(wput '{"components":["gpu"],"models":{"gpu":{"mode":"all","values":[],"query":"graphics card"}},"location":{"slug":"toronto","latitude":43.6532,"longitude":-79.3832},"radiusKm":25}')"
+has "  ...naming the field"                   '"field":"preservedTargetIds"' "$(body)"
+is "a non-integer radius is refused"          400 "$(wput '{"components":["gpu"],"models":{"gpu":{"mode":"all","values":[],"query":"graphics card"}},"location":{"slug":"toronto","latitude":43.6532,"longitude":-79.3832},"radiusKm":12.5,"preservedTargetIds":[]}')"
+has "  ...naming the radius"                  '"field":"radiusKm"' "$(body)"
+is "an unknown slug is refused"               400 "$(wput '{"components":["gpu"],"models":{"gpu":{"mode":"all","values":[],"query":"graphics card"}},"location":{"slug":"100-front-street-w-toronto-on-m5j-1e3","latitude":43.6532,"longitude":-79.3832},"radiusKm":25,"preservedTargetIds":[]}')"
+is "a model name sent as a broad query is refused" 400 "$(wput '{"components":["gpu"],"models":{"gpu":{"mode":"all","values":[],"query":"GeForce RTX 5080"}},"location":{"slug":"toronto","latitude":43.6532,"longitude":-79.3832},"radiusKm":25,"preservedTargetIds":[]}')"
+is "an unknown key inside models[t] is refused" 400 "$(wput '{"components":["gpu"],"models":{"gpu":{"mode":"all","values":[],"query":"graphics card","targetId":"x"}},"location":{"slug":"toronto","latitude":43.6532,"longitude":-79.3832},"radiusKm":25,"preservedTargetIds":[]}')"
+has "  ...naming the key"                     '"fields":["models.gpu.targetId"]' "$(body)"
+# THE TWO-SAVE ROUND TRIP, WHICH IS THE SHAPE THAT COST NINE ROWS IN REVIEW. Narrowing a type to one
+# model beside its own broad query, then saving a SECOND time with nothing touched, used to delete
+# the model row AND the kept search surrendered to make room for it -- because the type's mode was
+# decided by whichever of its rows sorted first by `target_id`, and `gpu-broad` sorts before
+# `gpu-geforce-rtx-5090`. Every other row in this gate stops after one save.
+sql "DELETE FROM watch_targets;
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('gpu-broad','gpu','radeon');" >/dev/null
+is "narrowing gpu to one model is accepted"    200 "$(wput '{"components":["gpu"],"models":{"gpu":{"mode":"selected","values":["GeForce RTX 5090"]}},"location":{"slug":"toronto","latitude":43.6532,"longitude":-79.3832},"radiusKm":25,"preservedTargetIds":["gpu-broad"]}')"
+is "  ...keeping the broad row beside it"      2 "$(val 'SELECT COUNT(*) FROM watch_targets')"
+is "the GET shows the narrowing"               200 "$(code -H "Origin: $ORIGIN" "$BASE/api/watch")"
+# IT MUST NOT SNAP BACK TO mode:"all". That reversion is what made the new row invisible in the form
+# and the budget read one lower than D1.
+has "  ...as mode selected"                    '"mode":"selected","values":["GeForce RTX 5090"]' "$(body)"
+has "  ...with the broad row kept, not lost"   '"targetId":"gpu-broad"' "$(body)"
+watchbody
+is "  ...and an untouched SECOND save is 200"  200 "$(wputf /tmp/e2e.watchbody)"
+is "  ...with the model search still stored"   1 "$(val "SELECT COUNT(*) FROM watch_targets WHERE query='GeForce RTX 5090'")"
+is "  ...and the broad query still beside it"  1 "$(val "SELECT COUNT(*) FROM watch_targets WHERE query='radeon'")"
+is "  ...and nothing else written or lost"     2 "$(val 'SELECT COUNT(*) FROM watch_targets')"
+
+# THE CREDENTIAL BOUNDARY, as the three-row differential with a live control. The naive
+# "a collector token is refused" row is VACUOUS here: the gate runs on 127.0.0.1 with
+# APP_ENV=local and authenticateRequest admits the loopback identity BEFORE reading a header. A
+# Host header turns that branch off, which is what makes the claim measurable.
+W_NO_TOKEN=$(hv "$BASE/api/watch")
+W_WITH_TOKEN=$(hv -H "X-Collector-Token: $COLLECTOR_TOKEN" "$BASE/api/watch")
+is "the collector token changes NOTHING here" "$W_NO_TOKEN" "$W_WITH_TOKEN"
+is "  ...and what it changes nothing to is a refusal" refused "$(refusal "$W_WITH_TOKEN")"
+is "  ...while that SAME token still opens its own route" 200 \
+   "$(hv -H "X-Collector-Token: $COLLECTOR_TOKEN" "$BASE/api/watch-targets")"
+# THE DEAL RULE IS UNDISTURBED by everything above.
+is "the revision log is unchanged in count"   "$WATCH_REV_COUNT" "$(val 'SELECT COUNT(*) FROM search_revisions')"
+is "  ...and at the same newest revision"     "$WATCH_REV_MAX" "$(val 'SELECT COALESCE(MAX(revision),-1) FROM search_revisions')"
+
+echo "== the cross-component link: does the collector run what the FORM wrote? =="
+# THE WHOLE SLICE IN ONE ASSERTION. The form writes the watch list over HTTP; the collector reads
+# it over HTTP with NO COLLECTOR_* target variables and runs that target. Before this slice the
+# watch list was only reachable through a hand-written `wrangler d1 execute`.
+ingest_tables
+sql "DELETE FROM watch_targets;" >/dev/null
+is "the form writes a single target"          200 "$(wput '{"components":["gpu"],"models":{"gpu":{"mode":"all","values":[],"query":"graphics card"}},"location":{"slug":"toronto","latitude":43.6532,"longitude":-79.3832},"radiusKm":25,"preservedTargetIds":[]}')"
+is "  ...and it is the only one"              1 "$(val 'SELECT COUNT(*) FROM watch_targets')"
+collect
+is "the collector run exits 0"                0 "$COLLECTOR_EXIT"
+has "  ...naming the target the FORM wrote"   '"target":"gpu-graphics-card"' "$(cat /tmp/e2e-collector.out)"
+has "  ...for exactly that one target"        '"targets":1,"complete":true,"exitCode":0' "$(cat /tmp/e2e-collector.out)"
+is "  ...and its listings reached D1"         4 "$(val "SELECT COUNT(*) FROM listings WHERE component_type='gpu'")"
+# THE MARKET THE FORM WROTE IS THE MARKET THE LISTINGS LANDED IN -- market_key is built from the
+# coordinates, and a form that wrote a market the collector did not use would be invisible here
+# without this row.
+is "  ...in the market the form wrote"        '43.6532,-79.3832|25km' "$(val 'SELECT DISTINCT market_key FROM listings')"
 
 ingest_tables
 

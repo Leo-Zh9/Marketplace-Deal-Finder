@@ -189,3 +189,121 @@ describe("bearer-token API transport", () => {
     ).toBe("Sign in again");
   });
 });
+
+/**
+ * THE QUERY STRING AND THE BODY, which the shipped client could carry NEITHER.
+ * MEASURED against the shipped module: `API_PATH_PATTERN` has no `?`, `=`, `&` or `%`, so
+ * `/api/verdicts?all=%5B%22gpu%22%5D` threw `ApiRequestError("Invalid API path.")` with ZERO fetch
+ * calls -- server-side filtering would have been a hard error on the one button the page has.
+ */
+describe("query strings and bodies", () => {
+  it("A-url: a query string reaches fetch verbatim, and the path half is still validated", async () => {
+    const fetchImplementation = fetcherFor(jsonResponse({ listings: [], truncated: false }));
+    const params = new URLSearchParams();
+    params.set("all", JSON.stringify([]));
+    params.set("pairs", JSON.stringify(["gpu/GeForce RTX 5080"]));
+
+    await requestJson(`/api/verdicts?${params.toString()}`, {
+      fetchImplementation: fetchImplementation as unknown as typeof fetch,
+    });
+
+    const [url] = fetchImplementation.mock.calls[0];
+    expect(url).toBe("/api/verdicts?all=%5B%5D&pairs=%5B%22gpu%2FGeForce+RTX+5080%22%5D");
+  });
+
+  it("A-url: the configured origin is prefixed with the query intact", async () => {
+    vi.stubEnv("VITE_API_BASE_URL", "https://api.example.workers.dev");
+    const fetchImplementation = fetcherFor(jsonResponse({ ok: true }));
+
+    await requestJson("/api/verdicts?all=%5B%22gpu%22%5D", {
+      fetchImplementation: fetchImplementation as unknown as typeof fetch,
+    });
+
+    expect(fetchImplementation.mock.calls[0][0]).toBe(
+      "https://api.example.workers.dev/api/verdicts?all=%5B%22gpu%22%5D",
+    );
+  });
+
+  /**
+   * A-url-guard: SPLITTING RATHER THAN LOOSENING IS THE WHOLE POINT. Loosening the pattern to admit
+   * `?`, `=` and `%` would move the traversal guard with it; the pattern here never sees the query,
+   * so `/api/../secret?x=1` still throws before any fetch. A `..` inside a query VALUE is harmless
+   * and must still reach the server.
+   */
+  it.each([
+    "/api/../secret?x=1",
+    "/api/../../etc?a=b",
+    "/nope?x=1",
+    "/api/verdicts%3Fall=1?x=1",
+    "//evil.com/api/x?y=1",
+  ])("A-url-guard: %s throws with no fetch call", async (path) => {
+    const fetchImplementation = fetcherFor(jsonResponse({ ok: true }));
+    await expect(
+      requestJson(path, {
+        fetchImplementation: fetchImplementation as unknown as typeof fetch,
+      }),
+    ).rejects.toThrow("Invalid API path.");
+    expect(fetchImplementation).toHaveBeenCalledTimes(0);
+  });
+
+  it("A-url-guard: a .. inside a query VALUE is not a traversal and does reach fetch", async () => {
+    const fetchImplementation = fetcherFor(jsonResponse({ ok: true }));
+    await requestJson("/api/verdicts?all=%5B%22..%22%5D", {
+      fetchImplementation: fetchImplementation as unknown as typeof fetch,
+    });
+    expect(fetchImplementation.mock.calls[0][0]).toBe("/api/verdicts?all=%5B%22..%22%5D");
+  });
+
+  it("carries a PUT body with its Content-Type, and a GET carries neither", async () => {
+    const fetchImplementation = fetcherFor(jsonResponse({ ok: true }), jsonResponse({ ok: true }));
+
+    await requestJson("/api/watch", {
+      method: "PUT",
+      body: { components: ["gpu"] },
+      token: "tok",
+      fetchImplementation: fetchImplementation as unknown as typeof fetch,
+    });
+    const [, write] = fetchImplementation.mock.calls[0];
+    expect(write.method).toBe("PUT");
+    expect(write.body).toBe('{"components":["gpu"]}');
+    expect(new Headers(write.headers).get("Content-Type")).toBe("application/json");
+    // The two properties the write must not lose: no cookies, and a redirect is an error rather
+    // than a forwarded token.
+    expect(write.credentials).toBe("omit");
+    expect(write.redirect).toBe("error");
+
+    await requestJson("/api/watch", {
+      fetchImplementation: fetchImplementation as unknown as typeof fetch,
+    });
+    const [, read] = fetchImplementation.mock.calls[1];
+    expect(read.method).toBe("GET");
+    expect(read.body).toBeUndefined();
+    // A GET carrying Content-Type would need a wider CORS preflight than a GET-only path grants.
+    expect(new Headers(read.headers).get("Content-Type")).toBeNull();
+  });
+
+  it("retries a PUT with the refreshed token, body and method intact", async () => {
+    const fetchImplementation = fetcherFor(
+      jsonResponse({ error: { code: "AUTH_TOKEN_INVALID" } }, 401),
+      jsonResponse({ ok: true }),
+    );
+    const tokens = ["stale", "fresh"];
+
+    await expect(
+      requestJsonWithAuth(
+        "/api/watch",
+        async () => tokens.shift() ?? null,
+        {
+          method: "PUT",
+          body: { radiusKm: 25 },
+          fetchImplementation: fetchImplementation as unknown as typeof fetch,
+        },
+      ),
+    ).resolves.toEqual({ ok: true });
+
+    const [, retried] = fetchImplementation.mock.calls[1];
+    expect(retried.method).toBe("PUT");
+    expect(retried.body).toBe('{"radiusKm":25}');
+    expect(new Headers(retried.headers).get("Authorization")).toBe("Bearer fresh");
+  });
+});
