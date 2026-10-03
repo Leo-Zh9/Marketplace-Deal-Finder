@@ -1,15 +1,16 @@
 import {
   dealRuleToSettings,
   marketplaceClient,
+  settingsToDealRule,
+  type WireSettings,
+} from "./marketplaceClient";
+import {
   preservableTargets,
   queryFor,
-  resetMarketplaceState,
-  settingsToDealRule,
   verdictsQuery,
   watchModelsFor,
   type StoredTarget,
-  type WireSettings,
-} from "./marketplaceClient";
+} from "./watchSelection";
 import { componentById } from "../data/catalog";
 import type { DealRule, Listing, SearchSettings } from "../types";
 
@@ -62,7 +63,6 @@ const INITIAL_RULE: DealRule = {
 const noToken = async () => null;
 
 afterEach(() => {
-  resetMarketplaceState();
   vi.unstubAllGlobals();
 });
 
@@ -401,16 +401,5 @@ describe("the kept searches", () => {
     expect(url).toBe("/api/watch");
     expect(init?.method).toBe("PUT");
     expect(JSON.parse(String(init?.body)).preservedTargetIds).toEqual(["cpu-toronto"]);
-  });
-});
-
-describe("prototype marketplace state", () => {
-  it("reads a stopped monitor and keeps the unavailable scenario reachable", async () => {
-    await expect(marketplaceClient.getMonitoringStatus()).resolves.toEqual({
-      state: "STOPPED",
-      provider: "AVAILABLE",
-      lastSuccessfulScanAt: null,
-      nextScanAt: null,
-    });
   });
 });

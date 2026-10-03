@@ -76,6 +76,7 @@ interface Wire {
   watchStatus?: number;
   settings?: WireSettings | null;
   settingsStatus?: number;
+  settingsPutStatus?: number;
   verdicts?: { listings: Listing[]; truncated: boolean };
 }
 
@@ -111,7 +112,11 @@ const stubWire = (wire: Wire = {}) => {
           : reply(wire.watch ?? EMPTY_WATCH);
       }
       if (path === "/api/settings") {
-        if (method === "PUT") return reply({ settings: wire.settings ?? null, changed: true });
+        if (method === "PUT") {
+          return wire.settingsPutStatus !== undefined && wire.settingsPutStatus !== 200
+            ? reply({ error: { code: "SETTINGS_STORAGE_FAILED" } }, wire.settingsPutStatus)
+            : reply({ settings: wire.settings ?? null, changed: true });
+        }
         return wire.settingsStatus !== undefined && wire.settingsStatus !== 200
           ? reply({ error: { code: "SETTINGS_STORAGE_FAILED" } }, wire.settingsStatus)
           : reply({ settings: wire.settings ?? null });
@@ -499,6 +504,17 @@ describe("the control panel", () => {
     );
     expect(alert).toBeInTheDocument();
     expect(alert.textContent).not.toContain("deselect");
+
+    // D-8: REMOVE IS THE ONE ACTION THE MESSAGE ASKS FOR, SO IT MUST ANSWER THE MESSAGE. Without
+    // re-validating here the text stayed at "11 of 9" after the operator did exactly what it said,
+    // which reads as "the only route out did not work".
+    await user.click(screen.getByRole("button", { name: "Remove gpu-rtx" }));
+    expect(
+      await screen.findByText("10 of 9 searches used — remove a kept search or narrow fewer models."),
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Remove legacy-ebay" }));
+    expect(screen.getByText("9 of 9 searches used")).toBeInTheDocument();
+    expect(screen.queryByText(/remove a kept search/)).not.toBeInTheDocument();
   });
 
   /**
@@ -734,6 +750,122 @@ describe("the control panel", () => {
     const sent = JSON.stringify(putTo(calls, "/api/watch")?.body);
     expect(sent).not.toContain(String(deviceLatitude));
     expect(sent).not.toContain(String(deviceLongitude));
+  });
+
+  /**
+   * A-market: THE STORED COORDINATES ARE WHAT THE FORM SENDS BACK. Looking the slug up in the
+   * catalog and returning that entry WHOLE discarded them, so a market row at
+   * `('toronto', 43.6459, -79.3816)` -- what a hand-written bootstrap could hold -- was rewritten to
+   * the catalog's coordinates BY AN UNTOUCHED SAVE, moving `market_key` and orphaning every
+   * `model_stats` row, while the form's own warning said that happens only if you change something.
+   * The server cannot catch it: the coordinates it receives agree with the slug.
+   *
+   * The refusal those stored coordinates now get is `worker/api/watch.test.ts`'s W-loc; what this row
+   * asserts is that the form stops silently substituting.
+   */
+  it("A-market: an untouched Save carries the stored coordinates, not the catalog's", async () => {
+    const user = userEvent.setup();
+    const drifted = { slug: "toronto", latitude: 43.6459, longitude: -79.3816 };
+    const calls = stubWire({
+      watch: {
+        ...LIVE_WATCH,
+        selection: { ...LIVE_WATCH.selection, location: drifted },
+      },
+      settings: null,
+    });
+    render(<App getToken={noToken} />);
+    await waitForLoad("9 of 9 searches used");
+
+    // The label still comes from the catalog, so the operator sees a city rather than a slug.
+    expect(screen.getByText("Selected: Toronto, ON")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Save searches" }));
+    await waitFor(() => expect(putTo(calls, "/api/watch")).toBeDefined());
+    expect((putTo(calls, "/api/watch")?.body as { location: unknown }).location).toEqual(drifted);
+  });
+
+  /**
+   * A-partial: THE WATCH WRITE IS COMMITTED BEFORE THE DEAL-RULE WRITE IS ATTEMPTED, so a failure on
+   * the second leaves the form describing what IS stored rather than what was stored before the
+   * click. Previously both state setters sat after the rule PUT: a 503 there left the page showing
+   * Toronto while D1 held Waterloo, with the benchmarks already reset and nothing on screen changed.
+   */
+  it("A-partial: a failing deal-rule save still shows the watch list that WAS written", async () => {
+    const user = userEvent.setup();
+    const written: WatchWire = {
+      selection: {
+        components: ["gpu"],
+        models: { gpu: { mode: "all", values: [], query: "radeon" } },
+        location: TORONTO,
+        radiusKm: 10,
+      },
+      storedTargets: [{ targetId: "gpu-radeon", componentType: "gpu", query: "radeon" }],
+      keptSearches: [],
+    };
+    const calls = stubWire({
+      watch: LIVE_WATCH,
+      watchAfter: written,
+      settings: null,
+      settingsPutStatus: 503,
+    });
+    render(<App getToken={noToken} />);
+    await waitForLoad("9 of 9 searches used");
+
+    await user.click(screen.getByRole("button", { name: "Save searches" }));
+
+    // The error is shown...
+    expect(await screen.findByRole("alert")).toHaveTextContent(/temporarily unavailable/);
+    // ...and the form now describes the list that IS in D1: one derived search, no kept searches.
+    expect(screen.getByText("1 of 9 searches used")).toBeInTheDocument();
+    expect(screen.queryByTestId("kept-searches")).not.toBeInTheDocument();
+    // "Saved." is NOT claimed, because the save was only half done.
+    expect(screen.queryByText(/^Saved\./)).not.toBeInTheDocument();
+    expect(putTo(calls, "/api/settings")).toBeDefined();
+  });
+
+  /**
+   * A-fallback: THE FALLBACK MESSAGES ARE REACHABLE, which is why they are not deleted. The review
+   * read them as dead on the grounds that every throw constructs an `ApiRequestError`; the body
+   * parse does not. `requestJson` ends with an unwrapped `await response.json()`, so a 200 carrying
+   * a truncated or non-JSON body rejects with a SyntaxError, which `requestErrorMessage` cannot
+   * recognise -- and that is exactly when the caller's own sentence is the only thing to show.
+   */
+  it("A-fallback: a 200 with a body that is not JSON shows the load fallback and disables Save", async () => {
+    const fetchMock = vi.fn<(url: string, init?: RequestInit) => Promise<Response>>(
+      async () => new Response("<html>a proxy error page</html>", { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App getToken={noToken} />);
+
+    expect(
+      await screen.findByText(
+        "Could not read your saved searches. Saving is disabled until it loads.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save searches" })).toBeDisabled();
+  });
+
+  /**
+   * A-scope: WHAT PREVIEW STILL IGNORES IS ON SCREEN. `components` and `models` are real now;
+   * `location`, `radiusKm` and the deal rule are not -- a verdict is committed against the STORED
+   * revision, so an unsaved rule edit previews against the saved rule. The comment that used to
+   * disclose this was replaced when the read became half-real.
+   *
+   * It also asserts the monitoring panel is GONE. With Start/Stop deleted, nothing could ever set
+   * the status, so the panel answered "Not running / Stopped / Next scan —" forever, beside a line
+   * saying the collector runs every 30 minutes. Restoring it needs a reader for `monitor_runs`.
+   */
+  it("A-scope: the page says what Preview ignores and claims nothing about the monitor", async () => {
+    stubWire({ watch: LIVE_WATCH, settings: null });
+    render(<App getToken={noToken} />);
+    await waitForLoad("9 of 9 searches used");
+
+    expect(screen.getByTestId("preview-scope")).toHaveTextContent(
+      "using your saved deal rule — not unsaved edits",
+    );
+    for (const claim of ["Monitoring", "Not running", "Stopped", "Last successful scan", "Next scan"]) {
+      expect(screen.queryByText(claim), claim).not.toBeInTheDocument();
+    }
   });
 
   /** The form refuses a radius the column cannot store, rather than letting the write 503. */

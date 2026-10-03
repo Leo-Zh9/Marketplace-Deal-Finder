@@ -4,23 +4,20 @@ import { DealRuleForm } from "./components/DealRuleForm";
 import { ListingCard } from "./components/ListingCard";
 import { LocationSelector } from "./components/LocationSelector";
 import { ModelSelector } from "./components/ModelSelector";
-import { StatusPanel } from "./components/StatusPanel";
 import type { AuthenticatedIdentity } from "./auth/authTypes";
 import { componentById, mockLocations } from "./data/catalog";
 import { requestErrorMessage } from "./services/apiClient";
+import { marketplaceClient, settingsToDealRule } from "./services/marketplaceClient";
 import {
-  marketplaceClient,
   preservableTargets,
   queryFor,
-  settingsToDealRule,
   watchModelsFor,
   type StoredTarget,
-} from "./services/marketplaceClient";
+} from "./services/watchSelection";
 import type {
   ComponentType,
   Listing,
   ModelSelection,
-  MonitoringStatus,
   SearchLocation,
   SearchSettings,
 } from "./types";
@@ -51,13 +48,6 @@ const initialSettings: SearchSettings = {
   },
 };
 
-const initialMonitoringStatus: MonitoringStatus = {
-  state: "STOPPED",
-  provider: "AVAILABLE",
-  lastSuccessfulScanAt: null,
-  nextScanAt: null,
-};
-
 const hasErrors = (errors: ValidationErrors) =>
   Object.keys(errors).length > 0;
 
@@ -79,16 +69,28 @@ interface AppProps {
 }
 
 /**
- * The stored market as a form value. The label comes from the catalog entry the slug names; a slug
- * the catalog does not know (reachable only from a hand-written `watch_market` row) keeps its own
- * values and is refused BY NAME on save rather than being silently replaced here.
+ * The stored market as a form value. THE STORED COORDINATES ARE KEPT AND ONLY THE LABEL IS LOOKED
+ * UP, and that is the whole point of this function.
+ *
+ * MEASURED DEFECT IT FIXES: returning the catalog entry WHOLE on a slug match discarded the stored
+ * coordinates, so a market row at `('toronto', 43.6459, -79.3816, 25)` -- the coordinates of the
+ * "100 Front Street W, Toronto" entry this slice deleted, and exactly what a hand-written
+ * `wrangler d1 execute` bootstrap could hold -- was rewritten to `43.6532,-79.3832` BY AN UNTOUCHED
+ * SAVE. `market_key` is built from those coordinates and `model_stats` is keyed by it, so every
+ * price benchmark in that market was orphaned while the form's own warning said that happens only
+ * if you CHANGE the location or radius. The server cannot catch it: the coordinates it received
+ * agreed with the slug.
+ *
+ * What happens now is loud instead: the save carries the stored coordinates, the server refuses them
+ * by name (`INVALID_WATCH {field:"location", detail:"coordinates"}`, pinned by W-loc), and the
+ * operator picks a location deliberately -- with the benchmark-reset line on screen beside it.
  */
 const locationFromWire = (
   wire: { slug: string; latitude: number; longitude: number } | null,
 ): SearchLocation | null => {
   if (wire === null) return null;
   const known = mockLocations.find((entry) => entry.slug === wire.slug);
-  return known ?? { ...wire, label: wire.slug };
+  return { ...wire, label: known?.label ?? wire.slug };
 };
 
 function App({ identity, onSignOut, getToken }: AppProps) {
@@ -98,23 +100,12 @@ function App({ identity, onSignOut, getToken }: AppProps) {
   const [radiusMode, setRadiusMode] = useState<"2" | "5" | "10" | "25" | "custom">("25");
   const [errors, setErrors] = useState<ValidationErrors>({});
   const [listings, setListings] = useState<Listing[]>([]);
-  const [monitoringStatus, setMonitoringStatus] = useState(initialMonitoringStatus);
   const [pendingAction, setPendingAction] = useState<PendingAction>(null);
   const [hasPreviewed, setHasPreviewed] = useState(false);
   const [truncated, setTruncated] = useState(false);
   const [previewedAt, setPreviewedAt] = useState<string | null>(null);
   const [requestError, setRequestError] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<string | null>(null);
-
-  useEffect(() => {
-    marketplaceClient
-      .getMonitoringStatus()
-      .then(setMonitoringStatus)
-      .catch((error: unknown) => {
-        const message = requestErrorMessage(error);
-        if (message) setRequestError(message);
-      });
-  }, []);
 
   /**
    * BOTH READS, AND SAVE STAYS DISABLED UNTIL BOTH SUCCEED. MEASURED: a 503 on load plus one click
@@ -265,10 +256,26 @@ function App({ identity, onSignOut, getToken }: AppProps) {
     });
   };
 
-  /** Omitting an id from `preservedTargetIds` is what removes that row; this is that omission. */
+  /**
+   * Omitting an id from `preservedTargetIds` is what removes that row; this is that omission.
+   *
+   * IT RE-VALIDATES, and that is not symmetry for its own sake: Remove is the ONE action the
+   * over-budget message tells the operator to take, so leaving `11 of 9 searches used — remove a
+   * kept search` on screen after they removed one says the only route out did not work.
+   */
   const removeKeptSearch = (targetId: string) => {
-    setStoredTargets((current) => current.filter((row) => row.targetId !== targetId));
+    const remaining = storedTargets.filter((row) => row.targetId !== targetId);
+    setStoredTargets(remaining);
     setSavedAt(null);
+    if (hasErrors(errors)) {
+      setErrors(
+        validateSearchSettings(
+          settings,
+          preservableTargets(remaining, settings.components, settings.models, settings.queries)
+            .length,
+        ),
+      );
+    }
   };
 
   const selectRadius = (mode: typeof radiusMode) => {
@@ -289,9 +296,21 @@ function App({ identity, onSignOut, getToken }: AppProps) {
     setPendingAction("preview");
     setRequestError(null);
     try {
-      // THE SELECTION TRAVELS WITH THE READ NOW. `GET /api/verdicts` filters on it in SQL, before
-      // its own `LIMIT 50`, so a page of a component the user is not watching can no longer arrive
-      // and be filtered to nothing in the browser.
+      /*
+       * THE SELECTION TRAVELS WITH THE READ NOW. `GET /api/verdicts` filters on it in SQL, before
+       * its own `LIMIT 50`, so a page of a component the user is not watching can no longer arrive
+       * and be filtered to nothing in the browser.
+       *
+       * WHAT THIS BUTTON STILL IGNORES, because the comment that said so was replaced and the fact
+       * was only PARTLY fixed. `components` and `models` are now real. `location` and `radiusKm`
+       * are still REQUIRED to press it (validate() refuses without them) and still reach nothing
+       * here -- the market lives in `watch_market` and the read has no market parameter -- so a
+       * preview after changing the location shows listings from the market the collector last ran
+       * in. And the DEAL RULE reaches nothing either: a verdict is committed by `evaluateBatch`
+       * against the STORED revision, so an UNSAVED rule edit previews against the saved rule. The
+       * action-help line under the buttons says so on screen; the honest fix for the market half is
+       * for this read to take the market, which is a slice, not a line.
+       */
       const result = await marketplaceClient.preview(settings, getToken);
       setListings(result.listings);
       setTruncated(result.truncated);
@@ -333,9 +352,13 @@ function App({ identity, onSignOut, getToken }: AppProps) {
         },
         getToken,
       );
-      // THE DEAL RULE GOES THROUGH ITS OWN ROUTE, which bumps the search revision ON PURPOSE when
-      // it changes. It is sent SECOND: the watch write must not be skipped because the rule failed.
-      await marketplaceClient.saveDealRule(settings.dealRule, getToken);
+      // THE RE-SEED HAPPENS BEFORE THE SECOND WRITE, AND THE ORDER IS THE FIX. The watch list and
+      // the market are already COMMITTED at this point; if the deal-rule PUT then rejects and these
+      // setters have been skipped, the form goes on describing the world before the save -- the
+      // operator sees Toronto when D1 holds Waterloo, with the price benchmarks already reset and
+      // the page looking untouched. Applying what is stored first means a failure past this point
+      // costs an error banner and nothing else.
+      //
       // RE-SEEDED FROM THE RESPONSE, which is re-read from D1 rather than echoed. A broad query
       // that was preserved for a type the form deselected comes back as a SELECTED TYPE, because
       // that row is still being collected -- showing it unticked would be the lie.
@@ -357,6 +380,9 @@ function App({ identity, onSignOut, getToken }: AppProps) {
             .map(([type, selection]) => [type, selection?.query]),
         ),
       }));
+      // THE DEAL RULE GOES THROUGH ITS OWN ROUTE, which bumps the search revision ON PURPOSE when it
+      // changes. It is sent SECOND so that the watch write is never skipped because the rule failed.
+      await marketplaceClient.saveDealRule(settings.dealRule, getToken);
       setSavedAt(new Date().toISOString());
     } catch (error: unknown) {
       setRequestError(
@@ -635,6 +661,15 @@ function App({ identity, onSignOut, getToken }: AppProps) {
                 ? "Your collector reads this list every 30 minutes."
                 : "Reading your saved searches…"}
             </p>
+            {/*
+              * ON SCREEN, because the surprise is reachable in one click: Preview reads verdicts
+              * that were judged against the SAVED deal rule, so editing the rule and previewing
+              * without saving shows the old judgements.
+              */}
+            <p className="action-help" data-testid="preview-scope">
+              Preview shows listings your collector has already judged, using your saved deal rule —
+              not unsaved edits.
+            </p>
             {savedAt && (
               <p className="action-help" role="status">
                 Saved. Your collector picks this up on its next run.
@@ -642,9 +677,20 @@ function App({ identity, onSignOut, getToken }: AppProps) {
             )}
           </section>
 
+          {/*
+            * THE MONITORING PANEL IS GONE, AND DELETING IT IS THE HONEST END OF DELETING THE
+            * Start/Stop BUTTONS. Those buttons were a fiction -- the browser never started
+            * collection, a launchd cron does -- but they were also the ONLY writers of the status
+            * the panel rendered. With them gone the panel could answer exactly one thing, forever:
+            * "Not running / Stopped / Next scan —", beside a line saying the collector reads this
+            * list every 30 minutes. A widget that can only say "no" to "is anything collecting?"
+            * is a worse lie than the buttons were.
+            *
+            * THE REAL THING NEEDS A READER FOR `monitor_runs`, which no browser route exposes:
+            * `GET /api/status` answers liveness, not runs. That is a slice, not a line, and it is
+            * the one to write before this panel comes back.
+            */}
           <aside className="results-column" id="preview-results">
-            <StatusPanel status={monitoringStatus} />
-
             <section className="results-panel" aria-live="polite" aria-busy={pendingAction === "preview"}>
               <div className="results-heading">
                 <div>
@@ -665,12 +711,6 @@ function App({ identity, onSignOut, getToken }: AppProps) {
                   <span className="spinner" aria-hidden="true" />
                   <strong>Reading your collected listings…</strong>
                   <p>Fetching the latest verdicts from your database.</p>
-                </div>
-              ) : monitoringStatus.provider === "UNAVAILABLE" ? (
-                <div className="empty-state empty-state--warning">
-                  <div className="empty-icon" aria-hidden="true">!</div>
-                  <h3>Facebook Marketplace is unavailable</h3>
-                  <p>Your settings are safe. Try previewing again later.</p>
                 </div>
               ) : !hasPreviewed ? (
                 <div className="empty-state">

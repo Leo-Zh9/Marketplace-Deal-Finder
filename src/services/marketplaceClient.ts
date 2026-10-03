@@ -1,15 +1,13 @@
 import { requestJsonWithAuth } from "./apiClient";
-import { allSelection } from "../utils/validation";
-import { componentById } from "../data/catalog";
-import type {
-  ComponentType,
-  DealRule,
-  Listing,
-  ModelSelection,
-  MonitoringStatus,
-  PreviewResult,
-  SearchSettings,
-} from "../types";
+/**
+ * THE SELECTION RULES LIVE IN `./watchSelection`, not here, so that `worker/api/watch.test.ts` can
+ * run the REAL client rule against the REAL handler without dragging `apiClient`'s `import.meta.env`
+ * into the Worker's tsc program. See that file's header.
+ */
+import { verdictsQuery, type StoredTarget, type WatchSaveBody } from "./watchSelection";
+import type { ComponentType, DealRule, Listing, PreviewResult, SearchSettings } from "../types";
+
+export type { StoredTarget, WatchSaveBody } from "./watchSelection";
 
 type GetToken = (forceRefresh: boolean) => Promise<string | null>;
 
@@ -23,12 +21,6 @@ export interface WireSettings {
   searchRevision?: number;
 }
 
-export interface StoredTarget {
-  targetId: string;
-  componentType: string;
-  query: string;
-}
-
 export interface WatchWire {
   selection: {
     components: ComponentType[];
@@ -40,21 +32,12 @@ export interface WatchWire {
   keptSearches: StoredTarget[];
 }
 
-export interface WatchSaveBody {
-  components: ComponentType[];
-  models: Record<string, { mode: "all" | "selected"; values: string[]; query?: string }>;
-  location: { slug: string; latitude: number; longitude: number };
-  radiusKm: number;
-  preservedTargetIds: string[];
-}
-
 export interface MarketplaceClient {
   preview(settings: SearchSettings, getToken: GetToken): Promise<PreviewResult>;
   getWatch(getToken: GetToken): Promise<WatchWire>;
   saveWatch(body: WatchSaveBody, getToken: GetToken): Promise<WatchWire>;
   getSettings(getToken: GetToken): Promise<WireSettings | null>;
   saveDealRule(rule: DealRule, getToken: GetToken): Promise<void>;
-  getMonitoringStatus(): Promise<MonitoringStatus>;
 }
 
 interface VerdictsResponse {
@@ -62,29 +45,14 @@ interface VerdictsResponse {
   truncated: boolean;
 }
 
-const wait = (duration = 450) =>
-  new Promise<void>((resolve) => window.setTimeout(resolve, duration));
-
-const getMockScenario = () =>
-  new URLSearchParams(window.location.search).get("scenario");
-
-const stoppedStatus = (): MonitoringStatus => ({
-  state: "STOPPED",
-  provider: "AVAILABLE",
-  lastSuccessfulScanAt: null,
-  nextScanAt: null,
-});
-
-let monitoringStatus: MonitoringStatus = stoppedStatus();
-
-/**
- * Clears client-side state belonging to the previous identity. `AuthGate` calls it on every
- * identity change; the monitoring LIFECYCLE it used to roll back is gone -- the browser never
- * started collection, the Cron does -- and what remains is the read `StatusPanel` renders.
+/*
+ * THERE IS NO CLIENT-SIDE STATE LEFT TO RESET, and `resetMarketplaceState` is gone with it. It
+ * existed to roll back the monitoring lifecycle -- a fiction, since the browser never started
+ * collection -- and once Start/Stop and the status read went, its body was a no-op and `AuthGate`
+ * was importing the marketplace client to call it. Every request here is a fresh fetch with the
+ * caller's current token, so an identity change needs nothing undone; the day something IS cached
+ * per identity, a reset hook comes back with a test that can see it.
  */
-export const resetMarketplaceState = () => {
-  monitoringStatus = stoppedStatus();
-};
 
 /* ---------- the deal rule, BOTH directions ---------- */
 
@@ -140,93 +108,6 @@ export const settingsToDealRule = (
   };
 };
 
-/* ---------- the watch list ---------- */
-
-/** The query a `mode:"all"` type searches with: the stored one, else the catalog's `searchTerm`. */
-export const queryFor = (
-  component: ComponentType,
-  queries: Partial<Record<ComponentType, string>>,
-): string => queries[component] ?? componentById[component].searchTerm;
-
-export const watchModelsFor = (
-  components: readonly ComponentType[],
-  models: Partial<Record<ComponentType, ModelSelection>>,
-  queries: Partial<Record<ComponentType, string>>,
-): WatchSaveBody["models"] => {
-  const wire: WatchSaveBody["models"] = {};
-  for (const component of components) {
-    const selection = models[component] ?? allSelection();
-    // `values` IS EMPTY UNDER `all` and the query travels instead; `query` is FORBIDDEN under
-    // `selected`. Both halves are refused on the wire, not coerced.
-    wire[component] =
-      selection.mode === "selected"
-        ? { mode: "selected", values: selection.values }
-        : { mode: "all", values: [], query: queryFor(component, queries) };
-  }
-  return wire;
-};
-
-/**
- * THE CLIENT HALF OF THE SYMMETRIC PRESERVATION RULE, RECOMPUTED LIVE AND NOT READ FROM THE LAST
- * GET. A stored row is preservable when its query is not a catalog model of its own type AND the
- * current selection is not writing it -- so narrowing a type, or deselecting it, MOVES that type's
- * broad row into this set. Rendering the GET's `keptSearches` instead would under-count the budget
- * by exactly those rows: the form would read "9 of 9" and the server would refuse at 10.
- *
- * THE LIMIT, STATED: a stored row whose query IS a catalog model of its type is NOT preservable,
- * because the form can re-author that exact search as `mode:"selected"`. For a type whose mode the
- * inversion decided as `all` (the first row by `target_id` wins), such a row is therefore dropped
- * by a save until the user narrows that type. Production holds no model-named rows, so this is
- * reachable only from a hand-written one.
- */
-export const preservableTargets = (
-  storedTargets: readonly StoredTarget[],
-  components: readonly ComponentType[],
-  models: Partial<Record<ComponentType, ModelSelection>>,
-  queries: Partial<Record<ComponentType, string>>,
-): StoredTarget[] => {
-  const written = new Set<string>();
-  for (const [component, selection] of Object.entries(
-    watchModelsFor(components, models, queries),
-  )) {
-    const values = selection.mode === "selected" ? selection.values : [selection.query ?? ""];
-    for (const query of values) written.add(JSON.stringify([component, query]));
-  }
-  return storedTargets.filter((row) => {
-    // The wire is catalog vocabulary; `watch_targets.component_type` is storage vocabulary, and
-    // `case_fan` is the one id that differs.
-    const type = row.componentType === "case_fan" ? "case_fans" : row.componentType;
-    const isModel =
-      Object.hasOwn(componentById, type) &&
-      componentById[type as ComponentType].models.includes(row.query);
-    return !isModel && !written.has(JSON.stringify([type, row.query]));
-  });
-};
-
-/**
- * THE PREVIEW'S SELECTION, AS A QUERY STRING THE SERVER FILTERS ON. `?all` carries the catalog ids
- * whose selection is `mode:"all"` and `?pairs` the `type/model` pairs for `mode:"selected"`; both
- * are always sent, because `?pairs` with `?all` ABSENT is a 400 (measured: the pairs would
- * otherwise be a silent no-op). Built with `URLSearchParams`, never by hand.
- */
-export const verdictsQuery = (settings: SearchSettings): string => {
-  const all: string[] = [];
-  const pairs: string[] = [];
-  for (const component of settings.components) {
-    const selection = settings.models[component] ?? allSelection();
-    if (selection.mode === "all") all.push(component);
-    // `none` contributes to neither list: App unticks the component the moment a selection
-    // empties, so this is a transient state rather than a selection.
-    if (selection.mode === "selected") {
-      for (const model of selection.values) pairs.push(`${component}/${model}`);
-    }
-  }
-  const params = new URLSearchParams();
-  params.set("all", JSON.stringify(all));
-  params.set("pairs", JSON.stringify(pairs));
-  return params.toString();
-};
-
 export const marketplaceClient: MarketplaceClient = {
   /**
    * THE FILTER RUNS ON THE SERVER NOW, AND THE CLIENT-SIDE ONE IS DELETED. That deletion is what
@@ -269,13 +150,5 @@ export const marketplaceClient: MarketplaceClient = {
       method: "PUT",
       body: dealRuleToSettings(rule),
     });
-  },
-
-  async getMonitoringStatus() {
-    await wait(100);
-    if (getMockScenario() === "unavailable") {
-      return { ...monitoringStatus, provider: "UNAVAILABLE" };
-    }
-    return monitoringStatus;
   },
 };

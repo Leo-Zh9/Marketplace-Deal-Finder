@@ -17,13 +17,6 @@ export type EvaluationStatus =
   | "NEEDS_REVIEW"
   | "PENDING";
 
-export type MonitoringState =
-  | "STOPPED"
-  | "STARTING"
-  | "ACTIVE"
-  | "DEGRADED"
-  | "ERROR";
-
 export interface SearchLocation {
   label: string;
   /**
@@ -89,13 +82,6 @@ export interface Listing {
     averagePriceCents?: number;
     discountPercent?: number;
   };
-}
-
-export interface MonitoringStatus {
-  state: MonitoringState;
-  provider: "AVAILABLE" | "DEGRADED" | "UNAVAILABLE";
-  lastSuccessfulScanAt: string | null;
-  nextScanAt: string | null;
 }
 
 export interface PreviewResult {

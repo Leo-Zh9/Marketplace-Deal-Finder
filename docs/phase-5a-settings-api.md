@@ -103,18 +103,28 @@ They are granted **per path**, from one table in `worker/index.ts`:
 | `/api/status` | `GET` | `GET, OPTIONS` | `Authorization, Accept` |
 | `/api/settings` | `GET`, `PUT` | `GET, PUT, OPTIONS` | `Authorization, Accept, Content-Type` |
 | `/api/verdicts` | `GET` | `GET, OPTIONS` | `Authorization, Accept` |
+| `/api/watch` | `GET`, `PUT` | `GET, PUT, OPTIONS` | `Authorization, Accept, Content-Type` |
 
 `Content-Type` is offered to a path **if and only if that path declares a body-bearing method**
 (`PUT`/`POST`/`PATCH`) — not "if it has more than one method". The table's rows cannot tell those
-two rules apart — three could not, and four still cannot, since every row but `/api/settings` is
-read-only — so `preflightHeadersFor` is exported and tested directly over method sets the table
-does not contain (`["GET","HEAD"]`, `["GET","OPTIONS"]`, `["POST"]`, …).
+two rules apart: there are now **two** write rows (`/api/settings` and `/api/watch`) and three
+read-only ones, and both candidate rules still agree on every one of them. (An earlier version of
+this paragraph said "every row but `/api/settings` is read-only", which the control-panel slice made
+false.) So `preflightHeadersFor` is exported and tested directly over method sets the table does not
+contain (`["GET","HEAD"]`, `["GET","OPTIONS"]`, `["POST"]`, …).
 
-`/api/verdicts` was added by the read-path slice and belongs in this table for the reason the
-table exists: it is the **advertised browser surface**, and a route missing from it answers `403`
-to a cross-origin preflight. The collector routes (`POST /api/listings`,
-`GET /api/watch-targets`) are deliberately **absent** — they are not browser routes, and a row
-for either would open a real browser channel.
+`/api/verdicts` was added by the read-path slice and `/api/watch` by the control-panel slice; both
+belong in this table for the reason the table exists: it is the **advertised browser surface**, and a
+route missing from it answers `403` to a cross-origin preflight. `X-w1` and the gate's four
+`pf /api/watch` rows are what notice its absence — every handler test stays green without it, and so
+does `curl`, because `curl` never preflights and `npm run dev` reaches the Worker through Vite's
+same-origin `/api` proxy.
+
+**`/api/watch` and `/api/watch-targets` are two different routes on two different credentials**, and
+the shared prefix is the mechanical risk: the browser's route is below `authenticateRequest` and in
+this table; the collector's is above it, on `authorizeCollector`, and deliberately **absent** from
+it. The collector routes (`POST /api/listings`, `GET /api/watch-targets`) are not browser routes, and
+a row for either would open a real browser channel.
 
 **Each of those three mistakes is guarded, and here is what notices**, measured by making it:
 

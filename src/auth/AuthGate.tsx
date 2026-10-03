@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { requestJsonWithAuth } from "../services/apiClient";
-import { resetMarketplaceState } from "../services/marketplaceClient";
 import {
   ApiRequestError,
   type AuthAdapter,
@@ -156,7 +155,6 @@ export const AuthGate = ({
         // Sign-in, sign-out, or account change.
         generationRef.current += 1;
         uidRef.current = nextUid;
-        resetMarketplaceState();
 
         if (nextUid === null) {
           setState({ status: "signed-out", message: null });
@@ -207,7 +205,6 @@ export const AuthGate = ({
     // warning. The same reasoning is why the ref starts `undefined` on a cold
     // load, where the first event is also `null`.
     uidRef.current = undefined;
-    resetMarketplaceState();
     setState({ status: "signed-out", message: null });
     void adapter?.signOut();
   }, [adapter]);

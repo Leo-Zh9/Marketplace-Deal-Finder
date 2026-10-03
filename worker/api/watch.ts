@@ -135,33 +135,79 @@ export const deriveTargets = (selection: WatchSelection): StoredTarget[] => {
  * `searchTerm` comparison anywhere, which is what stops those nine strings becoming the persisted
  * format's discriminator -- changing one then costs one string and no data migration.
  *
- * Rows arrive `ORDER BY target_id` and THE FIRST ROW OF A TYPE DECIDES THAT TYPE'S MODE; a later
- * row of the other kind goes to the residue. MEASURED: 0 of 336 single-model selections and 0 of
- * 9 broad terms mis-invert.
+ * A TYPE'S MODE IS `selected` WHENEVER ANY ROW OF THAT TYPE IS A CATALOG MODEL OF IT, and the
+ * type's broad rows then become kept searches. IT IS NOT "the first row by `target_id` wins", and
+ * that distinction is a MEASURED DATA LOSS rather than a preference:
+ *
+ *   Narrow `ram` to `G.Skill Trident Z5 Royal Neo 64GB DDR5` (which is `ram.models[0]`, beside
+ *   production's stored `ram:'ddr4 ram'`), Remove one kept search to get under the cap, Save -> 200
+ *   and the model row IS in D1. Under first-row-wins, `'ram-ddr4' < 'ram-g-skill-...'`, so the
+ *   BROAD row won the mode and the brand-new model row landed in the residue -- where BOTH halves
+ *   of the preservation rule call it non-preservable, because a model name is "re-authorable from
+ *   the form". So the form re-seeded with `ram` back at `mode:"all"` (the narrowing visibly
+ *   reverted), the new row was filtered out of the kept list (invisible), the budget rendered
+ *   8 of 9 while D1 held 9 -- and the NEXT untouched Save deleted both the model row and the
+ *   `gpu:'rtx'` the operator had surrendered to make room for it.
+ *
+ *   RE-MEASURED HERE RATHER THAN QUOTED: of the 244 models across production's six stored types,
+ *   **111** sort after their type's first stored `target_id` and therefore lose the mode --
+ *   cpu 26 of 45, gpu 20 of 68, motherboard **36 of 36** (the legacy id is `mobo-toronto`, which
+ *   sorts before every `motherboard-*`), psu 0 of 29, ram 17 of 26, storage 12 of 40. Both
+ *   `cpu.models[0]` (`Ryzen 9 9950X3D`) and `ram.models[0]` are among them, so the first thing an
+ *   operator is likely to click is in the losing set.
+ *
+ * THE PROPERTY THIS RULE BUYS, and `W-kept-agree` is what pins it: EVERY RESIDUE ROW IS A
+ * NON-MODEL, so every kept search is preservable, so the browser's kept list and this field agree
+ * for an untouched load. Under first-row-wins the residue could contain a model row that the
+ * client would then refuse to echo and the server would then delete.
+ *
+ * Rows still arrive `ORDER BY target_id`, which is what makes `values` and the chosen broad query
+ * deterministic.
  */
 export const invert = (
   rows: readonly StoredTarget[],
 ): { components: ComponentType[]; models: Record<string, WireSelection>; residue: StoredTarget[] } => {
+  // PASS 1: which types hold at least one model-named row? A narrowed type's mode cannot depend on
+  // which of its rows happens to sort first.
+  const narrowed = new Set<ComponentType>();
+  for (const row of rows) {
+    const type = catalogIdOf(row.componentType);
+    if (type !== null && isCatalogModel(type, row.query)) narrowed.add(type);
+  }
+
   const models: Record<string, WireSelection> = {};
   const components: ComponentType[] = [];
   const residue: StoredTarget[] = [];
   for (const row of rows) {
     const type = catalogIdOf(row.componentType);
     if (type === null) {
+      // A `component_type` outside the catalog has no model list, so it can never be placed.
       residue.push(row);
       continue;
     }
-    const model = isCatalogModel(type, row.query);
-    const current = models[type];
-    if (current === undefined) {
-      models[type] = model
-        ? { mode: "selected", values: [row.query] }
-        : { mode: "all", values: [], query: row.query };
-      components.push(type);
+
+    if (narrowed.has(type)) {
+      if (!isCatalogModel(type, row.query)) {
+        // The type is model-narrowed, so its broad query is a KEPT SEARCH -- preserved, visible and
+        // removable, rather than deleted.
+        residue.push(row);
+        continue;
+      }
+      const current = models[type];
+      if (current === undefined) {
+        models[type] = { mode: "selected", values: [row.query] };
+        components.push(type);
+      } else if (current.mode === "selected") {
+        current.values.push(row.query);
+      }
       continue;
     }
-    if (model && current.mode === "selected") {
-      current.values.push(row.query);
+
+    // No row of this type is a model name: the first by `target_id` carries the broad query and any
+    // further broad row of the same type is a kept search.
+    if (models[type] === undefined) {
+      models[type] = { mode: "all", values: [], query: row.query };
+      components.push(type);
       continue;
     }
     residue.push(row);

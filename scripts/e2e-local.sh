@@ -504,6 +504,24 @@ WATCH_REV_MAX=$(val 'SELECT COALESCE(MAX(revision),-1) FROM search_revisions')
 # body that must be built at runtime is passed through a FILE, where no shell quoting touches it.
 wput() { code -X PUT -H "Origin: $ORIGIN" -H "Content-Type: application/json" -d "$1" "$BASE/api/watch"; }
 wputf() { code -X PUT -H "Origin: $ORIGIN" -H "Content-Type: application/json" -d @"$1" "$BASE/api/watch"; }
+
+# THE PRESERVATION RULE IS NOT RE-IMPLEMENTED HERE, AND THAT IS THE POINT. This used to carry a
+# THIRD copy of the browser's half of it, and the copy had DIVERGED -- it was missing the "is this
+# query a catalog model of its own type?" term -- so it preserved a row the real client discards and
+# therefore could not see the two-save data loss `W-twice` now pins. There are two implementations
+# of that rule and there should be two: the server's `preservableIds` and the client's
+# `preservableTargets`. This turns the LAST GET RESPONSE into the next PUT body by echoing the
+# wire's own `keptSearches`, which for an untouched load is exactly the client's kept list -- a
+# property of the inversion, asserted by W-kept-agree.
+watchbody() { python3 -c "
+import json
+state = json.load(open('/tmp/e2e.body'))
+sel = state['selection']
+json.dump({'components': sel['components'], 'models': sel['models'], 'location': sel['location'],
+           'radiusKm': sel['radiusKm'],
+           'preservedTargetIds': [row['targetId'] for row in state['keptSearches']]},
+          open('/tmp/e2e.watchbody', 'w'))
+"; }
 # TWO BROAD ROWS FOR ONE TYPE, so preservation has something to keep AND something to drop. Both
 # are free-text queries the form cannot author, which is the only kind preservation protects.
 sql "DELETE FROM watch_targets;
@@ -543,29 +561,7 @@ is "  ...storing the WORKER spelling"         case_fan "$(val "SELECT component_
 is "  ...and reading back the CATALOG one"    200 "$(code -H "Origin: $ORIGIN" "$BASE/api/watch")"
 has "  ...as case_fans"                       '"case_fans"' "$(body)"
 # THE GET'S OWN OUTPUT RE-PUTs: the read and the write agree on one vocabulary.
-# THE BROWSER'S OWN RULE, in six lines: echo the selection verbatim and name every stored row the
-# selection does not reproduce. `case_fan` is translated because the column holds the worker
-# spelling and the wire carries the catalog one.
-python3 -c "
-import json
-state = json.load(open('/tmp/e2e.body'))
-sel = state['selection']
-models, written = {}, set()
-for t, m in sel['models'].items():
-    if m['mode'] == 'selected':
-        models[t] = {'mode': 'selected', 'values': m['values']}
-        written.update((t, v) for v in m['values'])
-    else:
-        models[t] = {'mode': 'all', 'values': [], 'query': m['query']}
-        written.add((t, m['query']))
-kept = [
-    row['targetId'] for row in state['storedTargets']
-    if ('case_fans' if row['componentType'] == 'case_fan' else row['componentType'], row['query'])
-    not in written
-]
-json.dump({'components': sel['components'], 'models': models, 'location': sel['location'],
-           'radiusKm': sel['radiusKm'], 'preservedTargetIds': kept}, open('/tmp/e2e.watchbody', 'w'))
-"
+watchbody
 is "  ...and the GET's own output re-PUTs"     200 "$(wputf /tmp/e2e.watchbody)"
 # AND THE FREE-TEXT QUERY SURVIVED THE ROUND TRIP. The gpu row at this point is `keep-me`'s
 # 'radeon deals' -- a hand-written query the form cannot author -- which the GET echoed as gpu's
@@ -595,6 +591,26 @@ is "an unknown slug is refused"               400 "$(wput '{"components":["gpu"]
 is "a model name sent as a broad query is refused" 400 "$(wput '{"components":["gpu"],"models":{"gpu":{"mode":"all","values":[],"query":"GeForce RTX 5080"}},"location":{"slug":"toronto","latitude":43.6532,"longitude":-79.3832},"radiusKm":25,"preservedTargetIds":[]}')"
 is "an unknown key inside models[t] is refused" 400 "$(wput '{"components":["gpu"],"models":{"gpu":{"mode":"all","values":[],"query":"graphics card","targetId":"x"}},"location":{"slug":"toronto","latitude":43.6532,"longitude":-79.3832},"radiusKm":25,"preservedTargetIds":[]}')"
 has "  ...naming the key"                     '"fields":["models.gpu.targetId"]' "$(body)"
+# THE TWO-SAVE ROUND TRIP, WHICH IS THE SHAPE THAT COST NINE ROWS IN REVIEW. Narrowing a type to one
+# model beside its own broad query, then saving a SECOND time with nothing touched, used to delete
+# the model row AND the kept search surrendered to make room for it -- because the type's mode was
+# decided by whichever of its rows sorted first by `target_id`, and `gpu-broad` sorts before
+# `gpu-geforce-rtx-5090`. Every other row in this gate stops after one save.
+sql "DELETE FROM watch_targets;
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('gpu-broad','gpu','radeon');" >/dev/null
+is "narrowing gpu to one model is accepted"    200 "$(wput '{"components":["gpu"],"models":{"gpu":{"mode":"selected","values":["GeForce RTX 5090"]}},"location":{"slug":"toronto","latitude":43.6532,"longitude":-79.3832},"radiusKm":25,"preservedTargetIds":["gpu-broad"]}')"
+is "  ...keeping the broad row beside it"      2 "$(val 'SELECT COUNT(*) FROM watch_targets')"
+is "the GET shows the narrowing"               200 "$(code -H "Origin: $ORIGIN" "$BASE/api/watch")"
+# IT MUST NOT SNAP BACK TO mode:"all". That reversion is what made the new row invisible in the form
+# and the budget read one lower than D1.
+has "  ...as mode selected"                    '"mode":"selected","values":["GeForce RTX 5090"]' "$(body)"
+has "  ...with the broad row kept, not lost"   '"targetId":"gpu-broad"' "$(body)"
+watchbody
+is "  ...and an untouched SECOND save is 200"  200 "$(wputf /tmp/e2e.watchbody)"
+is "  ...with the model search still stored"   1 "$(val "SELECT COUNT(*) FROM watch_targets WHERE query='GeForce RTX 5090'")"
+is "  ...and the broad query still beside it"  1 "$(val "SELECT COUNT(*) FROM watch_targets WHERE query='radeon'")"
+is "  ...and nothing else written or lost"     2 "$(val 'SELECT COUNT(*) FROM watch_targets')"
+
 # THE CREDENTIAL BOUNDARY, as the three-row differential with a live control. The naive
 # "a collector token is refused" row is VACUOUS here: the gate runs on 127.0.0.1 with
 # APP_ENV=local and authenticateRequest admits the loopback identity BEFORE reading a header. A

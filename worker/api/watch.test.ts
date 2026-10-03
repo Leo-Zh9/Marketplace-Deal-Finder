@@ -13,13 +13,24 @@
 
 import { readFileSync } from "node:fs";
 import { componentById, componentCatalog } from "../../src/data/catalog";
+/**
+ * THE REAL CLIENT'S HALF OF THE PRESERVATION RULE, IMPORTED RATHER THAN RE-IMPLEMENTED. There were
+ * three copies of it -- the client, this file's own body builder and a python block in
+ * `scripts/e2e-local.sh` -- and the one that diverged (the python block had no "is this query a
+ * catalog model of its type?" term) is why no gate could see the two-save data loss W-twice now
+ * pins. The e2e no longer computes the set at all; it echoes the wire's own `keptSearches`, which
+ * W-kept-agree proves is the same set for an untouched load.
+ */
+import { preservableTargets, watchModelsFor } from "../../src/services/watchSelection";
+import { allSelection, derivedTargetCount } from "../../src/utils/validation";
+import type { ComponentType, ModelSelection } from "../../src/types";
 import { createTestDatabase, truncateAll, type TestDatabase } from "../testing/d1";
 import {
   claim,
   fingerprint,
   seedEvaluationCorpus,
 } from "../testing/evaluationFingerprint";
-import { buildStorageComponentId, CATALOG_COMPONENT_ID } from "../normalize/catalogIndex";
+import { buildStorageComponentId } from "../normalize/catalogIndex";
 import {
   handleGetWatch,
   handlePutWatch,
@@ -101,17 +112,57 @@ const get = async (db: D1Database = database.db): Promise<WatchBody> => {
   return result.body;
 };
 
-const catalogIdOf = (storage: string): string =>
-  Object.hasOwn(CATALOG_COMPONENT_ID, storage)
-    ? CATALOG_COMPONENT_ID[storage as keyof typeof CATALOG_COMPONENT_ID]
-    : storage;
-
 /**
- * WHAT THE BROWSER SENDS: the GET's own selection, plus the id of every stored row the selection
- * does not reproduce and that is not a model-named query. This is the client half of the symmetric
- * preservation rule, and keeping it in one place here is what makes W-prod a round-trip test
- * rather than a hand-written body.
+ * THE FORM'S OWN STATE, built from a wire response exactly as `src/App.tsx` builds it on load and
+ * after a save: `ModelSelection` per type, with the echoed query held OUTSIDE it.
  */
+const formStateFrom = (
+  state: WatchBody,
+  over: Partial<{ components: string[]; models: Record<string, unknown> }> = {},
+) => {
+  const components = (over.components ?? state.selection.components) as ComponentType[];
+  const wireModels = (over.models ?? state.selection.models) as Record<
+    string,
+    { mode: string; values: string[]; query?: string } | undefined
+  >;
+  const models: Partial<Record<ComponentType, ModelSelection>> = {};
+  const queries: Partial<Record<ComponentType, string>> = {};
+  for (const [type, selection] of Object.entries(wireModels)) {
+    if (selection === undefined) continue;
+    models[type as ComponentType] =
+      selection.mode === "selected"
+        ? { mode: "selected", values: selection.values }
+        : allSelection();
+    if (selection.mode === "all" && selection.query !== undefined) {
+      queries[type as ComponentType] = selection.query;
+    }
+  }
+  return { components, models, queries, storedTargets: state.storedTargets };
+};
+
+type FormState = ReturnType<typeof formStateFrom>;
+
+/** THE BODY `src/App.tsx`'s `save()` SENDS, through the client's own helpers and no copy of them. */
+const bodyFromForm = (
+  form: FormState,
+  over: Partial<{ preservedTargetIds: string[]; location: typeof TORONTO; radiusKm: number }> = {},
+) => ({
+  components: form.components,
+  models: watchModelsFor(form.components, form.models, form.queries),
+  location: over.location ?? TORONTO,
+  radiusKm: over.radiusKm ?? 25,
+  preservedTargetIds:
+    over.preservedTargetIds ??
+    preservableTargets(form.storedTargets, form.components, form.models, form.queries).map(
+      (row) => row.targetId,
+    ),
+});
+
+/** The number the budget line renders, from the same two helpers the form uses. */
+const formBudget = (form: FormState) =>
+  derivedTargetCount(form.components, form.models) +
+  preservableTargets(form.storedTargets, form.components, form.models, form.queries).length;
+
 const saveBodyFrom = (
   state: WatchBody,
   over: Partial<{
@@ -121,37 +172,7 @@ const saveBodyFrom = (
     location: typeof TORONTO;
     radiusKm: number;
   }> = {},
-) => {
-  const components = over.components ?? state.selection.components;
-  const models =
-    over.models ??
-    Object.fromEntries(components.map((component) => [component, state.selection.models[component]]));
-  const written = new Set<string>();
-  for (const [type, selection] of Object.entries(
-    models as Record<string, { mode: string; values: string[]; query?: string }>,
-  )) {
-    const queries = selection.mode === "all" ? [selection.query ?? ""] : selection.values;
-    for (const query of queries) written.add(JSON.stringify([type, query]));
-  }
-  const preservedTargetIds =
-    over.preservedTargetIds ??
-    state.storedTargets
-      .filter((row) => {
-        const type = catalogIdOf(row.componentType);
-        const isModel =
-          Object.hasOwn(componentById, type) &&
-          componentById[type as keyof typeof componentById].models.includes(row.query);
-        return !isModel && !written.has(JSON.stringify([type, row.query]));
-      })
-      .map((row) => row.targetId);
-  return {
-    components,
-    models,
-    location: over.location ?? TORONTO,
-    radiusKm: over.radiusKm ?? 25,
-    preservedTargetIds,
-  };
-};
+) => bodyFromForm(formStateFrom(state, over), over);
 
 describe("the watch list the BROWSER reads and writes", () => {
   /**
@@ -211,6 +232,105 @@ describe("the watch list the BROWSER reads and writes", () => {
     expect(after).toContain("ram:ddr4 ram");
     expect(after).toContain(`ram:${componentById.ram.models[0]}`);
     expect(after).toHaveLength(9);
+  });
+
+  /**
+   * W-twice: TWO SAVES, THROUGH THE REAL CLIENT HELPERS, AGAINST THE REAL HANDLER. This is the one
+   * test shape the slice was missing and the reason a 9-row data loss reached review: every other
+   * row here stops after ONE save, and the browser suite stubs the wire so the server's `invert`
+   * never runs in the browser loop.
+   *
+   * THE SEQUENCE IS THE SLICE'S HEADLINE ACTION: narrow a type to one model, Remove a kept search
+   * to get back under the cap (the only action that frees a slot), Save -- then touch nothing and
+   * Save again. Before the `invert` fix the second save deleted BOTH the new model row and the
+   * `gpu:'rtx'` that was surrendered to make room for it, and the form showed 8 of 9 while D1 held
+   * 9. The models are `ram.models[0]` and `cpu.models[0]`, which are in the 111-of-244 losing set.
+   */
+  it.each([
+    ["ram", () => componentById.ram.models[0]],
+    ["cpu", () => componentById.cpu.models[0]],
+  ])("W-twice: narrowing %s and saving TWICE keeps every search", async (type, modelOf) => {
+    await seedLive();
+    const model = modelOf();
+
+    // SAVE 1: narrow the type, and remove one kept search to fit the cap.
+    const first = formStateFrom(await get());
+    const narrowed: FormState = {
+      ...first,
+      models: { ...first.models, [type]: { mode: "selected", values: [model] } },
+      storedTargets: first.storedTargets.filter((row) => row.targetId !== "gpu-rtx"),
+    };
+    expect(formBudget(narrowed)).toBe(MAX_WATCH_TARGETS);
+    expect(await put(bodyFromForm(narrowed))).toMatchObject({ ok: true });
+    const afterFirst = await searches();
+    expect(afterFirst).toContain(`${type}:${model}`);
+    expect(afterFirst).toHaveLength(9);
+
+    // THE RE-SEED: the narrowing must still be on screen, the broad query must be a VISIBLE kept
+    // search, and the budget must equal what D1 holds. All three were wrong before the fix.
+    const state = await get();
+    const reseeded = formStateFrom(state);
+    expect(reseeded.models[type as ComponentType]).toEqual({ mode: "selected", values: [model] });
+    const keptIds = preservableTargets(
+      reseeded.storedTargets,
+      reseeded.components,
+      reseeded.models,
+      reseeded.queries,
+    ).map((row) => row.targetId);
+    expect(keptIds).toEqual(state.keptSearches.map((row) => row.targetId));
+    expect(formBudget(reseeded)).toBe((await rows()).length);
+
+    // SAVE 2, untouched.
+    expect(await put(bodyFromForm(reseeded))).toMatchObject({ ok: true });
+    expect(await searches()).toEqual(afterFirst);
+  });
+
+  /**
+   * W-kept-agree: THE WIRE'S `keptSearches` AND THE BROWSER'S KEPT LIST ARE THE SAME SET FOR AN
+   * UNTOUCHED LOAD, and that identity is what lets `scripts/e2e-local.sh` echo the wire's own field
+   * instead of carrying a third copy of the preservation rule -- the copy that diverged, had no
+   * "is this a catalog model of its type?" term, and so could not see W-twice's defect in principle.
+   *
+   * The fixture mixes every shape the inversion can meet: a narrowed type with a broad row beside
+   * it, a type with two broad rows, a model-named row, and a `component_type` outside the catalog.
+   */
+  it("W-kept-agree: the residue is exactly the browser's kept list, and every residue row is a non-model", async () => {
+    await truncateAll(database.db);
+    await database.db.batch([
+      insertMarket(),
+      insertTarget("gpu-broad", "gpu", "graphics card"),
+      insertTarget("gpu-zz-model", "gpu", componentById.gpu.models[0]),
+      insertTarget("cpu-a", "cpu", "ryzen"),
+      insertTarget("cpu-b", "cpu", "cpu"),
+      insertTarget("legacy-ebay", "ebay", "gpu deals"),
+      insertTarget("fan-broad", "case_fan", "quiet fans"),
+    ]);
+
+    const state = await get();
+    const form = formStateFrom(state);
+    const keptIds = preservableTargets(
+      form.storedTargets,
+      form.components,
+      form.models,
+      form.queries,
+    ).map((row) => row.targetId);
+
+    expect(keptIds).toEqual(state.keptSearches.map((row) => row.targetId));
+    // Non-empty, so the equality is not satisfied by both sides losing.
+    expect(keptIds).toEqual(["cpu-b", "gpu-broad", "legacy-ebay"]);
+    // EVERY residue row is a non-model of its own type -- the property the agreement rests on.
+    for (const row of state.keptSearches) {
+      const type = row.componentType === "case_fan" ? "case_fans" : row.componentType;
+      const known = Object.hasOwn(componentById, type)
+        ? componentById[type as ComponentType].models
+        : [];
+      expect(known, `${row.targetId} must not be a model of ${type}`).not.toContain(row.query);
+    }
+    // ...and the narrowed type kept its model while its broad row became a kept search.
+    expect(state.selection.models.gpu).toEqual({
+      mode: "selected",
+      values: [componentById.gpu.models[0]],
+    });
   });
 
   /**
