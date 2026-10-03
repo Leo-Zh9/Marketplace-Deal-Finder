@@ -73,6 +73,8 @@ interface Wire {
   watch?: WatchWire;
   /** What `PUT /api/watch` answers -- the server re-reads from D1, so it is not the request. */
   watchAfter?: WatchWire;
+  /** A 200 whose body is not JSON, which is the only way the save fallback is reached. */
+  watchPutRaw?: string;
   watchStatus?: number;
   settings?: WireSettings | null;
   settingsStatus?: number;
@@ -106,7 +108,11 @@ const stubWire = (wire: Wire = {}) => {
       calls.push({ url: String(url), method, body });
       const path = String(url).split("?")[0];
       if (path === "/api/watch") {
-        if (method === "PUT") return reply(wire.watchAfter ?? wire.watch ?? EMPTY_WATCH);
+        if (method === "PUT") {
+          return wire.watchPutRaw === undefined
+            ? reply(wire.watchAfter ?? wire.watch ?? EMPTY_WATCH)
+            : new Response(wire.watchPutRaw, { status: 200 });
+        }
         return wire.watchStatus !== undefined && wire.watchStatus !== 200
           ? reply({ error: { code: "WATCH_TARGETS_STORAGE_FAILED" } }, wire.watchStatus)
           : reply(wire.watch ?? EMPTY_WATCH);
@@ -843,6 +849,35 @@ describe("the control panel", () => {
       ),
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Save searches" })).toBeDisabled();
+  });
+
+  /**
+   * A-saved-maybe: THE SAVE FALLBACK MUST NOT CLAIM THE DATA IS UNTOUCHED. It is reached only when
+   * the throw is not an `ApiRequestError`, which on this path means a SyntaxError from parsing
+   * `saveWatch`'s own RESPONSE -- i.e. AFTER one PUT reached `/api/watch` and the write committed,
+   * and before the re-seed could run. "Nothing was changed." was therefore a false statement about
+   * the operator's watch list, and no reordering can make it true.
+   */
+  it("A-saved-maybe: a save whose response will not parse says the write MAY have landed", async () => {
+    const user = userEvent.setup();
+    const calls = stubWire({
+      watch: LIVE_WATCH,
+      settings: null,
+      watchPutRaw: "<html>a gateway page</html>",
+    });
+    render(<App getToken={noToken} />);
+    await waitForLoad("9 of 9 searches used");
+
+    await user.click(screen.getByRole("button", { name: "Save searches" }));
+
+    // The PUT went out -- which is exactly why the copy cannot say nothing changed.
+    await waitFor(() => expect(putTo(calls, "/api/watch")).toBeDefined());
+    const banner = await screen.findByRole("alert");
+    expect(banner).toHaveTextContent(
+      "Your searches may have been saved. Reload the page to see what is stored.",
+    );
+    expect(banner.textContent).not.toContain("Nothing was changed");
+    expect(screen.queryByText(/^Saved\./)).not.toBeInTheDocument();
   });
 
   /**

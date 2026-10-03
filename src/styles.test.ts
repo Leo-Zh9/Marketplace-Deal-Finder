@@ -18,6 +18,8 @@
  *     static prefix is checked, the generated endings are not;
  *   - renaming ONE rule of a class that has several leaves the class styled by the others, and this
  *     test passes -- correctly, because the class is still styled. MEASURED both ways.
+ *   - it reads the stylesheet, not the rendered page: a rule inside a `@media` block it never
+ *     matches, or one whose property is misspelled, still counts.
  */
 
 const css = (import.meta.glob("./styles.css", { query: "?raw", import: "default", eager: true }) as
@@ -55,8 +57,13 @@ const classesIn = (source: string): string[] => {
 
 describe("the stylesheet and the components agree", () => {
   it("defines a rule for every class the components use", () => {
+    // COMMENTS ARE STRIPPED FIRST. A name that appears only inside a `/* ... */` block is not a
+    // rule, and counting it as one is the cheapest possible way to satisfy this test -- which is
+    // the one thing a guard like this must not permit. `.toLowerCase` and `.tsx` are exactly that
+    // today: both appear only in prose, and neither would have been caught.
+    const rules = css.replace(/\/\*[\s\S]*?\*\//g, "");
     const defined = new Set(
-      [...css.matchAll(/\.(-?[A-Za-z_][A-Za-z0-9_-]*)/g)].map((match) => match[1]),
+      [...rules.matchAll(/\.(-?[A-Za-z_][A-Za-z0-9_-]*)/g)].map((match) => match[1]),
     );
 
     const missing: string[] = [];
@@ -78,5 +85,8 @@ describe("the stylesheet and the components agree", () => {
     expect(checked).toBeGreaterThan(60);
     expect(defined.has("budget-line")).toBe(true);
     expect(defined.has("kept-list")).toBe(true);
+    // ...and the strip is asserted, not assumed: `.tsx` appears in this stylesheet's prose only.
+    expect(css).toContain(".tsx");
+    expect(defined.has("tsx")).toBe(false);
   });
 });

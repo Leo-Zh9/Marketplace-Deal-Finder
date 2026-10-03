@@ -157,9 +157,16 @@ export const deriveTargets = (selection: WatchSelection): StoredTarget[] => {
  *   operator is likely to click is in the losing set.
  *
  * THE PROPERTY THIS RULE BUYS, and `W-kept-agree` is what pins it: EVERY RESIDUE ROW IS A
- * NON-MODEL, so every kept search is preservable, so the browser's kept list and this field agree
- * for an untouched load. Under first-row-wins the residue could contain a model row that the
- * client would then refuse to echo and the server would then delete.
+ * NON-MODEL. Under first-row-wins the residue could contain a model row, which the client then
+ * refuses to echo and this handler then deletes -- the loss above.
+ *
+ * STATED AT THE WIDTH IT HOLDS, because `scripts/e2e-local.sh` now rests on it: non-model is
+ * NECESSARY for preservability, not SUFFICIENT -- `preservableIds` also requires that the new
+ * derivation is not writing the row. The residue and the client's kept list therefore coincide for
+ * an UNTOUCHED load, where the derivation reproduces exactly what the inversion placed so nothing
+ * in the residue is written; they do NOT coincide in general, and the one stored shape where even
+ * an untouched load parts them is two rows sharing a single `(component_type, query)`, whose second
+ * row is residue AND written.
  *
  * Rows still arrive `ORDER BY target_id`, which is what makes `values` and the chosen broad query
  * deterministic.

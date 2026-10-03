@@ -15,7 +15,12 @@
  * list before it sends anything. A THIRD copy in `scripts/e2e-local.sh` is what let a two-save data
  * loss through review: it had diverged, missing the "is this query a catalog model of its type?"
  * term, so it preserved a row the real client discards. That copy is gone -- the gate echoes the
- * wire's own `keptSearches`, and `W-kept-agree` pins that the two agree.
+ * wire's own `keptSearches`, and `W-kept-agree` pins that the two agree ON AN UNTOUCHED LOAD, which
+ * is the only shape the gate uses it in. The two conditions are NOT the same condition: non-model
+ * is necessary for preservability but not sufficient, because preservability also requires that the
+ * new derivation is not writing the row. They coincide for an untouched load because the derivation
+ * then reproduces exactly what the inversion placed, so nothing in the residue is written -- except
+ * two stored rows sharing one `(component_type, query)`, where the second is residue AND written.
  */
 
 import { componentById } from "../data/catalog";
@@ -27,6 +32,52 @@ export interface StoredTarget {
   componentType: string;
   query: string;
 }
+
+/**
+ * STORAGE ID -> CATALOG ID, THE SAME DIRECTION AND THE SAME ANSWER AS THE SERVER'S `catalogIdOf`,
+ * INCLUDING FOR AN ID THAT IS NEITHER.
+ *
+ * MEASURED DIVERGENCE THIS CLOSES, and it is the FIFTH site of the `case_fan`/`case_fans` trap. A
+ * hand-written row carrying the CATALOG spelling in the STORAGE column -- `component_type =
+ * 'case_fans'` with a `case_fans` model name as its query -- was deleted by a save that answered
+ * 200. The server's `catalogIdOf` looks the value up in `CATALOG_COMPONENT_ID`, whose KEYS are
+ * storage ids, misses it, and therefore calls the row preservable; this filter used to resolve the
+ * value straight in `componentById`, where `case_fans` IS a key, see a model name, and call the row
+ * NON-preservable. So the row never reached the kept list, never reached `preservedTargetIds`, and
+ * the `DELETE` took it.
+ *
+ * The lookup is therefore the server's, not the catalog's: a value that is not a STORAGE id is not
+ * a catalog type here, whatever `componentById` thinks of it. `W-storage-agree` asserts the two
+ * halves answer identically for all nine storage ids, both spellings of the one that differs, and
+ * a value outside the set.
+ *
+ * `Record<ComponentType, string>` is what makes a NEW CATALOG ID a compile error in this file --
+ * the mirror of the `Record<Listing["componentType"], ComponentType>` typing that makes a new
+ * WORKER id a compile error in `worker/normalize/catalogIndex.ts`. Each table is exhaustive in its
+ * own direction, and the test above is what keeps them from drifting.
+ */
+const STORAGE_COMPONENT_ID: Record<ComponentType, string> = {
+  cpu: "cpu",
+  cpu_cooler: "cpu_cooler",
+  motherboard: "motherboard",
+  ram: "ram",
+  storage: "storage",
+  gpu: "gpu",
+  psu: "psu",
+  case: "case",
+  case_fans: "case_fan",
+};
+
+const CATALOG_BY_STORAGE_ID = new Map<string, ComponentType>(
+  Object.entries(STORAGE_COMPONENT_ID).map(([catalog, storage]) => [
+    storage,
+    catalog as ComponentType,
+  ]),
+);
+
+/** The catalog id a stored `component_type` means, or `null` when it is not a storage id at all. */
+export const catalogIdOf = (componentType: string): ComponentType | null =>
+  CATALOG_BY_STORAGE_ID.get(componentType) ?? null;
 
 /** The body `PUT /api/watch` takes. Catalog vocabulary throughout; storage ids never appear. */
 export interface WatchSaveBody {
@@ -86,21 +137,26 @@ export const preservableTargets = (
   models: Partial<Record<ComponentType, ModelSelection>>,
   queries: Partial<Record<ComponentType, string>>,
 ): StoredTarget[] => {
+  // THE COMPARISON HAPPENS IN STORAGE SPACE, WHICH IS THE SPACE THE SERVER COMPARES IN. Its
+  // `searchKey` is built from the stored `component_type`, so keying this set on the CATALOG id
+  // leaves a divergence in the mirror direction of the one above: a hand-written row spelled
+  // `case_fans` would match a derived `case_fans` key here and be dropped from
+  // `preservedTargetIds`, while the server -- deriving `case_fan` -- would have preserved it, so
+  // the row goes because the client never asked for it. One space, one answer, both ends.
   const written = new Set<string>();
   for (const [component, selection] of Object.entries<WatchSaveBody["models"][string]>(
     watchModelsFor(components, models, queries),
   )) {
+    const storageId = STORAGE_COMPONENT_ID[component as ComponentType];
     const values = selection.mode === "selected" ? selection.values : [selection.query ?? ""];
-    for (const query of values) written.add(JSON.stringify([component, query]));
+    for (const query of values) written.add(JSON.stringify([storageId, query]));
   }
   return storedTargets.filter((row) => {
-    // The wire is catalog vocabulary; `watch_targets.component_type` is storage vocabulary, and
-    // `case_fan` is the one id that differs.
-    const type = row.componentType === "case_fan" ? "case_fans" : row.componentType;
-    const isModel =
-      Object.hasOwn(componentById, type) &&
-      componentById[type as ComponentType].models.includes(row.query);
-    return !isModel && !written.has(JSON.stringify([type, row.query]));
+    const type = catalogIdOf(row.componentType);
+    // A `component_type` this map does not know has no model list, so its query can never be a
+    // model name -- the same conclusion the server reaches, by the same route.
+    const isModel = type !== null && componentById[type].models.includes(row.query);
+    return !isModel && !written.has(JSON.stringify([row.componentType, row.query]));
   });
 };
 

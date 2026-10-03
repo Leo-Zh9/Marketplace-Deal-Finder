@@ -385,10 +385,18 @@ function App({ identity, onSignOut, getToken }: AppProps) {
       await marketplaceClient.saveDealRule(settings.dealRule, getToken);
       setSavedAt(new Date().toISOString());
     } catch (error: unknown) {
+      /*
+       * "NOTHING WAS CHANGED" WAS A FALSE CLAIM ABOUT THE OPERATOR'S DATA, and the D-3 reordering
+       * cannot fix it: this fallback is reached only when the throw is NOT an `ApiRequestError`,
+       * which on this path means a SyntaxError from parsing `saveWatch`'s own RESPONSE -- after the
+       * PUT reached `/api/watch` and the write committed, and before `written` is assigned, so none
+       * of the re-seed below ran. One request went out and the watch list may well hold the new
+       * value. The honest sentence is the one that tells the operator how to find out.
+       */
       setRequestError(
         requestErrorMessage(
           error,
-          "Your searches could not be saved. Nothing was changed.",
+          "Your searches may have been saved. Reload the page to see what is stored.",
         ),
       );
     } finally {

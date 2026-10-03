@@ -21,7 +21,12 @@ import { componentById, componentCatalog } from "../../src/data/catalog";
  * pins. The e2e no longer computes the set at all; it echoes the wire's own `keptSearches`, which
  * W-kept-agree proves is the same set for an untouched load.
  */
-import { preservableTargets, watchModelsFor } from "../../src/services/watchSelection";
+import {
+  catalogIdOf,
+  preservableTargets,
+  watchModelsFor,
+} from "../../src/services/watchSelection";
+
 import { allSelection, derivedTargetCount } from "../../src/utils/validation";
 import type { ComponentType, ModelSelection } from "../../src/types";
 import { createTestDatabase, truncateAll, type TestDatabase } from "../testing/d1";
@@ -30,7 +35,11 @@ import {
   fingerprint,
   seedEvaluationCorpus,
 } from "../testing/evaluationFingerprint";
-import { buildStorageComponentId } from "../normalize/catalogIndex";
+import {
+  buildStorageComponentId,
+  CATALOG_COMPONENT_ID,
+  STORAGE_COMPONENT_ID,
+} from "../normalize/catalogIndex";
 import {
   handleGetWatch,
   handlePutWatch,
@@ -247,30 +256,43 @@ describe("the watch list the BROWSER reads and writes", () => {
    * 9. The models are `ram.models[0]` and `cpu.models[0]`, which are in the 111-of-244 losing set.
    */
   it.each([
-    ["ram", () => componentById.ram.models[0]],
-    ["cpu", () => componentById.cpu.models[0]],
-  ])("W-twice: narrowing %s and saving TWICE keeps every search", async (type, modelOf) => {
+    ["ram, one model", "ram", () => componentById.ram.models.slice(0, 1), ["gpu-rtx"]],
+    ["cpu, one model", "cpu", () => componentById.cpu.models.slice(0, 1), ["gpu-rtx"]],
+    // THE SECOND MODEL OF A NARROWED TYPE IS THE SAME DEFECT ONE MULTIPLICITY UP, and every
+    // fixture in this slice narrowed to exactly ONE model, so nothing saw it: mutating the
+    // `values.push` branch of the inversion to `residue.push` survived the WHOLE suite. The
+    // 2nd..Nth model row of a narrowed type would land in the residue, where a model name is
+    // non-preservable, and the next untouched save would delete it.
+    ["gpu, TWO models", "gpu", () => componentById.gpu.models.slice(0, 2), ["gpu-rtx", "gpu-toronto"]],
+  ])(
+    "W-twice: narrowing %s and saving TWICE keeps every search",
+    async (_label, type, modelsOf, removeIds) => {
     await seedLive();
-    const model = modelOf();
+    const models = modelsOf();
 
-    // SAVE 1: narrow the type, and remove one kept search to fit the cap.
+    // SAVE 1: narrow the type, and remove enough kept searches to fit the cap.
     const first = formStateFrom(await get());
     const narrowed: FormState = {
       ...first,
-      models: { ...first.models, [type]: { mode: "selected", values: [model] } },
-      storedTargets: first.storedTargets.filter((row) => row.targetId !== "gpu-rtx"),
+      models: { ...first.models, [type]: { mode: "selected", values: models } },
+      storedTargets: first.storedTargets.filter((row) => !removeIds.includes(row.targetId)),
     };
     expect(formBudget(narrowed)).toBe(MAX_WATCH_TARGETS);
     expect(await put(bodyFromForm(narrowed))).toMatchObject({ ok: true });
     const afterFirst = await searches();
-    expect(afterFirst).toContain(`${type}:${model}`);
+    for (const model of models) expect(afterFirst).toContain(`${type}:${model}`);
     expect(afterFirst).toHaveLength(9);
 
     // THE RE-SEED: the narrowing must still be on screen, the broad query must be a VISIBLE kept
     // search, and the budget must equal what D1 holds. All three were wrong before the fix.
     const state = await get();
     const reseeded = formStateFrom(state);
-    expect(reseeded.models[type as ComponentType]).toEqual({ mode: "selected", values: [model] });
+    const selection = reseeded.models[type as ComponentType];
+    expect(selection?.mode).toBe("selected");
+    // SORTED, not submission order: rows come back ORDER BY target_id, and `GeForce RTX 5080`
+    // sorts before `GeForce RTX 5090` while the body submitted them the other way round. EVERY
+    // model must come back, which is what the one-model fixtures could not ask.
+    expect([...(selection?.values ?? [])].sort()).toEqual([...models].sort());
     const keptIds = preservableTargets(
       reseeded.storedTargets,
       reseeded.components,
@@ -283,6 +305,103 @@ describe("the watch list the BROWSER reads and writes", () => {
     // SAVE 2, untouched.
     expect(await put(bodyFromForm(reseeded))).toMatchObject({ ok: true });
     expect(await searches()).toEqual(afterFirst);
+    },
+  );
+
+  /**
+   * W-storage-agree: THE TWO HALVES RESOLVE A STORED `component_type` THE SAME WAY, INCLUDING FOR A
+   * VALUE THAT IS NEITHER SPELLING. This is the fifth site of the `case_fan`/`case_fans` trap, and
+   * the divergence it closes deleted a row with a 200: the server misses the catalog spelling in the
+   * storage column (its map's keys are storage ids) and calls such a row preservable, while the
+   * client used to resolve it straight in `componentById`, see a model name, and call it
+   * NON-preservable -- so it never reached the kept list or `preservedTargetIds`, and the DELETE
+   * took it.
+   */
+  it("W-storage-agree: the client and the server resolve every component_type identically", () => {
+    const serverSide = (value: string): string | null =>
+      Object.hasOwn(CATALOG_COMPONENT_ID, value)
+        ? CATALOG_COMPONENT_ID[value as keyof typeof CATALOG_COMPONENT_ID]
+        : null;
+
+    const probes = [
+      ...Object.values(STORAGE_COMPONENT_ID),
+      // BOTH spellings of the one id that differs, which is the whole point.
+      "case_fan",
+      "case_fans",
+      // ...and values that are neither: a typo, a prototype key, and the empty string.
+      "gpuu",
+      "toString",
+      "",
+    ];
+    expect(probes.length).toBeGreaterThan(9);
+    for (const probe of probes) {
+      expect(catalogIdOf(probe), `component_type ${JSON.stringify(probe)}`).toBe(serverSide(probe));
+    }
+    // Non-vacuous in both directions: at least one probe resolves and at least one does not.
+    expect(catalogIdOf("case_fan")).toBe("case_fans");
+    expect(catalogIdOf("case_fans")).toBeNull();
+  });
+
+  /**
+   * W-storage-odd: THE ROW THAT DIVERGENCE DELETED. `component_type = 'case_fans'` is the catalog
+   * spelling in the storage column -- storable (0005 puts no CHECK on that column, deliberately) and
+   * reachable only from a hand-written `wrangler d1 execute`. It must be PRESERVED and VISIBLE,
+   * because neither half can say what it is, not deleted because the two halves disagreed.
+   */
+  it("W-storage-odd: a catalog spelling in the storage column is kept, not silently deleted", async () => {
+    await truncateAll(database.db);
+    const query = componentById.case_fans.models[0];
+    await database.db.batch([
+      insertMarket(),
+      insertTarget("hand-written", "case_fans", query),
+      insertTarget("gpu-broad", "gpu", "graphics card"),
+    ]);
+
+    const state = await get();
+    const form = formStateFrom(state);
+    const keptIds = preservableTargets(
+      form.storedTargets,
+      form.components,
+      form.models,
+      form.queries,
+    ).map((row) => row.targetId);
+
+    // The client keeps it, the wire reports it, and the two agree -- which is the bug's shape.
+    expect(keptIds).toContain("hand-written");
+    expect(state.keptSearches.map((row) => row.targetId)).toEqual(["hand-written"]);
+
+    expect(await put(bodyFromForm(form))).toMatchObject({ ok: true });
+    // BY ID, because a kept row keeps its own id -- that is the preservation guarantee -- while the
+    // derived gpu row is re-written under the id its query derives (nothing parses `target_id`).
+    expect((await rows()).map((row) => row.target_id)).toContain("hand-written");
+    expect(await searches()).toEqual([`case_fans:${query}`, "gpu:graphics card"]);
+
+    // AND THE MIRROR CASE, which is where keying the client's `written` set on the CATALOG id put a
+    // divergence back the other way: selecting case_fans and narrowing it to THAT SAME MODEL derives
+    // `case_fan:<model>`, which the server does not consider a rewrite of the `case_fans:<model>`
+    // row -- so the row stays preservable and must stay echoed, or it goes because the client never
+    // asked for it.
+    const narrowed: FormState = {
+      ...form,
+      components: [...form.components, "case_fans"],
+      models: { ...form.models, case_fans: { mode: "selected", values: [query] } },
+    };
+    const keptNarrowed = preservableTargets(
+      narrowed.storedTargets,
+      narrowed.components,
+      narrowed.models,
+      narrowed.queries,
+    ).map((row) => row.targetId);
+    expect(keptNarrowed).toContain("hand-written");
+    expect(await put(bodyFromForm(narrowed))).toMatchObject({ ok: true });
+    expect((await rows()).map((row) => row.target_id)).toContain("hand-written");
+    // Both spellings now stand side by side -- the hand-written row preserved verbatim, and the
+    // correctly-spelled derived row beside it.
+    const stored = await rows();
+    expect(stored.filter((row) => row.query === query).map((row) => row.component_type).sort()).toEqual([
+      "case_fan",
+      "case_fans",
+    ]);
   });
 
   /**

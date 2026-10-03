@@ -511,8 +511,10 @@ wputf() { code -X PUT -H "Origin: $ORIGIN" -H "Content-Type: application/json" -
 # therefore could not see the two-save data loss `W-twice` now pins. There are two implementations
 # of that rule and there should be two: the server's `preservableIds` and the client's
 # `preservableTargets`. This turns the LAST GET RESPONSE into the next PUT body by echoing the
-# wire's own `keptSearches`, which for an untouched load is exactly the client's kept list -- a
-# property of the inversion, asserted by W-kept-agree.
+# wire's own `keptSearches`, which for an UNTOUCHED LOAD is exactly the client's kept list -- a
+# property of the inversion, asserted by W-kept-agree. It holds at that width and no wider: every
+# residue row is a non-model, which preservability needs but is not satisfied by on its own (it also
+# needs the derivation not to be writing the row). Untouched is the only shape used here.
 watchbody() { python3 -c "
 import json
 state = json.load(open('/tmp/e2e.body'))
