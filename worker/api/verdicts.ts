@@ -16,7 +16,8 @@
 
 import { referenceAverageCents } from "../evaluation/dealRules";
 import { MINIMUM_REFERENCE_COUNT } from "../evaluation/types";
-import { CATALOG_COMPONENT_ID } from "../normalize/catalogIndex";
+import { CATALOG_COMPONENT_ID, STORAGE_COMPONENT_ID } from "../normalize/catalogIndex";
+import { componentById } from "../../src/data/catalog";
 import type { ComponentType } from "../../src/types";
 
 export const VERDICT_PAGE_SIZE = 50;
@@ -60,7 +61,8 @@ export type VerdictsResult =
        * one code sends an operator to the wrong one. Returning the storage code here would
        * reintroduce, on the wire, exactly the miscoding narrowing the `try` removed.
        */
-      code: "VERDICTS_STORAGE_FAILED" | "VERDICTS_ROWS_UNUSABLE";
+      code: "VERDICTS_STORAGE_FAILED" | "VERDICTS_ROWS_UNUSABLE" | "INVALID_VERDICTS_QUERY";
+      details?: Record<string, unknown>;
     };
 
 /**
@@ -115,8 +117,32 @@ export type VerdictsResult =
  * because the paragraph above already refuses the adjacent trap -- `LIMIT 51` bounds the
  * RESPONSE and not `rows_read` -- and then took a steady-state WRITE figure as a ceiling on a
  * cumulative SCAN. Two units confused in the same comment that insists on the distinction.
+ *
+ * WHAT THE SELECTION FILTER ADDS, RE-MEASURED, because the figures above were committed BEFORE
+ * the `WHERE` existed. MEASURED on a 63-row corpus (60 `cpu` ahead of 3 `gpu`), `rows_read`
+ * against the unfiltered statement's 126:
+ *
+ *   |all| |pairs|   delta
+ *       1      0     -59    the filter EXCLUDES most of the corpus and pays for itself
+ *       3      0       0
+ *       9      0      +9    all nine types: the no-op selection, and the worst realistic case
+ *       8      1      +8
+ *       9      9      +9    the `OR` short-circuits; `?3` is never materialised
+ *       0      1     -61
+ *
+ * THE BOUND TO WRITE IN: the `WHERE` adds AT MOST ONE `rows_read` PER ELEMENT OF THE LISTS IT
+ * EVALUATES -- <= 18 at the 9-target cap, 9 for the all-nine-types case -- and it REDUCES
+ * `rows_read` in proportion to the share of the corpus excluded. V-f7 pins the inequality over a
+ * table of list lengths rather than over one fixture's number: an earlier draft said "never more
+ * than 3", which was one fixture's `|all|` generalised into a bound and is wrong by 3x at the
+ * shipped configuration.
+ *
+ * THE PLAN SHAPE IS UNCHANGED, which is the good news: each `json_each` becomes a LIST SUBQUERY
+ * with a CREATE BLOOM FILTER, materialised ONCE; the three LEFT JOIN primary-key seeks and the
+ * USE TEMP B-TREE FOR ORDER BY are untouched; `SCAN l USING INDEX sqlite_autoindex_listings_1`
+ * becomes a plain `SCAN l`.
  */
-export const SELECT_VERDICTS = `SELECT l.source, l.listing_id, l.component_type, l.model_key,
+const SELECT_VERDICTS_BODY = `SELECT l.source, l.listing_id, l.component_type, l.model_key,
        l.variant_key, l.title, l.price_cents, l.location_text, l.url, l.last_seen_at,
        t.verdict AS verdict,
        CASE WHEN p.listing_id IS NULL THEN s.count
@@ -132,12 +158,55 @@ export const SELECT_VERDICTS = `SELECT l.source, l.listing_id, l.component_type,
          ON s.market_key  = COALESCE(p.market_key,  l.market_key)
         AND s.model_key   = COALESCE(p.model_key,   l.model_key)
         AND s.variant_key = COALESCE(p.variant_key, l.variant_key)
- ORDER BY CASE WHEN t.verdict IS NULL      THEN 2
+`;
+
+/**
+ * THE SERVER-SIDE SELECTION FILTER, and it closes PR #17's defect. Before it, the component and
+ * model filter ran IN THE BROWSER, AFTER this statement's `LIMIT 51` -- so a page of 50 rows that
+ * were all of a component the user is not watching filtered down to nothing and the page reported
+ * a non-empty database as empty. MEASURED both ways on 60 newer `cpu` rows ahead of 3 `gpu`:
+ * unfiltered, the page holds 50 rows, 0 of them gpu, `truncated: true`; filtered, it holds 3 rows,
+ * all gpu, `truncated: false`.
+ *
+ * `json_each`, NOT BOUND PARAMETERS, and that is not a style choice: D1 caps a statement at 100
+ * parameters (MEASURED -- `?101` answers `D1_ERROR: variable number must be between ?1 and ?100`)
+ * and a shipped-default `cpu + gpu` selection is 113 model names. The parameter form is BROKEN,
+ * not merely ugly.
+ *
+ * `'/'` IS SAFE AS THE PAIR SEPARATOR: MEASURED, 0 of 336 catalog model names contain one.
+ * `COALESCE(model_key, '')` yields `gpu/` for an uncatalogued listing, which preserves the
+ * requirement that a model-narrowed selection excludes rows whose model was never resolved --
+ * and is exactly why `pairs=["gpu/"]` is refused at the edge rather than bound here: MEASURED, it
+ * really does select precisely the `model_key IS NULL` rows.
+ *
+ * THE BINDINGS ARE STORAGE IDS, NOT CATALOG IDS. This is the fourth site of the
+ * `case_fan`/`case_fans` translation; the wire carries catalog vocabulary and the handler
+ * translates. Binding the catalog spelling makes case fans never appear.
+ */
+const WHERE_SELECTION = ` WHERE l.component_type IN (SELECT value FROM json_each(?2))
+    OR (l.component_type || '/' || COALESCE(l.model_key, '')) IN (SELECT value FROM json_each(?3))`
+;
+
+const ORDER_AND_BOUND = ` ORDER BY CASE WHEN t.verdict IS NULL      THEN 2
                WHEN t.verdict = 'DEAL'     THEN 0
                WHEN t.verdict = 'NOT_DEAL' THEN 3
                ELSE 1 END,
           l.last_seen_at DESC, l.listing_id
  LIMIT ?1`;
+
+/**
+ * TWO STATEMENTS, AND THE UNFILTERED ONE IS BYTE-IDENTICAL TO THE STATEMENT THAT SHIPPED. An
+ * ABSENT `?all` is NOT the same request as `?all` naming all nine catalog types, and the
+ * difference is measurable: binding the nine storage ids would make the SQL drop any row whose
+ * `component_type` is outside the catalog, which is precisely the catalog/collector skew
+ * `toWireListing` warns about and V-2b/V-16b pin. An absent filter would then silently swallow
+ * the one signal an operator has that the two halves disagree -- and it would make that guard
+ * unreachable, i.e. dead code. So absent means NO PREDICATE, and `?all=` present-and-empty means
+ * the empty list.
+ */
+export const SELECT_VERDICTS = SELECT_VERDICTS_BODY + ORDER_AND_BOUND;
+export const SELECT_VERDICTS_FILTERED = SELECT_VERDICTS_BODY + WHERE_SELECTION + ORDER_AND_BOUND;
+
 
 interface VerdictRow {
   source: string;
@@ -245,16 +314,117 @@ export const toWireListing = (row: VerdictRow): WireListing | null => {
   };
 };
 
-export const handleGetVerdicts = async (db: D1Database): Promise<VerdictsResult> => {
+/**
+ * ABSENT, EMPTY AND INVALID ARE THREE DIFFERENT THINGS, and each of the three is a measured row of
+ * the contract:
+ *
+ *   `?all` absent ............................ the unfiltered page (and `?pairs` is then a 400)
+ *   `?all=` present-and-empty, `?pairs` set .. only the paired rows -- the selection a
+ *                                              model-narrowed form sends, and the one an earlier
+ *                                              draft made a 400
+ *   `?all=` and `?pairs=` both empty ......... zero rows, which is the empty list and not an error
+ *   a value outside the catalog .............. 400, because ignoring it returns an empty page that
+ *                                              reads as "nothing collected yet"
+ *   `?pairs` with `?all` absent .............. 400: MEASURED, the page comes back byte-identical
+ *                                              to the unfiltered one, i.e. the pairs are a SILENT
+ *                                              NO-OP, and one validation line removes it
+ */
+export interface VerdictsSelection {
+  /** Storage component ids, for the types whose selection is `mode:"all"`. */
+  all: string[];
+  /** `"<storage type>/<model>"`, for the types whose selection is `mode:"selected"`. */
+  pairs: string[];
+}
+
+const parseList = (raw: string): string[] | null => {
+  if (raw.trim() === "") return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(parsed) || parsed.some((entry) => typeof entry !== "string")) return null;
+  return parsed as string[];
+};
+
+export const parseVerdictsQuery = (
+  params: URLSearchParams,
+): { ok: true; selection: VerdictsSelection | null } | { ok: false; detail: string } => {
+  const rawAll = params.get("all");
+  const rawPairs = params.get("pairs");
+
+  if (rawAll === null) {
+    if (rawPairs !== null) return { ok: false, detail: "pairs requires all" };
+    return { ok: true, selection: null };
+  }
+
+  const all = parseList(rawAll);
+  if (all === null) return { ok: false, detail: "all" };
+  const pairs = parseList(rawPairs ?? "");
+  if (pairs === null) return { ok: false, detail: "pairs" };
+
+  const storageIds: string[] = [];
+  for (const id of all) {
+    if (!Object.hasOwn(componentById, id)) return { ok: false, detail: id };
+    storageIds.push(STORAGE_COMPONENT_ID[id as ComponentType]);
+  }
+
+  const storagePairs: string[] = [];
+  for (const pair of pairs) {
+    // THE FIRST '/' ONLY: a model name cannot contain one (MEASURED over all 336), so the split is
+    // unambiguous, and a second '/' therefore lands in the model half where the catalog lookup
+    // refuses it.
+    const mark = pair.indexOf("/");
+    if (mark === -1) return { ok: false, detail: pair };
+    const type = pair.slice(0, mark);
+    const model = pair.slice(mark + 1);
+    if (!Object.hasOwn(componentById, type)) return { ok: false, detail: pair };
+    // THE EMPTY MODEL HALF IS REFUSED HERE AND NOWHERE ELSE. `gpu/` is not a pair the UI can
+    // build, but it IS a pair the wire can carry, and MEASURED it selects exactly the 17
+    // `model_key IS NULL` rows -- the opposite of what a model-narrowed selection means.
+    if (model === "" || !componentById[type as ComponentType].models.includes(model)) {
+      return { ok: false, detail: pair };
+    }
+    storagePairs.push(`${STORAGE_COMPONENT_ID[type as ComponentType]}/${model}`);
+  }
+
+  return { ok: true, selection: { all: storageIds, pairs: storagePairs } };
+};
+
+export const handleGetVerdicts = async (
+  db: D1Database,
+  params: URLSearchParams,
+): Promise<VerdictsResult> => {
   // THE try COVERS THE DATABASE CALL AND NOTHING ELSE. With the mapping inside it, a mapper
   // throw was reported as a storage failure -- the wrong subsystem, and the reason the
   // RangeError above was a 503 rather than one missing card.
+  // THE QUERY IS VALIDATED BEFORE THE READ, so a bad parameter costs no `rows_read` and cannot be
+  // reported as a storage failure.
+  const query = parseVerdictsQuery(params);
+  if (!query.ok) {
+    return {
+      ok: false,
+      status: 400,
+      code: "INVALID_VERDICTS_QUERY",
+      details: { detail: query.detail },
+    };
+  }
+  const selection = query.selection;
+
   let rows: VerdictRow[];
   try {
-    const read = await db
-      .prepare(SELECT_VERDICTS)
-      .bind(VERDICT_PAGE_SIZE + 1)
-      .all<VerdictRow>();
+    const read =
+      selection === null
+        ? await db.prepare(SELECT_VERDICTS).bind(VERDICT_PAGE_SIZE + 1).all<VerdictRow>()
+        : await db
+            .prepare(SELECT_VERDICTS_FILTERED)
+            .bind(
+              VERDICT_PAGE_SIZE + 1,
+              JSON.stringify(selection.all),
+              JSON.stringify(selection.pairs),
+            )
+            .all<VerdictRow>();
     rows = read.results;
   } catch {
     return { ok: false, status: 503, code: "VERDICTS_STORAGE_FAILED" };

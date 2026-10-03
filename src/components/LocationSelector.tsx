@@ -16,9 +16,36 @@ const normalizeLocationText = (text: string) =>
     .replace(/[^a-z0-9]+/g, " ")
     .trim();
 
+/**
+ * Great-circle distance in kilometres. The mean Earth radius is enough: this picks a NEAREST
+ * ENTRY out of 37 cities tens of kilometres apart, so ellipsoidal precision would change no
+ * answer.
+ */
+const distanceKm = (
+  first: { latitude: number; longitude: number },
+  second: { latitude: number; longitude: number },
+): number => {
+  const radians = (degrees: number) => (degrees * Math.PI) / 180;
+  const deltaLatitude = radians(second.latitude - first.latitude);
+  const deltaLongitude = radians(second.longitude - first.longitude);
+  const haversine =
+    Math.sin(deltaLatitude / 2) ** 2 +
+    Math.cos(radians(first.latitude)) *
+      Math.cos(radians(second.latitude)) *
+      Math.sin(deltaLongitude / 2) ** 2;
+  return 6371 * 2 * Math.asin(Math.min(1, Math.sqrt(haversine)));
+};
+
+/** The nearest committed market to a pair of coordinates. The catalog is never empty. */
+const nearestLocation = (coordinates: { latitude: number; longitude: number }) =>
+  mockLocations.reduce((nearest, candidate) =>
+    distanceKm(coordinates, candidate) < distanceKm(coordinates, nearest) ? candidate : nearest,
+  );
+
 export function LocationSelector({ value, error, onChange }: LocationSelectorProps) {
   const [query, setQuery] = useState(value?.label ?? "");
   const [locating, setLocating] = useState(false);
+  const [snappedFrom, setSnappedFrom] = useState<string | null>(null);
 
   const suggestions = useMemo(() => {
     const normalizedQuery = normalizeLocationText(query);
@@ -41,9 +68,25 @@ export function LocationSelector({ value, error, onChange }: LocationSelectorPro
 
   const selectLocation = (location: SearchLocation) => {
     setQuery(location.label);
+    setSnappedFrom(null);
     onChange(location);
   };
 
+  /**
+   * IT SNAPS TO THE NEAREST COMMITTED MARKET AND NEVER WRITES THE DEVICE'S COORDINATES, and that
+   * is two separate guards in one line.
+   *
+   * 1. PRIVACY. `migrations/0005` seeds a PUBLIC LANDMARK "chosen so that a leaked collector token
+   *    does not disclose the operator's home", and says in its own comment that the settings UI
+   *    must preserve that property. The shipped button wrote `position.coords.*` straight into the
+   *    settings object, so the first use of it put the operator's home in a row a collector
+   *    credential can read.
+   * 2. THE AGGREGATE. `market_key` buckets coordinates at 4 decimal places (~11 m), so GPS jitter
+   *    alone forks the benchmark into a new bucket on every save. A catalog entry is a fixed point.
+   *
+   * It also has to snap because `SearchLocation` now carries a `slug`: a device fix has no Facebook
+   * URL path segment, and inventing one is what §3.2 measured as accepting nonsense.
+   */
   const useCurrentLocation = () => {
     setLocating(true);
     if (!navigator.geolocation) {
@@ -53,11 +96,13 @@ export function LocationSelector({ value, error, onChange }: LocationSelectorPro
 
     navigator.geolocation.getCurrentPosition(
       (position) => {
-        selectLocation({
-          label: "Current location",
+        const nearest = nearestLocation({
           latitude: position.coords.latitude,
           longitude: position.coords.longitude,
         });
+        setQuery(nearest.label);
+        onChange(nearest);
+        setSnappedFrom(nearest.label);
         setLocating(false);
       },
       () => setLocating(false),
@@ -117,6 +162,11 @@ export function LocationSelector({ value, error, onChange }: LocationSelectorPro
         </button>
       </div>
 
+      {snappedFrom !== null && (
+        <p className="location-hint">
+          Nearest match: {snappedFrom}. Your exact coordinates are never saved.
+        </p>
+      )}
       {value && <p className="selected-location">Selected: {value.label}</p>}
       {error && (
         <p className="field-error" id="location-error" role="alert">

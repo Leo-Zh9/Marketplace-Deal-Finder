@@ -379,6 +379,47 @@ export const CATALOG_COMPONENT_ID: Record<Listing["componentType"], ComponentTyp
   case_fan: "case_fans",
 };
 
+/**
+ * THE INVERSE OF THE MAP ABOVE, AND THE LOOP IS WHAT CLOSES THE GAP THE COMMENT ABOVE NAMES.
+ * `CATALOG_COMPONENT_ID` is typed `Record<Listing["componentType"], ComponentType>`, so a new
+ * WORKER type without a mapping is a compile error and a new CATALOG id is not -- "THE REVERSE IS
+ * NOT CAUGHT". This builder catches it: a catalog id with no worker spelling throws AT MODULE
+ * LOAD rather than returning `undefined` into a SQL bind, which would store the literal string
+ * "undefined" as a `component_type` the collector then posts to `POST /api/listings` and gets 400
+ * INVALID_LISTINGS on, for every run, forever.
+ *
+ * It is exported as a FUNCTION as well as a value so the exhaustiveness loop has a killing
+ * mutation: a module-load throw cannot be asserted from a test that has already imported the
+ * module.
+ */
+export const buildStorageComponentId = (
+  catalog: readonly { id: ComponentType }[],
+): Record<ComponentType, Listing["componentType"]> => {
+  const reverse = {} as Record<ComponentType, Listing["componentType"]>;
+  for (const [storage, catalogId] of Object.entries(CATALOG_COMPONENT_ID) as [
+    Listing["componentType"],
+    ComponentType,
+  ][]) {
+    reverse[catalogId] = storage;
+  }
+  for (const entry of catalog) {
+    if (reverse[entry.id] === undefined) {
+      throw new Error(`catalogIndex: no worker component_type for catalog id "${entry.id}"`);
+    }
+  }
+  return reverse;
+};
+
+/**
+ * STORAGE VOCABULARY EXISTS ONLY INSIDE SQL STATEMENTS. The wire -- `components`, the keys of
+ * `models`, `?all`, `?pairs` -- is catalog vocabulary everywhere, and this map is the single
+ * bridge. MEASURED: validating a wire value against `CATALOG_COMPONENT_ID`'s KEYS instead (they
+ * are storage ids) makes `case_fans` a 400 and the `case_fan` spelling an uncaught TypeError --
+ * a bare 500 carrying none of `securityHeaders`.
+ */
+export const STORAGE_COMPONENT_ID: Record<ComponentType, Listing["componentType"]> =
+  buildStorageComponentId(componentCatalog);
+
 const catalogModels = (id: ComponentType): readonly string[] => {
   const definition = componentCatalog.find((entry) => entry.id === id);
   // THROWS AT MODULE LOAD rather than falling back to an empty index. An empty index answers

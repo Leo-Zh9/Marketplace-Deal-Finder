@@ -5,17 +5,31 @@ type FetchImplementation = typeof fetch;
 const API_PATH_PATTERN = /^\/api\/[A-Za-z0-9._~\-/]*$/;
 
 const resolveUrl = (path: string): string => {
+  // THE QUERY HALF IS SPLIT OFF BEFORE THE PATTERN SEES IT, AND THE PATTERN IS UNCHANGED.
+  // `API_PATH_PATTERN` has no `?`, `=`, `&` or `%`, so applying it to the whole string refused
+  // every query string: MEASURED, the shipped client answered `ApiRequestError("Invalid API
+  // path.")` with ZERO fetch calls for `/api/verdicts?all=%5B%22gpu%22%5D`, and App's catch
+  // rendered "Could not load Facebook Marketplace results" -- so server-side filtering would have
+  // been replaced by a hard error on the one button the page has.
+  //
+  // Splitting means the pattern does NOT need loosening, which is what keeps the traversal guard
+  // exactly as strict as it was. Callers build the query with `URLSearchParams`, never by hand.
+  const mark = path.indexOf("?");
+  const pathHalf = mark === -1 ? path : path.slice(0, mark);
+  const queryHalf = mark === -1 ? "" : path.slice(mark);
+
   // The traversal guard is part of the same check: "/api/../secret" matches the
-  // character class but resolves outside the API surface.
-  if (!API_PATH_PATTERN.test(path) || path.includes("..")) {
+  // character class but resolves outside the API surface. It runs on the PATH half, so a `..`
+  // inside a query VALUE is harmless and a `..` in the path still throws.
+  if (!API_PATH_PATTERN.test(pathHalf) || pathHalf.includes("..")) {
     throw new ApiRequestError("Invalid API path.", "unexpected");
   }
 
   // Read at call time, not at module load, so vi.stubEnv works.
   const base = import.meta.env.VITE_API_BASE_URL?.trim();
-  if (!base || base.startsWith("REPLACE_WITH_")) return path;
+  if (!base || base.startsWith("REPLACE_WITH_")) return pathHalf + queryHalf;
 
-  const resolved = new URL(path, base);
+  const resolved = new URL(pathHalf + queryHalf, base);
   if (resolved.origin !== new URL(base).origin) {
     throw new ApiRequestError("Invalid API path.", "unexpected");
   }
@@ -69,23 +83,32 @@ const errorForResponse = async (response: Response) => {
   );
 };
 
+export interface RequestOptions {
+  token?: string | null;
+  signal?: AbortSignal;
+  fetchImplementation?: FetchImplementation;
+  method?: "GET" | "PUT";
+  body?: unknown;
+}
+
 export const requestJson = async <T>(
   path: string,
-  options: {
-    token?: string | null;
-    signal?: AbortSignal;
-    fetchImplementation?: FetchImplementation;
-  } = {},
+  options: RequestOptions = {},
 ): Promise<T> => {
   const url = resolveUrl(path);
 
   const headers = new Headers({ Accept: "application/json" });
   if (options.token) headers.set("Authorization", `Bearer ${options.token}`);
+  // Content-Type IF AND ONLY IF there is a body: the write handlers refuse anything that is not
+  // `application/json` with a 415, and a GET carrying the header would need a wider CORS
+  // preflight than `preflightHeadersFor` grants a GET-only path.
+  if (options.body !== undefined) headers.set("Content-Type", "application/json");
 
   let response: Response;
   try {
     response = await (options.fetchImplementation ?? fetch)(url, {
-      method: "GET",
+      method: options.method ?? "GET",
+      ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
       credentials: "omit",
       // Also how a cross-origin redirect surfaces, rather than forwarding the token.
       redirect: "error",
@@ -107,7 +130,7 @@ export const requestJson = async <T>(
 export const requestJsonWithAuth = async <T>(
   path: string,
   getToken: (forceRefresh: boolean) => Promise<string | null>,
-  options: { signal?: AbortSignal; fetchImplementation?: FetchImplementation } = {},
+  options: Omit<RequestOptions, "token"> = {},
 ): Promise<T> => {
   const token = await getToken(false);
 

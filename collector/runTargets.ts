@@ -151,9 +151,15 @@ export const worstExitCode = (codes: readonly number[]): number =>
  * THE THROTTLE'S MECHANISM, AND IT LIVES HERE RATHER THAN IN main.ts BECAUSE IT IS NOT WIRING.
  *
  * MEASURED HOLE, and this constant is half of the fix: while this one line sat inline in
- * `collector/main.ts`, replacing it with `() => Promise.resolve()` left the ENTIRE unit suite
- * (156 tests) AND the whole e2e gate (79 assertions) green -- nine back-to-back searches from the
- * operator's residential IP with every check passing. Every unit test injects `sleep` and asserts
+ * `collector/main.ts`, replacing it with `() => Promise.resolve()` left the ENTIRE unit suite AND
+ * the whole e2e gate green -- nine back-to-back searches from the operator's residential IP with
+ * every check passing.
+ *
+ * THE COUNTS THAT USED TO BE IN THIS SENTENCE WERE BOTH WRONG AND ARE GONE RATHER THAN UPDATED.
+ * It said "156 tests" and "79 assertions"; at the commit this slice branched from the suite was
+ * 1,136 tests and the gate was 98 assertions, and both grow with every slice. A count that has to
+ * be re-measured on every PR to stay true is a worse record of the measurement than naming what
+ * was run, which is what the sentence above now does. Every unit test injects `sleep` and asserts
  * it was CALLED with 60000, which is correct and blind to whether the real one waits; the gate's
  * two throttle rows assert the REPORTED `delayMs`, not elapsed time.
  *

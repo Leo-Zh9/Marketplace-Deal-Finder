@@ -1,45 +1,54 @@
 import { useMemo, useState } from "react";
 import { componentById } from "../data/catalog";
+import { allSelection, noneSelection } from "../utils/validation";
 import type { ComponentType, ModelSelection } from "../types";
 
 interface ModelSelectorProps {
   componentType: ComponentType;
   selection: ModelSelection;
+  /** The query this type searches with under `mode:"all"` -- the STORED one where there is one. */
+  query: string;
   onChange: (selection: ModelSelection) => void;
 }
 
 export function ModelSelector({
   componentType,
   selection,
+  query,
   onChange,
 }: ModelSelectorProps) {
-  const [query, setQuery] = useState("");
+  const [search, setSearch] = useState("");
   const component = componentById[componentType];
   const filteredModels = useMemo(
     () =>
       component.models.filter((model) =>
-        model.toLowerCase().includes(query.trim().toLowerCase()),
+        model.toLowerCase().includes(search.trim().toLowerCase()),
       ),
-    [component.models, query],
+    [component.models, search],
   );
 
   const toggleModel = (model: string) => {
-    const values =
-      selection.mode === "all"
-        ? [...component.models]
-        : selection.mode === "selected"
-          ? selection.values
-          : [];
+    // FROM `all`, THE FIRST CLICK SELECTS THAT MODEL -- it does not deselect the other 67.
+    // MEASURED with the real component rendered: expanding `component.models` first made the first
+    // click produce 67 values -> 67 targets -> "67 of 9 searches used" and a disabled Save, so the
+    // budget was unreachable in one click. It is also what the user means by ticking one model.
+    if (selection.mode === "all") {
+      onChange({ mode: "selected", values: [model] });
+      return;
+    }
+    const values = selection.mode === "selected" ? selection.values : [];
     const nextValues = values.includes(model)
       ? values.filter((value) => value !== model)
       : [...values, model];
 
     onChange(
+      // `values` IS EMPTY UNDER `all`: one of the four sites the shipped code broke the wire
+      // invariant at by writing `[...component.models]` here.
       nextValues.length === component.models.length
-        ? { mode: "all", values: [...component.models] }
+        ? allSelection()
         : nextValues.length > 0
           ? { mode: "selected", values: nextValues }
-          : { mode: "none", values: [] },
+          : noneSelection(),
     );
   };
 
@@ -61,13 +70,30 @@ export function ModelSelector({
       </summary>
 
       <div className="model-selector__body">
+        {/*
+         * THE QUERY IS SHOWN, NOT HIDDEN. The operator's live rows are free-text queries this form
+         * cannot author -- `ryzen`, `ddr4 ram` -- and a form that saves a query it never displayed
+         * is how one gets rewritten. Under `all` this is the one search the type spends; under
+         * `selected` it is one search per model, which is what builds a price benchmark.
+         */}
+        {selection.mode === "all" ? (
+          <p className="muted-copy">
+            Searches Facebook for “{query}” — one search for all {component.models.length} models.
+          </p>
+        ) : selection.mode === "selected" ? (
+          <p className="muted-copy">
+            One search per model. A model-named search returns that model&rsquo;s listings instead
+            of a page of assorted {component.label} cards, which is what builds a price benchmark.
+          </p>
+        ) : null}
+
         <label className="search-field">
           <span className="sr-only">Search {component.label} models</span>
           <input
             type="search"
-            value={query}
+            value={search}
             placeholder={`Search ${component.label} models`}
-            onChange={(event) => setQuery(event.target.value)}
+            onChange={(event) => setSearch(event.target.value)}
           />
         </label>
 
@@ -75,13 +101,7 @@ export function ModelSelector({
           <input
             checked={selection.mode === "all"}
             type="checkbox"
-            onChange={(event) =>
-              onChange(
-                event.target.checked
-                  ? { mode: "all", values: [...component.models] }
-                  : { mode: "none", values: [] },
-              )
-            }
+            onChange={(event) => onChange(event.target.checked ? allSelection() : noneSelection())}
           />
           <span>Select all {component.models.length} models</span>
         </label>

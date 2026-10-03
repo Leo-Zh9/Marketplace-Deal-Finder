@@ -1,19 +1,24 @@
 import type { ComponentType, SearchLocation } from "../types";
 
-export interface FilterDefinition {
-  key: string;
-  label: string;
-  kind: "select" | "number" | "text";
-  options?: string[];
-  placeholder?: string;
-}
-
 export interface ComponentDefinition {
   id: ComponentType;
   label: string;
   description: string;
   models: string[];
-  filters: FilterDefinition[];
+  /**
+   * THE QUERY FOR A NEWLY SELECTED TYPE THAT HAS NO STORED ROW, and nothing else. It is NOT the
+   * inversion's discriminator: `worker/api/watch.ts` decides "broad or model-named" by the
+   * complement rule (is this query a catalog model name of its own type?), never by comparing
+   * against this string. That is what makes changing one of these cost one string and no data
+   * migration -- keying the inversion here would make these strings the PERSISTED FORMAT's
+   * discriminator and retroactively orphan every stored broad row of the type.
+   *
+   * `cpu` and `graphics card` are READ from migrations/0005_watch_targets.sql:78,80. The other
+   * seven are ASSUMED: a wrong-but-plausible term returns ~24 irrelevant listings, which is
+   * contained (MODEL_INDEXES is per type, so an off-target listing fails to match, lands
+   * NEEDS_REVIEW with no model_key and pollutes no model_stats) but silent.
+   */
+  searchTerm: string;
 }
 
 export const componentCatalog: ComponentDefinition[] = [
@@ -21,6 +26,7 @@ export const componentCatalog: ComponentDefinition[] = [
     id: "cpu",
     label: "CPU",
     description: "Desktop processors",
+    searchTerm: "cpu",
     models: [
       "Ryzen 9 9950X3D",
       "Ryzen 9 9900X3D",
@@ -68,15 +74,12 @@ export const componentCatalog: ComponentDefinition[] = [
       "Core i7-11700K",
       "Core i5-11600K",
     ],
-    filters: [
-      { key: "manufacturer", label: "Manufacturer", kind: "select", options: ["Any", "Intel", "AMD"] },
-      { key: "socket", label: "Socket", kind: "select", options: ["Any", "AM5", "AM4", "LGA1700"] },
-    ],
   },
   {
     id: "cpu_cooler",
     label: "CPU Cooler",
     description: "Air and liquid coolers",
+    searchTerm: "cpu cooler",
     models: [
       "Noctua NH-D15 G2",
       "Noctua NH-D15",
@@ -108,17 +111,12 @@ export const componentCatalog: ComponentDefinition[] = [
       "Arctic Liquid Freezer II 240",
       "Corsair iCUE H150i Elite Capellix",
     ],
-    filters: [
-      { key: "coolingType", label: "Cooling type", kind: "select", options: ["Any", "Air", "AIO Liquid"] },
-      { key: "supportedSocket", label: "Supported socket", kind: "select", options: ["Any", "AM5", "AM4", "LGA1700"] },
-      { key: "maximumHeight", label: "Maximum height (mm)", kind: "number", placeholder: "e.g. 160" },
-      { key: "radiatorSize", label: "Radiator size (mm)", kind: "select", options: ["Any", "120", "240", "280", "360"] },
-    ],
   },
   {
     id: "motherboard",
     label: "Motherboard",
     description: "Desktop motherboards",
+    searchTerm: "motherboard",
     models: [
       "ASUS ROG Crosshair X870E Hero",
       "MSI MPG X870E Carbon WiFi",
@@ -157,17 +155,12 @@ export const componentCatalog: ComponentDefinition[] = [
       "MSI MAG B660M Mortar WiFi",
       "ASUS ROG Strix Z590-E Gaming WiFi",
     ],
-    filters: [
-      { key: "socket", label: "Socket", kind: "select", options: ["Any", "AM5", "AM4", "LGA1700"] },
-      { key: "chipset", label: "Chipset", kind: "select", options: ["Any", "B650", "X670E", "Z790", "B760"] },
-      { key: "memoryType", label: "Memory type", kind: "select", options: ["Any", "DDR5", "DDR4"] },
-      { key: "formFactor", label: "Form factor", kind: "select", options: ["Any", "ATX", "Micro ATX", "Mini ITX"] },
-    ],
   },
   {
     id: "ram",
     label: "RAM",
     description: "Desktop memory kits",
+    searchTerm: "ram",
     models: [
       "G.Skill Trident Z5 Royal Neo 64GB DDR5",
       "G.Skill Trident Z5 Neo RGB 64GB DDR5",
@@ -196,17 +189,12 @@ export const componentCatalog: ComponentDefinition[] = [
       "Crucial Ballistix 16GB DDR4",
       "TeamGroup T-Force Vulcan Z 16GB DDR4",
     ],
-    filters: [
-      { key: "memoryType", label: "Memory type", kind: "select", options: ["Any", "DDR5", "DDR4"] },
-      { key: "minimumCapacity", label: "Minimum capacity (GB)", kind: "number", placeholder: "e.g. 32" },
-      { key: "moduleCount", label: "Module count", kind: "number", placeholder: "e.g. 2" },
-      { key: "minimumSpeed", label: "Minimum speed (MT/s)", kind: "number", placeholder: "e.g. 6000" },
-    ],
   },
   {
     id: "storage",
     label: "Storage",
     description: "SSDs and hard drives",
+    searchTerm: "ssd",
     models: [
       "Samsung 9100 Pro 4TB",
       "Samsung 9100 Pro 2TB",
@@ -249,16 +237,12 @@ export const componentCatalog: ComponentDefinition[] = [
       "Seagate IronWolf 4TB HDD",
       "WD Red Plus 4TB HDD",
     ],
-    filters: [
-      { key: "storageType", label: "Storage type", kind: "select", options: ["Any", "HDD", "SATA SSD", "NVMe SSD"] },
-      { key: "minimumCapacity", label: "Minimum capacity (GB)", kind: "number", placeholder: "e.g. 1000" },
-      { key: "formFactor", label: "Form factor", kind: "select", options: ["Any", "M.2 2280", "2.5 inch", "3.5 inch"] },
-    ],
   },
   {
     id: "gpu",
     label: "GPU",
     description: "Graphics cards",
+    searchTerm: "graphics card",
     models: [
       "GeForce RTX 5090",
       "GeForce RTX 5080",
@@ -329,17 +313,12 @@ export const componentCatalog: ComponentDefinition[] = [
       "Intel Arc A750",
       "Intel Arc A580",
     ],
-    filters: [
-      { key: "manufacturer", label: "Manufacturer", kind: "select", options: ["Any", "NVIDIA", "AMD", "Intel"] },
-      { key: "minimumVram", label: "Minimum VRAM (GB)", kind: "number", placeholder: "e.g. 12" },
-      { key: "maximumLength", label: "Maximum length (mm)", kind: "number", placeholder: "e.g. 330" },
-      { key: "maximumSlotWidth", label: "Maximum slot width", kind: "number", placeholder: "e.g. 2.5" },
-    ],
   },
   {
     id: "psu",
     label: "PSU",
     description: "Power supplies",
+    searchTerm: "power supply",
     models: [
       "Corsair AX1600i",
       "Corsair HX1500i",
@@ -371,16 +350,12 @@ export const componentCatalog: ComponentDefinition[] = [
       "Thermaltake Toughpower GF1 850W",
       "Cooler Master MWE Gold 750 V2",
     ],
-    filters: [
-      { key: "minimumWattage", label: "Minimum wattage (W)", kind: "number", placeholder: "e.g. 750" },
-      { key: "formFactor", label: "Form factor", kind: "select", options: ["Any", "ATX", "SFX", "SFX-L"] },
-      { key: "requiredConnectors", label: "Required connectors", kind: "text", placeholder: "e.g. 2× 8-pin PCIe" },
-    ],
   },
   {
     id: "case",
     label: "Case",
     description: "PC enclosures",
+    searchTerm: "pc case",
     models: [
       "Fractal North XL",
       "Fractal North",
@@ -420,17 +395,12 @@ export const componentCatalog: ComponentDefinition[] = [
       "Cooler Master NR200",
       "Phanteks P400A",
     ],
-    filters: [
-      { key: "motherboardFormFactor", label: "Motherboard form factor", kind: "select", options: ["Any", "ATX", "Micro ATX", "Mini ITX"] },
-      { key: "minimumGpuClearance", label: "Minimum GPU clearance (mm)", kind: "number", placeholder: "e.g. 350" },
-      { key: "minimumCoolerClearance", label: "Minimum cooler clearance (mm)", kind: "number", placeholder: "e.g. 165" },
-      { key: "radiatorSize", label: "Radiator size (mm)", kind: "select", options: ["Any", "120", "240", "280", "360"] },
-    ],
   },
   {
     id: "case_fans",
     label: "Case Fans",
     description: "Individual fans and fan packs",
+    searchTerm: "case fan",
     models: [
       "Noctua NF-A14x25 G2 PWM",
       "Noctua NF-A12x25 PWM",
@@ -459,11 +429,6 @@ export const componentCatalog: ComponentDefinition[] = [
       "be quiet! Silent Wings 3 120mm",
       "Lian Li UNI FAN SL120",
     ],
-    filters: [
-      { key: "fanSize", label: "Fan size (mm)", kind: "select", options: ["Any", "80", "92", "120", "140"] },
-      { key: "maximumThickness", label: "Maximum thickness (mm)", kind: "number", placeholder: "e.g. 25" },
-      { key: "connector", label: "Connector", kind: "select", options: ["Any", "3-pin", "4-pin PWM"] },
-    ],
   },
 ];
 
@@ -471,51 +436,67 @@ export const componentById = Object.fromEntries(
   componentCatalog.map((component) => [component.id, component]),
 ) as Record<ComponentType, ComponentDefinition>;
 
+/**
+ * THE CLOSED SET OF MARKETS, and `slug` is why it is closed. `slug` is a Facebook URL path
+ * segment (collector/searchUrl.ts LOCATION_PATTERN is its authority), so it cannot be derived
+ * from a label at runtime: MEASURED, slugifying all 42 of the original labels produced 42
+ * strings that ALL pass both LOCATION_PATTERN and the schema's GLOB, including
+ * `100-front-street-w-toronto-on-m5j-1e3` -- a URL Facebook will never serve. A committed,
+ * reviewed slug per entry is what makes `PUT /api/watch` able to refuse nonsense.
+ *
+ * THE FIVE STREET ADDRESSES WERE DELETED. They were demo data on a type called MockLocation,
+ * and giving them their city's slug would make `100 Front Street W, Toronto` and `Toronto, ON`
+ * run the SAME Facebook search at DIFFERENT coordinates (43.6459 vs 43.6532) -- two
+ * `market_key` buckets for one market, which splits every price benchmark in that market.
+ * After the deletion there are 37 entries with 37 distinct slugs and 37 distinct
+ * (slug, lat, lon) triples, so `slug` ALONE identifies a market and resolution is one lookup.
+ *
+ * ONLY `toronto` IS VERIFIED (production collects against it). The other 36 are ASSUMED: a
+ * wrong slug most likely returns 200 with an empty results page, which the collector reports as
+ * SOURCE_EMPTY -> exit 3, indistinguishable from a quiet market. Verifying one means issuing a
+ * request to Facebook from the operator's residential IP, which this repo does not do from a
+ * test.
+ */
 export interface MockLocation extends SearchLocation {
   searchTerms: string[];
 }
 
 export const mockLocations: MockLocation[] = [
-  { label: "Toronto, ON", latitude: 43.6532, longitude: -79.3832, searchTerms: ["toronto", "gta", "m5v", "m5g", "m4y"] },
-  { label: "Mississauga, ON", latitude: 43.589, longitude: -79.6441, searchTerms: ["mississauga", "peel", "l5b", "l5m"] },
-  { label: "Brampton, ON", latitude: 43.7315, longitude: -79.7624, searchTerms: ["brampton", "peel", "l6r", "l6t"] },
-  { label: "Hamilton, ON", latitude: 43.2557, longitude: -79.8711, searchTerms: ["hamilton", "l8p", "l8s"] },
-  { label: "Waterloo, ON", latitude: 43.4643, longitude: -80.5204, searchTerms: ["waterloo", "n2l", "n2j"] },
-  { label: "Kitchener, ON", latitude: 43.4516, longitude: -80.4925, searchTerms: ["kitchener", "kw", "n2g", "n2h"] },
-  { label: "Cambridge, ON", latitude: 43.3616, longitude: -80.3144, searchTerms: ["cambridge", "galt", "hespeler", "preston", "n1r"] },
-  { label: "Guelph, ON", latitude: 43.5448, longitude: -80.2482, searchTerms: ["guelph", "n1g", "n1h"] },
-  { label: "London, ON", latitude: 42.9849, longitude: -81.2453, searchTerms: ["london ontario", "n6a", "n6g"] },
-  { label: "Burlington, ON", latitude: 43.3255, longitude: -79.799, searchTerms: ["burlington", "l7l", "l7m"] },
-  { label: "Oakville, ON", latitude: 43.4675, longitude: -79.6877, searchTerms: ["oakville", "l6h", "l6j"] },
-  { label: "Milton, ON", latitude: 43.5183, longitude: -79.8774, searchTerms: ["milton", "l9t"] },
-  { label: "Vaughan, ON", latitude: 43.8563, longitude: -79.5085, searchTerms: ["vaughan", "woodbridge", "maple", "concord", "l4l"] },
-  { label: "Markham, ON", latitude: 43.8561, longitude: -79.337, searchTerms: ["markham", "unionville", "l3r"] },
-  { label: "Richmond Hill, ON", latitude: 43.8828, longitude: -79.4403, searchTerms: ["richmond hill", "l4c"] },
-  { label: "Newmarket, ON", latitude: 44.0592, longitude: -79.4613, searchTerms: ["newmarket", "l3y"] },
-  { label: "Barrie, ON", latitude: 44.3894, longitude: -79.6903, searchTerms: ["barrie", "l4m"] },
-  { label: "Oshawa, ON", latitude: 43.8971, longitude: -78.8658, searchTerms: ["oshawa", "durham", "l1h"] },
-  { label: "Whitby, ON", latitude: 43.8975, longitude: -78.9429, searchTerms: ["whitby", "durham", "l1n"] },
-  { label: "Ajax, ON", latitude: 43.8509, longitude: -79.0204, searchTerms: ["ajax", "durham", "l1s"] },
-  { label: "Pickering, ON", latitude: 43.8384, longitude: -79.0868, searchTerms: ["pickering", "durham", "l1v"] },
-  { label: "St. Catharines, ON", latitude: 43.1594, longitude: -79.2469, searchTerms: ["st catharines", "saint catharines", "niagara", "l2r"] },
-  { label: "Niagara Falls, ON", latitude: 43.0896, longitude: -79.0849, searchTerms: ["niagara falls", "l2e"] },
-  { label: "Brantford, ON", latitude: 43.1394, longitude: -80.2644, searchTerms: ["brantford", "n3r"] },
-  { label: "Stratford, ON", latitude: 43.370, longitude: -80.9822, searchTerms: ["stratford", "n5a"] },
-  { label: "Orangeville, ON", latitude: 43.9199, longitude: -80.0943, searchTerms: ["orangeville", "l9w"] },
-  { label: "Bolton, ON", latitude: 43.8792, longitude: -79.7384, searchTerms: ["bolton", "caledon", "l7e"] },
-  { label: "Georgetown, ON", latitude: 43.6502, longitude: -79.9036, searchTerms: ["georgetown", "halton hills", "l7g"] },
-  { label: "Elmira, ON", latitude: 43.6008, longitude: -80.5597, searchTerms: ["elmira", "woolwich", "n3b"] },
-  { label: "St. Jacobs, ON", latitude: 43.5401, longitude: -80.5536, searchTerms: ["st jacobs", "saint jacobs", "woolwich", "n0b"] },
-  { label: "Fergus, ON", latitude: 43.706, longitude: -80.377, searchTerms: ["fergus", "centre wellington", "n1m"] },
-  { label: "Elora, ON", latitude: 43.6837, longitude: -80.4306, searchTerms: ["elora", "centre wellington", "n0b"] },
-  { label: "Ayr, ON", latitude: 43.2858, longitude: -80.45, searchTerms: ["ayr", "north dumfries", "n0b"] },
-  { label: "Paris, ON", latitude: 43.194, longitude: -80.3845, searchTerms: ["paris ontario", "brant", "n3l"] },
-  { label: "Ancaster, ON", latitude: 43.2178, longitude: -79.9873, searchTerms: ["ancaster", "hamilton", "l9g"] },
-  { label: "Dundas, ON", latitude: 43.2665, longitude: -79.9567, searchTerms: ["dundas", "hamilton", "l9h"] },
-  { label: "Grimsby, ON", latitude: 43.2001, longitude: -79.5619, searchTerms: ["grimsby", "niagara", "l3m"] },
-  { label: "100 Front Street W, Toronto, ON M5J 1E3", latitude: 43.6459, longitude: -79.3816, searchTerms: ["100 front street west", "union station", "m5j 1e3"] },
-  { label: "200 University Avenue W, Waterloo, ON N2L 3G1", latitude: 43.4723, longitude: -80.5449, searchTerms: ["200 university avenue west", "university of waterloo", "n2l 3g1"] },
-  { label: "100 City Centre Drive, Mississauga, ON L5B 2C9", latitude: 43.593, longitude: -79.642, searchTerms: ["100 city centre drive", "square one", "l5b 2c9"] },
-  { label: "1 King Street W, Hamilton, ON L8P 1A4", latitude: 43.2564, longitude: -79.8691, searchTerms: ["1 king street west", "l8p 1a4"] },
-  { label: "25 Main Street E, Milton, ON L9T 1N3", latitude: 43.5137, longitude: -79.8828, searchTerms: ["25 main street east", "l9t 1n3"] },
+  { label: "Toronto, ON", slug: "toronto", latitude: 43.6532, longitude: -79.3832, searchTerms: ["toronto", "gta", "m5v", "m5g", "m4y"] },
+  { label: "Mississauga, ON", slug: "mississauga", latitude: 43.589, longitude: -79.6441, searchTerms: ["mississauga", "peel", "l5b", "l5m"] },
+  { label: "Brampton, ON", slug: "brampton", latitude: 43.7315, longitude: -79.7624, searchTerms: ["brampton", "peel", "l6r", "l6t"] },
+  { label: "Hamilton, ON", slug: "hamilton", latitude: 43.2557, longitude: -79.8711, searchTerms: ["hamilton", "l8p", "l8s"] },
+  { label: "Waterloo, ON", slug: "waterloo", latitude: 43.4643, longitude: -80.5204, searchTerms: ["waterloo", "n2l", "n2j"] },
+  { label: "Kitchener, ON", slug: "kitchener", latitude: 43.4516, longitude: -80.4925, searchTerms: ["kitchener", "kw", "n2g", "n2h"] },
+  { label: "Cambridge, ON", slug: "cambridge", latitude: 43.3616, longitude: -80.3144, searchTerms: ["cambridge", "galt", "hespeler", "preston", "n1r"] },
+  { label: "Guelph, ON", slug: "guelph", latitude: 43.5448, longitude: -80.2482, searchTerms: ["guelph", "n1g", "n1h"] },
+  { label: "London, ON", slug: "london", latitude: 42.9849, longitude: -81.2453, searchTerms: ["london ontario", "n6a", "n6g"] },
+  { label: "Burlington, ON", slug: "burlington", latitude: 43.3255, longitude: -79.799, searchTerms: ["burlington", "l7l", "l7m"] },
+  { label: "Oakville, ON", slug: "oakville", latitude: 43.4675, longitude: -79.6877, searchTerms: ["oakville", "l6h", "l6j"] },
+  { label: "Milton, ON", slug: "milton", latitude: 43.5183, longitude: -79.8774, searchTerms: ["milton", "l9t"] },
+  { label: "Vaughan, ON", slug: "vaughan", latitude: 43.8563, longitude: -79.5085, searchTerms: ["vaughan", "woodbridge", "maple", "concord", "l4l"] },
+  { label: "Markham, ON", slug: "markham", latitude: 43.8561, longitude: -79.337, searchTerms: ["markham", "unionville", "l3r"] },
+  { label: "Richmond Hill, ON", slug: "richmond-hill", latitude: 43.8828, longitude: -79.4403, searchTerms: ["richmond hill", "l4c"] },
+  { label: "Newmarket, ON", slug: "newmarket", latitude: 44.0592, longitude: -79.4613, searchTerms: ["newmarket", "l3y"] },
+  { label: "Barrie, ON", slug: "barrie", latitude: 44.3894, longitude: -79.6903, searchTerms: ["barrie", "l4m"] },
+  { label: "Oshawa, ON", slug: "oshawa", latitude: 43.8971, longitude: -78.8658, searchTerms: ["oshawa", "durham", "l1h"] },
+  { label: "Whitby, ON", slug: "whitby", latitude: 43.8975, longitude: -78.9429, searchTerms: ["whitby", "durham", "l1n"] },
+  { label: "Ajax, ON", slug: "ajax", latitude: 43.8509, longitude: -79.0204, searchTerms: ["ajax", "durham", "l1s"] },
+  { label: "Pickering, ON", slug: "pickering", latitude: 43.8384, longitude: -79.0868, searchTerms: ["pickering", "durham", "l1v"] },
+  { label: "St. Catharines, ON", slug: "st-catharines", latitude: 43.1594, longitude: -79.2469, searchTerms: ["st catharines", "saint catharines", "niagara", "l2r"] },
+  { label: "Niagara Falls, ON", slug: "niagara-falls", latitude: 43.0896, longitude: -79.0849, searchTerms: ["niagara falls", "l2e"] },
+  { label: "Brantford, ON", slug: "brantford", latitude: 43.1394, longitude: -80.2644, searchTerms: ["brantford", "n3r"] },
+  { label: "Stratford, ON", slug: "stratford", latitude: 43.370, longitude: -80.9822, searchTerms: ["stratford", "n5a"] },
+  { label: "Orangeville, ON", slug: "orangeville", latitude: 43.9199, longitude: -80.0943, searchTerms: ["orangeville", "l9w"] },
+  { label: "Bolton, ON", slug: "bolton", latitude: 43.8792, longitude: -79.7384, searchTerms: ["bolton", "caledon", "l7e"] },
+  { label: "Georgetown, ON", slug: "georgetown", latitude: 43.6502, longitude: -79.9036, searchTerms: ["georgetown", "halton hills", "l7g"] },
+  { label: "Elmira, ON", slug: "elmira", latitude: 43.6008, longitude: -80.5597, searchTerms: ["elmira", "woolwich", "n3b"] },
+  { label: "St. Jacobs, ON", slug: "st-jacobs", latitude: 43.5401, longitude: -80.5536, searchTerms: ["st jacobs", "saint jacobs", "woolwich", "n0b"] },
+  { label: "Fergus, ON", slug: "fergus", latitude: 43.706, longitude: -80.377, searchTerms: ["fergus", "centre wellington", "n1m"] },
+  { label: "Elora, ON", slug: "elora", latitude: 43.6837, longitude: -80.4306, searchTerms: ["elora", "centre wellington", "n0b"] },
+  { label: "Ayr, ON", slug: "ayr", latitude: 43.2858, longitude: -80.45, searchTerms: ["ayr", "north dumfries", "n0b"] },
+  { label: "Paris, ON", slug: "paris", latitude: 43.194, longitude: -80.3845, searchTerms: ["paris ontario", "brant", "n3l"] },
+  { label: "Ancaster, ON", slug: "ancaster", latitude: 43.2178, longitude: -79.9873, searchTerms: ["ancaster", "hamilton", "l9g"] },
+  { label: "Dundas, ON", slug: "dundas", latitude: 43.2665, longitude: -79.9567, searchTerms: ["dundas", "hamilton", "l9h"] },
+  { label: "Grimsby, ON", slug: "grimsby", latitude: 43.2001, longitude: -79.5619, searchTerms: ["grimsby", "niagara", "l3m"] },
 ];
