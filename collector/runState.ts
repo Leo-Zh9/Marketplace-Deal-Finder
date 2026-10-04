@@ -268,6 +268,31 @@ export interface PairOverlap {
   of: number;
 }
 
+/**
+ * TWO WATCH ROWS ARE THE SAME SEARCH IF THEIR QUERIES NORMALISE EQUAL, AND BYTE EQUALITY WAS NOT
+ * ENOUGH.
+ *
+ * MEASURED, with the byte comparison this replaces:
+ *
+ *   "rtx" vs "rtx"   -> skipped, correctly
+ *   "rtx" vs "RTX"   -> shared 2 of 2 = 1.000, still read as a "pair"
+ *   "rtx" vs "rtx "  -> shared 2 of 2 = 1.000, still read as a "pair"
+ *
+ * AND BOTH ARE REACHABLE RATHER THAN THEORETICAL. `worker/api/watch.ts` validates a query with
+ * `typeof query === "string" && query.trim() !== ""` and then STORES THE UNTRIMMED STRING, and its
+ * `searchKey` is `JSON.stringify([componentType, query])` -- so `('gpu','rtx')` and
+ * `('cpu','rtx ')` are two distinct, storable rows. Facebook's own search trims and is
+ * case-insensitive, which is the entire premise of this guard: those two rows make ONE request.
+ *
+ * The consequence of missing them is the one the guard was written for: the pair trips on run 1,
+ * is dirty on every probe, and NEVER clears -- roughly 105 requests a day against 432, with the
+ * page blaming a generic feed for two rows that should be one.
+ *
+ * `trim()` BEFORE THE EMPTINESS TEST, so a query of `"   "` is "no query" exactly as `""` is --
+ * the same thing `worker/api/watch.ts`'s own `trim() !== ""` guard already decides.
+ */
+const searchText = (query: string): string => query.trim().toLowerCase();
+
 const freshState = (): RunState => ({
   version: 1,
   consecutive: {},
@@ -418,8 +443,9 @@ export const maxPairOverlap = (ran: readonly TargetRun[]): PairOverlap | null =>
       // never be re-measured clean: a permanent 78 % cut explained to the operator as a generic
       // feed. The real fault is two watch rows that should be one, and nothing here can say so.
       // `""` is excluded because an unvalidated row has no query to compare and two broken rows
-      // are not the same search.
-      if (a.query !== "" && a.query === b.query) continue;
+      // are not the same search. NORMALISED, not byte-compared -- see `searchText`.
+      const leftQuery = searchText(a.query);
+      if (leftQuery !== "" && leftQuery === searchText(b.query)) continue;
       const left = new Set(a.ids);
       const right = new Set(b.ids);
       if (left.size === 0 || right.size === 0) continue;
@@ -663,6 +689,8 @@ export const advanceState = (input: AdvanceInput): AdvanceResult => {
   // EXISTING CAUSES, AGAINST THIS RUN'S EVIDENCE. Evaluated against the pre-drop snapshot, so
   // one cause clearing cannot change what another cause measures in the same run.
   const dropped: string[] = [];
+  /** Causes that have become unanswerable. Removed WITHOUT resetting any counter -- see below. */
+  const unmeasurable: string[] = [];
   for (const [cause, value] of Object.entries(alarm)) {
     value.runs += 1;
 
@@ -672,6 +700,36 @@ export const advanceState = (input: AdvanceInput): AdvanceResult => {
     const present = runTargets as TargetRun[];
 
     if (cause.startsWith("feed-overlap:")) {
+      /**
+       * A PAIR WHOSE TWO ROWS NOW CARRY THE SAME QUERY IS DROPPED, NOT LEFT PINNING THE GUARD --
+       * AND THIS DEFECT WAS CREATED BY THE SAME-QUERY SKIP ITSELF.
+       *
+       * The skip lives in `maxPairOverlap`, which the `measured` test below CALLS. So editing both
+       * rows of an ALREADY-LATCHED pair down to one query makes `pair` null, which the next line
+       * reads as "not measurable" and `continue`s -- and the cause then survives every clean
+       * probe forever. MEASURED: eight consecutive spotless probe runs and `feed-overlap:a+b`
+       * still latched, with `rm ~/.marketplace-collector-state.json` the only escape.
+       *
+       * DROPPING IS THE SAME REASONING THE PRUNE ALREADY APPLIES to a cause naming a target that
+       * has left the watch list: the question the cause asks has become unanswerable, so holding
+       * the collector at 2 of 9 waiting for an answer is the one thing that cannot be right. And
+       * the queries are in hand exactly where the check is needed -- a probe always runs BOTH
+       * targets of a feed cause (`selectProbe` never splits one), so `present` has both.
+       *
+       * IT IS NOT A CLEAN PROBE AND IT DOES NOT GO THROUGH `dropped`. `dropped` means "measured
+       * clean N times" and resets the targets' `consecutive` counters so that re-latching costs
+       * fresh evidence. This is "no longer meaningful", so it leaves those counters alone --
+       * exactly as the prune does, and for the same reason: an unrelated `transient` streak at
+       * one of these targets is still real evidence about something else.
+       */
+      if (present.length > 1) {
+        const first = searchText(present[0].query);
+        if (first !== "" && present.every((target) => searchText(target.query) === first)) {
+          unmeasurable.push(cause);
+          continue;
+        }
+      }
+
       // POSITIVE EVIDENCE, and this branch always required it: both pages must have been fetched
       // and parsed (non-empty id sets) and the denominator must clear the floor. The same
       // predicate the trip uses, so "clean" and "tripped" cannot disagree about what was
@@ -761,6 +819,11 @@ export const advanceState = (input: AdvanceInput): AdvanceResult => {
       }
     }
   }
+
+  // THE UNANSWERABLE CAUSES, REMOVED AND NOTHING ELSE TOUCHED. This is the prune's treatment, not
+  // a clean probe's: the cause stopped meaning anything, which says nothing about the targets'
+  // other counters, so those stay as they are.
+  for (const cause of unmeasurable) delete alarm[cause];
 
   const causes = Object.keys(alarm).sort();
 

@@ -627,6 +627,36 @@ is "two same-query rows both run"              2 "$(grep -c '"kind":"target"' /t
 has "  ...and NO pair is measured at all"      '"overlap":null' "$(cat /tmp/e2e-collector.out)"
 has "  ...so nothing latches"                  '"alarms":[]' "$(cat /tmp/e2e-collector.out)"
 
+# THE COMPARISON IS NORMALISED, AND A TRAILING SPACE IS REACHABLE THROUGH THE SHIPPED SAVE PATH.
+# `worker/api/watch.ts` validates with `query.trim() !== ""` and then STORES THE UNTRIMMED string,
+# and its `searchKey` is `JSON.stringify([componentType, query])` -- so `('gpu','rtx')` and
+# `('cpu','rtx ')` are two distinct storable rows. Facebook trims and is case-insensitive, so
+# they are ONE search; a byte comparison read them as a pair at 1.000 forever.
+sql "DELETE FROM watch_targets;
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('dup-gpu', 'gpu', 'RTX');
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('dup-cpu', 'cpu', 'rtx ');" >/dev/null
+ingest_tables
+rm -f "$COLLECTOR_STATE"
+collect
+has "casing and spacing are one search too"    '"overlap":null' "$(cat /tmp/e2e-collector.out)"
+has "  ...so nothing latches there either"     '"alarms":[]' "$(cat /tmp/e2e-collector.out)"
+
+# AND A PAIR THAT IS ALREADY LATCHED WHEN ITS ROWS BECOME ONE SEARCH IS DROPPED, NOT PINNED.
+# The same-query skip lives in `maxPairOverlap`, which the clean test CALLS -- so without the
+# targeted drop the cause becomes unreadable rather than cleared and NO number of spotless runs
+# can release it. Hand-seeded, because reaching a latched feed cause needs ids this gate's
+# fixtures cannot vary per target.
+cat > "$COLLECTOR_STATE" <<'STATE'
+{"version":1,"consecutive":{"dup-gpu":{"sourceEmpty":0,"transient":0}},
+ "alarm":{"feed-overlap:dup-cpu+dup-gpu":{"runs":9,"cleanProbes":0}},"probe":0,"canaryRuns":3}
+STATE
+collect
+is "a latched pair that is now one search runs both" 2 "$(grep -c '"kind":"target"' /tmp/e2e-collector.out)"
+has "  ...and the unanswerable cause is DROPPED" '"alarms":[]' "$(cat /tmp/e2e-collector.out)"
+has "  ...lifting the volume cut with it"      '"canary":false' "$(cat /tmp/e2e-collector.out)"
+is "  ...and the state file holds no alarm"    '{}' "$(python3 -c "import json;print(json.dumps(json.load(open('$COLLECTOR_STATE'))['alarm']))")"
+rm -f "$COLLECTOR_STATE"
+
 echo "== exit 4 is not a clean probe: a latch survives a page that changed shape =="
 # THE PROCESS-LAYER WITNESS FOR THE MOST SERIOUS DEFECT IN THIS SLICE, and it costs one `sed` and
 # NO new committed fixture.

@@ -51,7 +51,7 @@ export interface MarketplaceClient {
    * form's defaults and saving is how a live watch list of nine rows gets replaced -- whereas a
    * failed status read must cost nothing but the badge. A-2 is the guard.
    */
-  getStatus(getToken: GetToken): Promise<CollectionStatus>;
+  getStatus(getToken: GetToken, signal?: AbortSignal): Promise<CollectionStatus>;
 }
 
 interface VerdictsResponse {
@@ -166,7 +166,14 @@ export const marketplaceClient: MarketplaceClient = {
     });
   },
 
-  getStatus(getToken) {
-    return requestJsonWithAuth<CollectionStatus>("/api/status", getToken);
+  /**
+   * `signal` IS FORWARDED, AND IT IS THE ONLY REQUEST HERE THAT NEEDS ONE. The caller polls, so
+   * an unbounded read is two hazards at once: the age it reports is attributed to a send time
+   * that may be minutes stale, and two overlapping polls can land out of order and move the
+   * displayed age BACKWARD. `apiClient.ts` forwards `options.signal` and nothing else, so without
+   * this parameter there is no way to bound either.
+   */
+  getStatus(getToken, signal) {
+    return requestJsonWithAuth<CollectionStatus>("/api/status", getToken, { signal });
   },
 };

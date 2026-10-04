@@ -708,9 +708,22 @@ describe("the collector's cross-run state", () => {
    * happen to return the same page are exactly the degradation this slice exists to detect, and
    * must still latch.
    */
+  /**
+   * THE COMPARISON IS NORMALISED, NOT BYTE-FOR-BYTE, AND THE THREE CASING/WHITESPACE ROWS BELOW
+   * ARE EACH REACHABLE THROUGH THE SHIPPED SAVE PATH. `worker/api/watch.ts` validates a query
+   * with `typeof query === "string" && query.trim() !== ""` and then stores the UNTRIMMED string,
+   * and its `searchKey` is `JSON.stringify([componentType, query])` -- so `('gpu','rtx')` and
+   * `('cpu','rtx ')` are two distinct, storable rows that make ONE Facebook request, because
+   * Facebook's search trims and is case-insensitive. A byte comparison skipped only the first of
+   * these and left the other two tripping 1.000 on every run and never clearing.
+   */
   it.each<[string, string, string, string[]]>([
     ["the same query under two types", "rtx", "rtx", []],
+    ["the same query in different case", "rtx", "RTX", []],
+    ["the same query with a trailing space", "rtx", "rtx ", []],
+    ["the same query with both", " RTX  ", "rtx", []],
     ["two different queries", "rtx", "radeon", ["feed-overlap:a+b"]],
+    ["two queries differing by more than space", "rtx", "rtx 4060", ["feed-overlap:a+b"]],
   ])("G-24: %s raises %s", (_label, queryA, queryB, expected) => {
     const feed = ids("feed", 24);
     const result = advance({
@@ -723,14 +736,97 @@ describe("the collector's cross-run state", () => {
     expect(result.causes).toEqual(expected);
   });
 
-  it("G-24b: an unvalidated row's empty query is not equal to another's", () => {
+  /**
+   * G-24b: AN EMPTY QUERY IS "NO QUERY", AND WHITESPACE IS EMPTY. `trim()` runs BEFORE the
+   * emptiness test, which is the same decision `worker/api/watch.ts`'s own `trim() !== ""` guard
+   * already makes. Two rows with nothing to compare are not "the same search", so the pair is
+   * still measured -- otherwise two unvalidated rows would silently disable the detector.
+   */
+  it.each<[string, string, string]>([
+    ["two empty queries", "", ""],
+    ["two whitespace-only queries", "   ", "\t"],
+    ["one empty and one real", "", "rtx"],
+  ])("G-24b: %s leaves the pair measured", (_label, queryA, queryB) => {
     const feed = ids("feed", 24);
     const result = advance({
-      ran: [ran("a", 0, { ids: feed, query: "" }), ran("b", 0, { ids: feed, query: "" })],
+      ran: [ran("a", 0, { ids: feed, query: queryA }), ran("b", 0, { ids: feed, query: queryB })],
     });
 
-    // Two broken rows are not "the same search", so the pair is still compared.
     expect(result.causes).toEqual(["feed-overlap:a+b"]);
+  });
+
+  /**
+   * G-25: AN ALREADY-LATCHED PAIR WHOSE ROWS BECOME ONE SEARCH IS DROPPED, NOT PINNED FOREVER.
+   *
+   * THIS DEFECT WAS CREATED BY THE SAME-QUERY SKIP ITSELF, which is why the row exists. The skip
+   * lives in `maxPairOverlap`, and the feed branch's `measured` test calls it -- so editing both
+   * rows of a latched pair down to one query makes the pair unmeasurable, which the branch read
+   * as "no evidence" and left the cause standing. MEASURED before the fix: eight consecutive
+   * spotless probe runs and `feed-overlap:a+b` survived all eight, with
+   * `rm ~/.marketplace-collector-state.json` the only escape -- a permanent 78 % volume cut the
+   * operator cannot clear by fixing the configuration that caused it.
+   *
+   * DROPPING IS THE PRUNE'S TREATMENT: the question the cause asks has become unanswerable, so
+   * holding the collector at 2 of 9 waiting for an answer is the one thing that cannot be right.
+   * IT IS NOT CREDITED AS A CLEAN PROBE -- the second assertion is that the targets' unrelated
+   * `consecutive` counters are left exactly as they were, because this says nothing about them.
+   */
+  it.each<[string, string, string]>([
+    ["byte-identical", "rtx", "rtx"],
+    ["differing only in case", "rtx", "RTX"],
+    ["differing only in whitespace", "rtx", " rtx "],
+  ])("G-25: a latched pair whose queries become %s is dropped on the next probe", (_label, queryA, queryB) => {
+    /**
+     * BOTH TARGETS EXIT 5 ON A FAILED POST, AND THAT CHOICE IS WHAT MAKES THE SECOND ASSERTION
+     * ABLE TO FAIL. MEASURED: the first draft had them exit 0, and routing this drop through the
+     * clean-probe path (which resets counters) SURVIVED -- because an exit 0 zeroes `transient`
+     * in the ordinary counter update anyway, so the reset was invisible. A test whose input
+     * cannot distinguish the two paths is not a test of the difference between them.
+     *
+     * Exit 5 after a SUCCESS parse CLIMBS `transient` instead, so whether the drop resets it is
+     * observable: 1 -> 2 and stays 2 here, or 1 -> 2 -> 0 under the mutation.
+     */
+    const result = advance({
+      state: fresh({
+        consecutive: { a: { sourceEmpty: 0, transient: 1 }, b: { sourceEmpty: 0, transient: 0 } },
+        alarm: { "feed-overlap:a+b": { runs: 9, cleanProbes: 0 } },
+      }),
+      watchList: ["a", "b", "c"],
+      ran: [
+        ran("a", 5, { reason: "ok", ids: ids("feed", 24), query: queryA }),
+        ran("b", 5, { reason: "ok", ids: ids("feed", 24), query: queryB }),
+      ],
+      canary: true,
+    });
+
+    expect(result.causes).toEqual([]);
+    expect(result.state.alarm).toEqual({});
+    // NOT CREDITED AS A CLEAN PROBE: `a`'s unrelated transient streak is real evidence about
+    // something else -- the Worker is 5xx-ing -- and it survives, exactly as it does when the
+    // prune removes a cause naming a deleted target.
+    expect(result.state.consecutive.a).toEqual({ sourceEmpty: 0, transient: 2 });
+    expect(result.state.consecutive.b).toEqual({ sourceEmpty: 0, transient: 1 });
+  });
+
+  /**
+   * G-25b: AND IT IS NOT A BACK DOOR. A latched pair whose queries are still DIFFERENT is dropped
+   * only by the ordinary clean-probe route, so this row is what stops the fix from being "any
+   * feed cause clears on the next probe".
+   */
+  it("G-25b: a latched pair with different queries still needs real clean probes", () => {
+    const state = fresh({ alarm: { "feed-overlap:a+b": { runs: 9, cleanProbes: 0 } } });
+    const dirty = advance({
+      state,
+      watchList: ["a", "b", "c"],
+      ran: [
+        ran("a", 0, { ids: ids("feed", 24), query: "rtx" }),
+        ran("b", 0, { ids: ids("feed", 24), query: "radeon" }),
+      ],
+      canary: true,
+    });
+
+    expect(dirty.causes).toEqual(["feed-overlap:a+b"]);
+    expect(dirty.state.alarm["feed-overlap:a+b"].cleanProbes).toBe(0);
   });
 
   /**
