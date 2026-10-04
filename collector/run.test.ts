@@ -264,6 +264,128 @@ describe("one collector run", () => {
     expect(timeout).toHaveBeenCalledWith(REQUEST_TIMEOUT_MS);
   });
 
+  /* ---------- the parsed listing ids, which the within-run feed check reads ---------- */
+
+  /**
+   * R-1: THE IDS ARE THE PARSED SET, NOT THE `limit` SLICE.
+   *
+   * THE MUTATION IS `selected.map(l => l.id)`, which is the natural implementation -- the slice
+   * is right there on the line above -- and it returns TWO ids here where SIX are expected,
+   * because this suite runs at `limit: 4` against a six-block page.
+   *
+   * WHY IT MATTERS BEYOND THE COUNT: the overlap threshold and its floor were both derived
+   * against a page's FULL yield (~24 listings), and `SPEC_RESULT_LIMIT = 15` is the default
+   * `COLLECTOR_LIMIT` falls back to. Under the mutation the denominator would move with an
+   * unrelated environment variable, and a threshold whose denominator moves is not a threshold.
+   * Production runs `COLLECTOR_LIMIT=50`, so the slice is inert there and no production run
+   * would ever show the difference.
+   */
+  it("R-1: listingIds carries all six parsed ids although the limit is four", async () => {
+    const { post } = recorder(okResult());
+
+    const { listingIds, summary } = await run(config, {
+      post,
+      readHtmlFile: fromHtml(facebookSearchPage),
+    });
+
+    expect(listingIds).toEqual([
+      "1807946430653887",
+      "915010494744438",
+      "913388811629562",
+      "1812246723463464",
+      "2253354775457674",
+      "1814788326341654",
+    ]);
+    expect(listingIds).toHaveLength(6);
+    // The POST really was limited to four, so the two numbers genuinely differ in this run.
+    expect(summary.posted).toBe(4);
+    expect(config.limit).toBe(4);
+  });
+
+  /**
+   * R-2: `[]` ON EVERY NON-SUCCESS PATH.
+   *
+   * THE MUTATION IS RETURNING IDS ON A PARTIAL `PROVIDER_FAILURE` -- the two variants that leave
+   * FIVE perfectly good listings in hand -- and it gives 5 ids where 0 are expected. A
+   * five-of-six page shares five with its neighbour BY CONSTRUCTION, so a partially parsed page
+   * feeding the overlap check is a false feed signal built out of the parser's own refusal.
+   *
+   * The empty row is the other end: `0/0` must be unrepresentable in the pair loop, and an empty
+   * array is what makes it so.
+   */
+  it.each<[string, string]>([
+    ["a genuinely empty market", facebookSearchEmpty],
+    ["every anchor renamed", withRenamedTypename()],
+    ["one block corrupted", withCorruptBlock()],
+    ["the body truncated mid-block", truncatedMidBlock()],
+    ["one block missing its title", withMissingTitle()],
+  ])("R-2: %s returns no listing ids at all", async (_label, html) => {
+    const { post } = recorder(okResult());
+
+    const { listingIds, exitCode } = await run(config, { post, readHtmlFile: fromHtml(html) });
+
+    expect(listingIds).toEqual([]);
+    expect(exitCode).not.toBe(0);
+  });
+
+  it("R-2: a live fetch that never produced a page returns no ids either", async () => {
+    const fetchImplementation = (async () => ({
+      status: 429,
+      headers: new Headers(),
+      text: async () => "",
+    })) as unknown as typeof fetch;
+
+    const { listingIds, exitCode } = await run(
+      { ...config, htmlFile: null },
+      { fetchImplementation },
+    );
+
+    expect(listingIds).toEqual([]);
+    expect(exitCode).toBe(5);
+  });
+
+  /**
+   * R-2b: IDS ARE RETURNED WHEN THE PARSE SUCCEEDED AND THE *POST* FAILED.
+   *
+   * THE MUTATION IS `[]` ON `!result.ok`, which reads as caution and is wrong: the page WAS
+   * fetched and WAS parsed, so the feed was really measured. It is not hypothetical either --
+   * `scripts/e2e-local.sh`'s three-target block drives one target down exactly this path (parse
+   * SUCCESS -> 400 -> not retryable -> exit 6), and under the mutation that target contributes
+   * no ids and the pair the gate measures does not exist.
+   */
+  it.each<[string, number, number]>([
+    ["a contract error", 400, 6],
+    ["a server error", 503, 5],
+  ])("R-2b: %s after a successful parse still returns the six ids", async (_label, status, exit) => {
+    const { post } = recorder({ ok: false, status, code: "SOME_CODE", retryable: status >= 500 });
+
+    const result = await run(config, { post, readHtmlFile: fromHtml(facebookSearchPage) });
+
+    expect(result.exitCode).toBe(exit);
+    expect(result.listingIds).toHaveLength(6);
+  });
+
+  /**
+   * R-3: IDS ARE RETURNED UNDER `dryRun`. INVARIANT 3.
+   *
+   * THE MUTATION IS `[]` UNDER DRY-RUN, which makes condition 3 -- the only degradation this
+   * project has actually OBSERVED -- structurally blind in exactly the mode that already reports
+   * `complete:true, exitCode:0` FOREVER WHILE COLLECTING NOTHING. A dry run still fetches and
+   * still parses; only the POST is skipped, so the measurement is real.
+   */
+  it("R-3: a dry run posts nothing and still returns the six parsed ids", async () => {
+    const { calls, post } = recorder(okResult());
+
+    const { listingIds, summary } = await run(
+      { ...config, dryRun: true },
+      { post, readHtmlFile: fromHtml(facebookSearchPage) },
+    );
+
+    expect(calls).toHaveLength(0);
+    expect(summary.dryRun).toBe(true);
+    expect(listingIds).toHaveLength(6);
+  });
+
   it("R6: a clean 200 exits 0 and its printed line says FAILED:0", async () => {
     const { post } = recorder(okResult());
 

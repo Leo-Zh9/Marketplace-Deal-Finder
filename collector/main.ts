@@ -2,11 +2,19 @@
  * The wiring, and ONLY the wiring: read the environment, call `runAllTargets`, exit.
  *
  * NO TEST COVERS THIS FILE, and that is stated rather than hidden. Every line of LOGIC it
- * touches lives in `runTargets.ts`, `watchTargets.ts` and `run.ts` and is tested there against
- * injected seams; what is left here is `process.env`, `readFile`, `console.log`, `process.exit`
- * and the live `fetch`, none of which can be exercised without a network or a process fork.
- * `npm run e2e:local` does run this file end to end with COLLECTOR_HTML_FILE set, so the wiring
- * is exercised by the gate even though no unit test reaches it.
+ * touches lives in `runTargets.ts`, `runState.ts`, `watchTargets.ts` and `run.ts` and is tested
+ * there against injected seams; what is left here is `process.env`, `readFile`, `writeFile`,
+ * `chmod`, `rename`, `console.log`, `process.exit` and the live `fetch`, none of which can be
+ * exercised without a network or a process fork. `npm run e2e:local` does run this file end to
+ * end with COLLECTOR_HTML_FILE set, so the wiring is exercised by the gate even though no unit
+ * test reaches it.
+ *
+ * THE STATE FILE'S PATH AND MODE ARE THE NEWEST VALUES ON THAT LIST, and the gate is the ONLY
+ * thing that can see either. `readState` and `writeState` are supplied from here, so a unit test
+ * injecting them is blind to which FILE a real run touches -- which is exactly the shape of the
+ * throttle hole below. E-1 asserts the real process writes the path the gate names, and §R5 of
+ * the plan records why that is correctness rather than tidiness: without it the gate's
+ * deliberately identical fixtures would latch the operator's production guard.
  *
  * `setTimeout` USED TO BE ON THAT LIST AND IT DID NOT BELONG THERE. It is exercisable with
  * neither a network nor a fork, and while it sat inline below, replacing it with
@@ -34,7 +42,10 @@
  * flag; that is measured, and it is why there is no build step for the collector.
  */
 
-import { readFile } from "node:fs/promises";
+import { chmod, readFile, rename, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { postRunHealth } from "./postRunHealth.ts";
 import { EXIT_CONFIG, run } from "./run.ts";
 import { realSleep, runAllTargets, TARGET_DELAY_MS, type ProcessConfig } from "./runTargets.ts";
 import { SPEC_RESULT_LIMIT } from "./types.ts";
@@ -74,6 +85,56 @@ const processConfig: ProcessConfig = {
   dryRun: (process.env.COLLECTOR_DRY_RUN ?? "") !== "",
 };
 
+/**
+ * THE CROSS-RUN STATE FILE, AND IT IS PROTECTED BY ITS MODE AND ITS LOCATION, NOT BY .gitignore.
+ *
+ * It lives in $HOME beside `~/.marketplace-collector.env`, which is protected the same way and
+ * for the same reason: a file inside the repository is one `git add -A` away from being
+ * committed, and `.gitignore` is a convention that a `-f` overrides. Nothing in it is a secret
+ * today -- target ids, counters and cause strings -- but it IS the guard's memory, so a
+ * world-writable copy is a way to turn the guard off or to pin it on.
+ *
+ * `COLLECTOR_STATE_FILE` EXISTS FOR THE GATE, AND THAT IS CORRECTNESS RATHER THAN TIDINESS.
+ * `scripts/e2e-local.sh` runs `node collector/main.ts` directly; without an override it would
+ * write the file the operator's real launchd collector reads, and the gate's deliberately
+ * identical fixtures would LATCH THE PRODUCTION GUARD. E-1 is the only layer that can see that.
+ */
+const STATE_FILE =
+  process.env.COLLECTOR_STATE_FILE?.trim() || join(homedir(), ".marketplace-collector-state.json");
+
+/**
+ * ABSENT IS `null`, NOT A THROW, AND IT IS THE NORMAL CASE: there is no state file until the
+ * first run writes one. Every other read error is also `null`, because `runAllTargets` treats
+ * both the same way -- a fresh state at FULL volume -- and a read that threw out of here would
+ * take the whole run with it over a file that is an optimisation, not a prerequisite.
+ */
+const readState = async (): Promise<string | null> => {
+  try {
+    return await readFile(STATE_FILE, "utf8");
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * TEMP + `rename`, AND THE `chmod` IS NOT REDUNDANT.
+ *
+ * `rename` within one filesystem is atomic, so a process killed mid-write leaves the PREVIOUS
+ * state rather than a truncated file that `parseRunState` would have to treat as fresh -- which
+ * would silently clear a latched guard on an unlucky kill.
+ *
+ * `writeFile`'s `mode` OPTION APPLIES ONLY WHEN THE FILE IS CREATED. A temp file left behind by
+ * an earlier crash is opened for truncation, not creation, so its existing mode survives and the
+ * `mode` option is a no-op. The explicit `chmod` is what makes 0600 unconditional, and it runs
+ * BEFORE the rename so the file is never visible at its final path with a wider mode.
+ */
+const writeState = async (serialized: string): Promise<void> => {
+  const temporary = `${STATE_FILE}.tmp`;
+  await writeFile(temporary, serialized, { mode: 0o600 });
+  await chmod(temporary, 0o600);
+  await rename(temporary, STATE_FILE);
+};
+
 const exitCode = await runAllTargets(
   {
     process: processConfig,
@@ -83,6 +144,13 @@ const exitCode = await runAllTargets(
   {
     fetchTargets: fetchWatchTargets,
     run: (config) => run(config, { readHtmlFile: (path: string) => readFile(path, "utf8") }),
+    readState,
+    writeState,
+    // ONE REPORT PER RUN LINE, on the SAME credential the listings POST and the watch-list GET
+    // already use. The report carries no clock: the server stamps `reported_at` itself, so a
+    // laptop whose clock is wrong cannot report itself permanently fresh.
+    postHealth: (report) =>
+      postRunHealth({ apiBase: processConfig.apiBase, token: processConfig.token, report }),
     // THE REAL SLEEP IS IMPORTED, NEVER WRITTEN HERE. Inline, it was a `setTimeout` call in the
     // one file no test reaches: replacing it with `() => Promise.resolve()` left the unit suite
     // and the whole gate green while the throttle was gone. `realSleep` is unit-tested (L-14) and

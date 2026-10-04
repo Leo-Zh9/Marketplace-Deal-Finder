@@ -12,6 +12,12 @@
  * loop above it is bounded by a list length the server returns and the cap refuses. That matters
  * more than usual because this runs on a laptop, where a bad loop is easy to start and hard to
  * notice.
+ *
+ * ONE THING WAS ADDED AND IT IS A RETURN VALUE, NOT A REQUEST. `run()` now also returns
+ * `listingIds` -- the ids the page yielded -- so that `runTargets.ts` can compare two DIFFERENT
+ * queries' results inside ONE run. No extra fetch, no extra POST, no state: the cheapest
+ * degradation signal available, and the one the only measured degradation event would have
+ * tripped. See `ListingIds` below for which paths populate it and why.
  */
 
 import { classifyParsedPage, parseSearchPage } from "./parseSearchPage.ts";
@@ -43,6 +49,27 @@ export interface RunDependencies {
   timeoutMs?: number;
 }
 
+/**
+ * THE PARSED LISTING IDS, AND THEY ARE A SIBLING OF `summary` RATHER THAN A FIELD INSIDE IT.
+ *
+ * `runTargets.ts`'s `emitTarget` spreads `...outcome.summary` straight into the per-target log
+ * line, so an id array inside `RunSummary` would put 216 ids into every run's worth of log --
+ * the one file that is the real signal history, and the file
+ * `docs/collector-ingest.md`'s shipped health check greps. Outside it, the ids reach the
+ * within-run overlap check and nothing else.
+ *
+ * POPULATED IF AND ONLY IF `classifyParsedPage` RETURNED SUCCESS, and then from
+ * `page.listings` -- every id the page yielded, BEFORE the `config.limit` slice. The slice is
+ * not the measurement: `COLLECTOR_LIMIT=50` today makes the two equal, but a limit below the
+ * page's yield would shrink the overlap denominator and silently move the threshold
+ * `collector/runState.ts` derives from a 24-listing page. R-1 is the guard.
+ *
+ * `[]` ON EVERY NON-SUCCESS PATH, which is what makes `0/0` unrepresentable in the pair loop.
+ * It IS populated when the parse succeeded and the POST then failed (R-2b) and under `dryRun`
+ * (R-3): both ran a real search against a real page, so both measured a real feed.
+ */
+export type ListingIds = readonly string[];
+
 export interface RunSummary {
   state: ProviderResultState;
   reason: ProviderReason;
@@ -69,12 +96,22 @@ export interface RunSummary {
  *   2  configuration error -- a required variable is missing. Nothing was fetched.
  *   3  SOURCE_EMPTY. Nothing was posted. Normal on a quiet day; an ALARM if it repeats, because
  *      a wholesale rename of every evidence marker is indistinguishable from it in one run.
+ *      THE ALARM NOW EXISTS AND THE NUMBER DID NOT CHANGE. `collector/runState.ts` counts
+ *      CONSECUTIVE exit 3 PER TARGET across runs and latches `source-empty:<target>` at
+ *      CONSECUTIVE_ALARM_RUNS = 3; the code this run exits with is still 3 and launchd still
+ *      reads 3. The alarm ADDS a signal (the run line's `alarms`, the health row, the page); it
+ *      does not redefine this one.
  *   4  PROVIDER_FAILURE. The page changed shape. A HUMAN MUST LOOK; nothing was posted.
  *   5  transient: the source was unavailable or rate-limited, or the POST failed with 5xx or a
  *      network error. The next run is the retry.
  *      A REPEATED EXIT 5 ACROSS RUNS IS A PERSISTENT SERVER-SIDE FAILURE, NOT A TRANSIENT ONE --
  *      measured: a one-listing batch whose only write fails answers 503 and lands here, so a
  *      total write outage carries the quieter code. Check `wrangler tail`.
+ *      THAT SENTENCE IS NOW A MECHANISM TOO: three consecutive 5s at one target latch
+ *      `transient:<target>`, and a 5 whose `reason` is `rate-limited` or `blocked-redirect`
+ *      latches `refused:<target>` ON THE FIRST OCCURRENCE -- both of those mean Facebook has
+ *      refused THIS IP, and 27 further requests over 90 minutes into an active refusal is how a
+ *      soft throttle becomes the hard block that is not recoverable by backing off.
  *   6  the POST was refused with a 4xx (a contract error), or it returned 200 while the Worker
  *      reported FAILED > 0. Either way a human must look.
  */
@@ -163,7 +200,7 @@ const fetchLivePage = async (
 export const run = async (
   config: CollectorConfig,
   dependencies: RunDependencies = {},
-): Promise<{ exitCode: number; summary: RunSummary }> => {
+): Promise<{ exitCode: number; summary: RunSummary; listingIds: ListingIds }> => {
   const post = dependencies.post ?? postListings;
 
   let html: string;
@@ -190,6 +227,8 @@ export const run = async (
           dryRun: config.dryRun,
           sourceOrdered: true,
         },
+        // Nothing was fetched, so nothing was measured. R-2's first row.
+        listingIds: [],
       };
     }
     html = fetched.html;
@@ -211,12 +250,24 @@ export const run = async (
         dryRun: config.dryRun,
         sourceOrdered: page.sourceOrdered,
       },
+      // `[]` EVEN ON THE TWO PATHS THAT HOLD FIVE GOOD LISTINGS IN HAND. A partially parsed page
+      // posts nothing, and the overlap check must not read a feed signal off a page the
+      // classifier refused -- a five-of-six page shares five with its neighbour by construction.
+      listingIds: [],
     };
   }
 
   // SORTED, THEN SLICED -- parseSearchPage already sorted, so the N kept really are the newest N
   // of what came back rather than the first N the source happened to emit.
   const selected = page.listings.slice(0, config.limit);
+
+  // `page.listings`, NEVER `selected`, AND THE TWO ARE EQUAL ONLY BY CONFIGURATION. Production
+  // runs COLLECTOR_LIMIT=50 against a ~24-listing page, so the slice is inert there -- but
+  // `SPEC_RESULT_LIMIT = 15` is the default, and under it the denominator would be 15 while
+  // runState.ts's OVERLAP_MIN_DENOMINATOR and OVERLAP_ALARM_FRACTION were both derived against
+  // the page's full yield. A threshold whose denominator moves with an unrelated environment
+  // variable is not a threshold. R-1 is the guard and it runs at `limit: 4`.
+  const listingIds: ListingIds = page.listings.map((listing) => listing.id);
 
   if (config.dryRun) {
     return {
@@ -228,6 +279,12 @@ export const run = async (
         dryRun: true,
         sourceOrdered: page.sourceOrdered,
       },
+      // IDS UNDER DRY-RUN, AND THAT IS INVARIANT 3's ANSWER IN THIS FILE. A dry run still fetches
+      // and still parses; only the POST is skipped. Returning `[]` here would make condition 3
+      // -- the one degradation this slice has actually OBSERVED -- structurally blind in exactly
+      // the mode that already reports `complete:true, exitCode:0` forever while collecting
+      // nothing. R-3 is the guard.
+      listingIds,
     };
   }
 
@@ -259,6 +316,12 @@ export const run = async (
     return {
       exitCode: result.retryable ? EXIT_TRANSIENT : EXIT_CONTRACT,
       summary: { ...base, httpStatus: result.status, code: result.code },
+      // THE PARSE SUCCEEDED AND THE *POST* FAILED, so the page was really measured and the ids
+      // are real. This is not a formality: the gate's own 3-target block drives `a-bad` down
+      // exactly this path (parse SUCCESS -> 400 -> not retryable -> exit 6), and with `[]` here
+      // that target would contribute no ids and the pair that the gate measures would not exist.
+      // R-2b is the guard.
+      listingIds,
     };
   }
 
@@ -276,5 +339,6 @@ export const run = async (
       pricesUnparsed: result.summary.pricesUnparsed,
       usage: result.summary.usage,
     },
+    listingIds,
   };
 };

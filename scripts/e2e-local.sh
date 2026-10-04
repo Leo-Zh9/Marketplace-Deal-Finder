@@ -27,6 +27,15 @@ PASS=0; FAIL=0; SERVER_PID=
 E2E_COLLECTOR_TOKEN=e2e-collector-token-4d81f0ba75c9e236
 COLLECTOR_TOKEN=${COLLECTOR_TOKEN:-}
 
+# THE SINGLE MOST DANGEROUS DEFAULT IN THE SLICE, OVERRIDDEN HERE. `run_collector` below runs
+# `node collector/main.ts` directly, and without this variable that process writes
+# `~/.marketplace-collector-state.json` -- THE FILE THE OPERATOR'S REAL launchd COLLECTOR READS.
+# This gate deliberately serves three targets the SAME fixture and runs the empty fixture three
+# times in a row, so it would LATCH THE PRODUCTION GUARD and pin real collection at 2 of 9
+# searches, discovered days later. E-1 is the only layer that can see this: no unit test reaches
+# `main.ts`, where the path is chosen.
+COLLECTOR_STATE=/tmp/e2e-collector-state.json
+
 cleanup() { [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null; }
 trap cleanup EXIT
 
@@ -220,6 +229,39 @@ is "a valid token with no Origin reads it"     200 "$(wt -H "X-Collector-Token: 
 has "  ...carrying the seeded target"          '"targetId":"e2e-gpu"' "$(body)"
 has "  ...and the market alongside it"         '"radiusKm":18' "$(body)"
 
+echo "== the health report the collector writes =="
+# E-9. THE SAME CREDENTIAL ON THE SAME TERMS AS THE TWO ROUTES ABOVE: no browser channel, no
+# Firebase identity, no Origin at all. The route WRITES the one row the page reads, so a browser
+# channel here would let any approved session forge the collector's health.
+HR='{"exitCode":0,"complete":true,"canary":false,"dryRun":false,"fixture":false,"targets":1,"alarms":[]}'
+# THE BODY IS THE FIRST PARAMETER, NOT A SECOND `-d`, AND THAT IS A MEASURED CORRECTION. The first
+# draft put `-d "$HR"` inside the helper and let callers append their own `-d` for the two bad-body
+# rows -- and curl CONCATENATES repeated `-d` with `&`, so both of those rows got
+# `{...}&{...}`, which is not JSON at all. They answered 400 INVALID_JSON and the status-only
+# assertions PASSED while measuring nothing of what they claimed. The `has` rows beside them are
+# what turned it red, which is the whole argument for pairing a status row with a body row.
+chb() { local payload="$1"; shift
+        $CURL -s -o /tmp/e2e.body -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+          "$@" -d "$payload" "$BASE/api/collector-health" --max-time 15; }
+ch() { chb "$HR" "$@"; }
+is "the health POST with NO token is refused"  401 "$(ch)"
+is "  ...with a WRONG token too"               401 "$(ch -H 'X-Collector-Token: wrong-but-long-enough-to-be-a-token')"
+is "a valid token from the ALLOWED origin"     403 "$(ch -H "X-Collector-Token: $COLLECTOR_TOKEN" -H "Origin: $ORIGIN")"
+is "a valid token from an evil origin"         403 "$(ch -H "X-Collector-Token: $COLLECTOR_TOKEN" -H "Origin: $EVIL")"
+is "the health preflight is refused"           403 "$(pf /api/collector-health POST)"
+is "a valid token with no Origin stores it"    200 "$(ch -H "X-Collector-Token: $COLLECTOR_TOKEN")"
+has "  ...and says so"                         '"stored":true' "$(body)"
+# AN UNKNOWN FIELD IS A 400, NOT A SILENTLY DROPPED ONE -- and the field that matters is
+# `reportedAt`: the server stamps its own clock, so a laptop with a wrong clock cannot report
+# itself permanently fresh.
+is "a body naming reportedAt is refused"       400 "$(chb '{"exitCode":0,"complete":true,"canary":false,"dryRun":false,"fixture":false,"targets":1,"alarms":[],"reportedAt":1}' -H "X-Collector-Token: $COLLECTOR_TOKEN")"
+has "  ...naming the field"                    '"field":"reportedAt"' "$(body)"
+# A BAD `alarms` IS 400, NOT THE 503 THE COLUMN'S OWN CHECK WOULD PRODUCE: two fixes behind one
+# code (deploy the collector vs wait for D1) sends an operator to the wrong one.
+is "alarms as a bare string is 400, not 503"   400 "$(chb '{"exitCode":0,"complete":true,"canary":false,"dryRun":false,"fixture":false,"targets":1,"alarms":"boom"}' -H "X-Collector-Token: $COLLECTOR_TOKEN")"
+has "  ...naming the field"                    '"field":"alarms"' "$(body)"
+has "  ...with its own code, not INVALID_JSON" '"code":"INVALID_COLLECTOR_HEALTH"' "$(body)"
+
 # The real thing: the collector process, against the committed fixture, over HTTP, into D1.
 #
 # COLLECTOR_COMPONENT_TYPE, COLLECTOR_LOCATION, COLLECTOR_QUERY, COLLECTOR_LATITUDE,
@@ -229,15 +271,25 @@ has "  ...and the market alongside it"         '"radiusKm":18' "$(body)"
 # its configuration out of D1 over HTTP rather than out of this file.
 COLLECTOR_EXIT=0
 run_collector() { # run_collector [EXTRA=VALUE ...]
+  # `"$@"` SITS AFTER THE HARDCODED ASSIGNMENTS ON PURPOSE AND THAT IS LOAD-BEARING: `env` applies
+  # assignments left to right, so a caller can override COLLECTOR_HTML_FILE (the empty-fixture
+  # blocks below do exactly that) with no change to this helper.
   env COLLECTOR_API_BASE="$BASE" \
       COLLECTOR_TOKEN="$COLLECTOR_TOKEN" \
       COLLECTOR_LIMIT=4 \
       COLLECTOR_HTML_FILE=collector/testing/fixtures/facebookSearchPage.html \
+      COLLECTOR_STATE_FILE="$COLLECTOR_STATE" \
       "$@" \
       node collector/main.ts >/tmp/e2e-collector.out 2>&1
   COLLECTOR_EXIT=$?
 }
 collect() { run_collector COLLECTOR_TARGET_DELAY_MS=0; }
+
+# THE GUARD'S MEMORY STARTS EMPTY ON EVERY RUN OF THIS GATE. Without this the second run of the
+# gate would start from the latches the first one left, so the blocks below would silently stop
+# testing what they say they test -- the same defect the watch-list reset at the top of this
+# section records being MEASURED once already.
+rm -f "$COLLECTOR_STATE"
 
 collect
 is "the collector run exits 0"                 0 "$COLLECTOR_EXIT"
@@ -298,6 +350,26 @@ is "  ...and no listing carries a key while not VALID" 0 \
 # structurally unreachable in one direction before this slice: every listing reported the latter.
 has "  ...and the collector reports one recorded"      '"recorded":1' "$(cat /tmp/e2e-collector.out)"
 has "  ...and one skipped-no-model"                    '"skipped-no-model":1' "$(cat /tmp/e2e-collector.out)"
+# E-1. THE STATE FILE LANDS AT THE PATH THIS GATE NAMES, AND THIS IS THE ONLY LAYER THAT CAN SEE
+# IT. `readState`/`writeState` are wired in `collector/main.ts` -- "the one file no unit test
+# reaches" -- so a unit test injecting them is blind to WHICH file a real run touches. Dropping
+# COLLECTOR_STATE_FILE from `run_collector` makes this 0, and would mean this gate had been
+# latching the operator's production guard all along.
+is "  ...and the state file is at the gate's path" 1 "$([ -f "$COLLECTOR_STATE" ] && echo 1 || echo 0)"
+# MODE 600, which is the whole of this file's protection: it lives outside the repository, so
+# `.gitignore` is not what keeps it private and `writeFile`'s own `mode` option applies only on
+# CREATE. Nothing but a real process can check this.
+is "  ...and is mode 600"                      600 "$(stat -f '%OLp' "$COLLECTOR_STATE" 2>/dev/null)"
+# E-7. THE PAGE TELLS THE TRUTH ABOUT A FIXTURE RUN. Every assertion above is green -- exit 0,
+# four listings in D1, FAILED:0 -- and the collector read a SAVED PAGE rather than Facebook. That
+# is the same lie COLLECTOR_DRY_RUN tells by a different mechanism, and before this slice
+# `/api/status` answered `{"status":"ok","phase":2}` unconditionally through all of it.
+is "  ...and /api/status now reports on it"    200 "$(code -H "Origin: $ORIGIN" "$BASE/api/status")"
+has "  ...as degraded, not ok"                 '"status":"degraded"' "$(body)"
+has "  ...naming the fixture"                  '"fixture"' "$(body)"
+has "  ...and carrying the run's own counts"   '"targets":1' "$(body)"
+has "  ...and no phase field"                  '"authentication"' "$(body)"
+is "  ...and phase is GONE from the body"      0 "$(grep -c '"phase"' /tmp/e2e.body)"
 
 collect
 is "a second run exits 0"                      0 "$COLLECTOR_EXIT"
@@ -389,8 +461,173 @@ is "  ...and the bad target wrote nothing"     0 "$(val "SELECT COUNT(*) FROM li
 has "  ...at the delay it was given"           "\"delayMs\":$MT_DELAY_MS" "$(cat /tmp/e2e-collector.out)"
 # THE MECHANISM, not the reported value: three targets means TWO real sleeps.
 atleast "  ...and REALLY slept between them (${MT_ELAPSED}ms)" "$MT_FLOOR_MS" "$MT_ELAPSED"
+# E-4. THIS BLOCK IS NOW ALSO THE PROCESS-LAYER PROOF OF OVERLAP_MIN_DENOMINATOR, AND IT COST NO
+# NEW FIXTURE, NO NEW TARGET AND NO CHANGE TO A SINGLE ROW ABOVE.
+#
+# Three targets serve the SAME committed page, so all three parse the SAME six listing ids and
+# every pair is 6 of 6 -- a coefficient of 1.000, which is the exact shape of the degradation this
+# slice exists to detect. It must NOT alarm, because the floor is 12 and six listings is half of
+# it: 0.175 x 6 is one listing of margin, which cannot tell a feed from a quiet market.
+#
+# THE SECOND ROW IS WHY THE FIRST ONE IS EVIDENCE. `"alarms":[]` ALONE is satisfied by the floor
+# working AND EQUALLY by `listingIds` never being collected, by the pair loop never running, or by
+# the whole feature being absent -- so the process layer's entire case for condition 3 would have
+# been that nothing fired. Asserting the `overlap` line the run already computes turns it into
+# absence PLUS a measurement: the computation ran, in a real process, over real parsed ids, and
+# THE FLOOR declined to alarm.
+#
+# IT IS ALSO THE PROCESS-LAYER WITNESS THAT `a-bad` CONTRIBUTES IDS. That target parses SUCCESS,
+# is refused 400 by the ingest route and exits 6 -- and its ids are still real, which is why it
+# is the `a` of the reported pair. `COLLECTOR_LIMIT=4` is set, so the 6 also pins that the ids are
+# the PARSED set and not the posted slice.
+has "  ...and no feed alarm fires below the floor" '"alarms":[]' "$(cat /tmp/e2e-collector.out)"
+has "  ...while the overlap IS measured at 6 of 6" '"overlap":{"a":"a-bad","b":"b-gpu","shared":6,"of":6}' "$(cat /tmp/e2e-collector.out)"
+has "  ...and the run was not cut"             '"canary":false' "$(cat /tmp/e2e-collector.out)"
+
+echo "== the guard: three empty runs latch, the fourth is a probe =="
+# THE ONLY PROCESS-LAYER PROOF OF THE CROSS-RUN STATE, AND THE ONLY CROSS-PROCESS PROOF OF THE
+# STATE FILE'S ROUND TRIP. It runs FIVE separate `node` processes, which is the only layer that
+# can test this at all: `readState` and `writeState` are wired in `collector/main.ts`, the one
+# file no unit test reaches -- the exact hole `realSleep` fell into.
+#
+# `collector/testing/fixtures/facebookSearchEmpty.html` IS ALREADY COMMITTED and is a real
+# 0-result capture: 2/14/2 shell markers, ZERO evidence markers, ZERO listing anchors -> the
+# classifier answers SOURCE_EMPTY / no-results -> exit 3. `collector/run.test.ts` already relies
+# on it, so no new fixture is added here.
+#
+# WHY CONDITION 1 AND NOT CONDITION 3: `COLLECTOR_HTML_FILE` is process-level, not per-target, so
+# this gate CANNOT serve two DIFFERENT pages in one run and therefore cannot produce a real feed
+# at a denominator above the floor. Condition 3's detection and recovery are unit-only (G-7,
+# G-8, G-10, G-17, G-18, G-11, G-12) and that is stated rather than papered over; E-4 above tests
+# the floor, not the trip.
+ingest_tables
+sql "DELETE FROM watch_targets;
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('x-one', 'gpu', 'graphics card');
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('y-two', 'gpu', 'rtx');
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('z-three', 'gpu', 'radeon');" >/dev/null
+rm -f "$COLLECTOR_STATE"
+
+empty_run() {
+  run_collector COLLECTOR_TARGET_DELAY_MS=0 \
+    COLLECTOR_HTML_FILE=collector/testing/fixtures/facebookSearchEmpty.html
+}
+
+# E-2. THREE RUNS OF THREE EMPTY TARGETS. Each run exits 3 and the THIRD latches.
+#
+# THREE CAUSES LATCH TOGETHER, which is what the counters being PER TARGET means: every one of the
+# three targets reaches `sourceEmpty = 3` on the same run, so `alarms` carries three entries. The
+# probe below then covers TWO of them and the third stays unmeasured and unchanged -- which is
+# also why E-3's histogram sums to 2 rather than 3.
+empty_run
+is "the first empty run exits 3"               3 "$COLLECTOR_EXIT"
+has "  ...with three empty targets"            '"targets":3,"complete":false,"exitCode":3,"exitCodes":{"3":3}' "$(cat /tmp/e2e-collector.out)"
+has "  ...and NO alarm yet"                    '"alarms":[]' "$(cat /tmp/e2e-collector.out)"
+# NO PAIR IS MEASURABLE when every page came back empty: `0/0` must be unrepresentable, so the
+# overlap is reported as null rather than as a 0-of-0 match.
+has "  ...and no measurable overlap"           '"overlap":null' "$(cat /tmp/e2e-collector.out)"
+empty_run
+is "the second empty run exits 3"              3 "$COLLECTOR_EXIT"
+has "  ...and STILL no alarm at two runs"      '"alarms":[]' "$(cat /tmp/e2e-collector.out)"
+empty_run
+is "the third empty run exits 3"               3 "$COLLECTOR_EXIT"
+has "  ...and the third run latches all three" '"alarms":["source-empty:x-one","source-empty:y-two","source-empty:z-three"]' "$(cat /tmp/e2e-collector.out)"
+# THE LATCH DOES NOT CUT THE RUN THAT PRODUCED IT: the three requests were already made by the
+# time the third consecutive failure existed. The cut starts on the next run.
+has "  ...without cutting that same run"       '"canary":false' "$(cat /tmp/e2e-collector.out)"
+# THE EXIT CODE IS UNCHANGED, which is invariant 1: the alarm ADDS a signal and never redefines
+# 0/2/3/4/5/6, and launchd still reads 3.
+is "  ...and the exit code is still 3"         3 "$COLLECTOR_EXIT"
+
+# E-3. THE FOURTH RUN IS A PROBE: two of the three targets, and `targets` still reports three.
+empty_run
+is "the fourth run is a probe and exits 3"     3 "$COLLECTOR_EXIT"
+is "  ...running TWO targets, not three"       2 "$(grep -c '"kind":"target"' /tmp/e2e-collector.out)"
+has "  ...reporting the cut and the full count" '"targets":3,"complete":false,"exitCode":3,"exitCodes":{"3":2}' "$(cat /tmp/e2e-collector.out)"
+has "  ...as a canary run"                     '"canary":true' "$(cat /tmp/e2e-collector.out)"
+has "  ...with the causes still latched"       '"source-empty:x-one"' "$(cat /tmp/e2e-collector.out)"
+# THE PAGE SAYS SO TOO, which is the whole point: the exit code is 3 either way, so the reduction
+# is only visible here and on the dashboard.
+is "  ...and /api/status reports the cut"      200 "$(code -H "Origin: $ORIGIN" "$BASE/api/status")"
+has "  ...as degraded"                         '"status":"degraded"' "$(body)"
+has "  ...naming the canary"                   '"canary"' "$(body)"
+has "  ...and the cause with its target"       '"source-empty:x-one"' "$(body)"
+has "  ...over the count the SERVER returned"  '"targets":3' "$(body)"
+
+# E-5. THE PRUNE, AND IT IS LOAD-BEARING RATHER THAN TIDY. `watch_targets` has no `enabled`
+# column, so DELETING a row is the only way to pause a search -- and a latched cause whose
+# targets are all gone would otherwise yield an EMPTY PROBE SET: a run that makes zero requests,
+# stores nothing and exits 0. The mutation (pruning `consecutive` only) produces exactly that.
+sql "DELETE FROM watch_targets;
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('e2e-gpu', 'gpu', 'graphics card');" >/dev/null
+collect
+is "replacing the watch list exits 0"          0 "$COLLECTOR_EXIT"
+is "  ...running the ONE new target"           1 "$(grep -c '"kind":"target"' /tmp/e2e-collector.out)"
+has "  ...as a FULL run, not an empty probe"   '"targets":1,"complete":true,"exitCode":0,"exitCodes":{"0":1}' "$(cat /tmp/e2e-collector.out)"
+has "  ...with the cut lifted"                 '"canary":false' "$(cat /tmp/e2e-collector.out)"
+has "  ...and the stranded causes pruned"      '"alarms":[]' "$(cat /tmp/e2e-collector.out)"
+
+# E-8. A WHOLE-RUN FAILURE STILL REPORTS, AND THIS IS THE ROW THAT CAUGHT A REAL DESIGN DEFECT.
+# The six whole-run failure paths return BEFORE the loop, so an implementation that posted health
+# after the loop posted NOTHING on a configuration error -- the page would have said nothing was
+# wrong for 45 minutes and then BLAMED THE LAPTOP (`stale`) for a bad watch list.
+HEALTH_BEFORE=$(val 'SELECT reported_at FROM collector_health WHERE id = 1')
+STATE_BEFORE=$(cksum "$COLLECTOR_STATE" | awk '{print $1}')
+sql "DELETE FROM watch_targets;
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('c01','gpu','graphics card');
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('c02','gpu','graphics card');
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('c03','gpu','graphics card');
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('c04','gpu','graphics card');
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('c05','gpu','graphics card');
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('c06','gpu','graphics card');
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('c07','gpu','graphics card');
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('c08','gpu','graphics card');
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('c09','gpu','graphics card');
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('c10','gpu','graphics card');" >/dev/null
+collect
+is "an over-the-cap list exits 2"              2 "$COLLECTOR_EXIT"
+is "  ...having run NOTHING"                   0 "$(grep -c '"kind":"target"' /tmp/e2e-collector.out)"
+has "  ...reporting the count it was given"    '"targets":10' "$(cat /tmp/e2e-collector.out)"
+is "  ...and it STILL wrote a health row"      1 "$([ "$(val 'SELECT reported_at FROM collector_health WHERE id = 1')" != "$HEALTH_BEFORE" ] && echo 1 || echo 0)"
+is "  ...and the page reads it"                200 "$(code -H "Origin: $ORIGIN" "$BASE/api/status")"
+has "  ...as degraded"                         '"status":"degraded"' "$(body)"
+has "  ...naming the exit code"                '"exit-code:2"' "$(body)"
+# AND IT WROTE NO STATE AT ALL: no targets ran, so there is no evidence. `consecutive` must not
+# reset (a cap refusal between two empty runs would otherwise launder a real streak),
+# `cleanProbes` must not advance, and `canaryRuns` must not advance because no requests were made.
+# The file's checksum is the only thing at this layer that can see the difference between "wrote
+# the same values" and "did not write".
+is "  ...while leaving the guard state untouched" "$STATE_BEFORE" "$(cksum "$COLLECTOR_STATE" | awk '{print $1}')"
+
+echo "== the dry-run trap, measured end to end =="
+# INVARIANT 3, AT THE PROCESS LAYER. With COLLECTOR_DRY_RUN set, every run emits
+# `complete:true, exitCode:0, dryRun:true` ON THE DOT and launchd's own last exit code is 0 --
+# both shipped signals report success while NOTHING WHATSOEVER IS COLLECTED.
+#
+# THE MUTATION IS SKIPPING THE HEALTH POST UNDER DRY-RUN, which is the obvious reading ("do not
+# report a run that collected nothing"). Its failure shape is the same lie in the STALE disguise:
+# the row stops being updated, the page says `stale` 45 minutes later, and "stale" reads as a
+# broken cron or a sleeping Mac rather than saying WHY.
+sql "DELETE FROM watch_targets;
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('e2e-gpu', 'gpu', 'graphics card');" >/dev/null
+ingest_tables
+DRY_BEFORE=$(val 'SELECT reported_at FROM collector_health WHERE id = 1')
+run_collector COLLECTOR_TARGET_DELAY_MS=0 COLLECTOR_DRY_RUN=1
+is "a dry run exits 0"                         0 "$COLLECTOR_EXIT"
+has "  ...reporting complete:true, exit 0"     '"targets":1,"complete":true,"exitCode":0,"exitCodes":{"0":1}' "$(cat /tmp/e2e-collector.out)"
+has "  ...and saying it was a dry run"         '"dryRun":true' "$(cat /tmp/e2e-collector.out)"
+is "  ...and it stored NOTHING"                0 "$(val 'SELECT COUNT(*) FROM listings')"
+is "  ...yet the health row WAS updated"       1 "$([ "$(val 'SELECT reported_at FROM collector_health WHERE id = 1')" != "$DRY_BEFORE" ] && echo 1 || echo 0)"
+is "  ...carrying dry_run = 1"                 1 "$(val 'SELECT dry_run FROM collector_health WHERE id = 1')"
+is "  ...and the page refuses to say ok"       200 "$(code -H "Origin: $ORIGIN" "$BASE/api/status")"
+has "  ...answering degraded"                  '"status":"degraded"' "$(body)"
+has "  ...and naming the dry run"              '"dry-run"' "$(body)"
 
 echo "== the throttle, pinned in BOTH directions =="
+# THE GUARD'S MEMORY IS CLEARED BEFORE THIS BLOCK, so the two rows below keep measuring the
+# THROTTLE and nothing else. A latch surviving from the empty-fixture block above would make
+# these runs probes, and a probe of one target reports the same `delayMs` -- so the rows would
+# still pass while measuring something else. No block here depends on another's state.
+rm -f "$COLLECTOR_STATE"
 # Two rows, and neither alone is enough. UNSET must report 60000: with the variable SET to 60000
 # a literal `0` fallback in main.ts would pass. And the 0 row is what catches a TYPO'D VARIABLE
 # NAME -- with the variable unset, COLLECTOR_TARGET_DELAY_MS and COLLECTOR_TARGET_DELY_MS both
