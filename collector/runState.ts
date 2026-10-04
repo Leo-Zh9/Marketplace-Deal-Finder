@@ -29,7 +29,7 @@
  * page) and never redefines 0/2/3/4/5/6. There is no seventh code.
  */
 
-import { EXIT_SOURCE_EMPTY, EXIT_TRANSIENT } from "./run.ts";
+import { EXIT_CONTRACT, EXIT_OK, EXIT_SOURCE_EMPTY, EXIT_TRANSIENT } from "./run.ts";
 
 /**
  * N = 3 CONSECUTIVE RUNS AT ONE TARGET, for condition 1 (exit 3) and condition 2 (exit 5) alike.
@@ -244,6 +244,15 @@ export interface TargetRun {
   reason: string | null;
   /** `run()`'s `listingIds`: every id the page yielded, or empty on a non-SUCCESS path. */
   ids: readonly string[];
+  /**
+   * THE SEARCH TEXT, AND IT IS HERE FOR EXACTLY ONE REASON: two watch rows can carry the SAME
+   * query under DIFFERENT component types, and `buildSearchUrl` does not read the component type
+   * -- so those two targets make the IDENTICAL request and must overlap 1.000 by construction.
+   * Without this field the pair trips every single run and can never clear, which is a permanent
+   * volume cut with the page blaming a generic feed for what is a duplicate configuration. It is
+   * `""` for a row that failed validation, and two empty strings are never treated as equal.
+   */
+  query: string;
 }
 
 /**
@@ -401,6 +410,16 @@ export const maxPairOverlap = (ran: readonly TargetRun[]): PairOverlap | null =>
     for (let j = i + 1; j < ran.length; j += 1) {
       const a = ran[i];
       const b = ran[j];
+      // TWO ROWS WITH THE SAME QUERY ARE NOT A PAIR, THEY ARE ONE SEARCH RUN TWICE.
+      // `collector/searchUrl.ts`'s `buildSearchUrl` reads the query, the location, the limit, the
+      // radius and the day window -- NOT the component type -- so `('gpu','rtx')` and
+      // `('cpu','rtx')` fetch the same URL and their id sets are identical by construction. The
+      // overlap would be 1.000 on every run, so the cause would latch immediately and could
+      // never be re-measured clean: a permanent 78 % cut explained to the operator as a generic
+      // feed. The real fault is two watch rows that should be one, and nothing here can say so.
+      // `""` is excluded because an unvalidated row has no query to compare and two broken rows
+      // are not the same search.
+      if (a.query !== "" && a.query === b.query) continue;
       const left = new Set(a.ids);
       const right = new Set(b.ids);
       if (left.size === 0 || right.size === 0) continue;
@@ -502,6 +521,35 @@ export const selectProbe = (state: RunState, watchList: readonly string[]): Prob
     }
   }
 
+  /**
+   * THE TOP-UP, AND IT IS WHAT MAKES `CANARY_TARGETS = 2` MEAN WHAT IT SAYS.
+   *
+   * THE DEFECT WITHOUT IT: filling by cause and stopping at the cap means ONE single-target cause
+   * yields a ONE-target probe. That is the commonest alarm there is -- a single
+   * `source-empty:<t>` -- and a one-target run makes condition 3 UNMEASURABLE, which is the
+   * exact defect `CANARY_TARGETS = 2` was chosen to prevent: "one target makes condition 3
+   * unmeasurable, so a feed alarm could latch and never prove it should clear". The guard would
+   * have been disarming its own strongest detector precisely while engaged. It also made the
+   * page's "2 of N" sentence false, since the code delivered 1.
+   *
+   * THE FILL IS FROM WATCH-LIST ORDER, which is `ORDER BY target_id` and therefore deterministic.
+   * The topped-up targets are VOLUME PARITY, NOT EVIDENCE: `advanceState` credits a cause only
+   * when that cause's own targets ran and produced positive evidence, so a filler that happens to
+   * be half of some other latched pair earns that pair nothing (G-12 is the pin).
+   *
+   * `min(CANARY_TARGETS, watchList.length)` NEVER EXCEEDS THE LIST, so volume still only ever
+   * REDUCES: `canary` below stays a STRICT-subset test, and a 2-target watch list with one cause
+   * latched tops up to 2, fails that test, and runs FULL -- no claimed reduction that did not
+   * happen. It also makes the panel's numerator exact rather than approximate: whenever `canary`
+   * is true, `indices.length === CANARY_TARGETS`, which G-22e asserts as a property.
+   */
+  const probeSize = Math.min(CANARY_TARGETS, watchList.length);
+  if (picked.size > 0) {
+    for (let position = 0; position < watchList.length && picked.size < probeSize; position += 1) {
+      picked.add(position);
+    }
+  }
+
   const canary = picked.size > 0 && picked.size < watchList.length;
 
   return {
@@ -541,10 +589,16 @@ export interface AdvanceResult {
  *
  *   cause                | measured iff                               | clean iff
  *   ---------------------|--------------------------------------------|---------------------------
- *   source-empty:t       | t ran                                      | t's exit != 3
- *   transient:t          | t ran                                      | t's exit != 5
- *   refused:t            | t ran                                      | not (exit 5 with a refusal)
+ *   source-empty:t       | t ran AND t's exit is 0 or 6               | t's exit is not 3
+ *   transient:t          | t ran AND t's exit is 0 or 6               | t's exit is not 5
+ *   refused:t            | t ran AND t's exit is 0 or 6               | not (exit 5 with a refusal)
  *   feed-overlap:a+b     | both ran, both non-empty, min >= the floor | coefficient < the fraction
+ *
+ * "MEASURED" IS POSITIVE EVIDENCE, NOT THE ABSENCE OF THE CAUSE'S OWN CODE. Exit 0 and exit 6
+ * are the only per-target codes that prove the page was fetched and parsed; 2, 3, 4 and 5
+ * measured nothing about the condition in question. The cause's own code is DIRTY (it resets the
+ * clean count); everything else is simply NOT MEASURED. See the long note at the predicate for
+ * the two failures a pure negation produced.
  *
  * MEASURED AND CLEAN -> cleanProbes += 1, and at CANARY_CLEAN_PROBES the cause is DROPPED.
  * MEASURED AND DIRTY -> cleanProbes := 0.
@@ -614,32 +668,70 @@ export const advanceState = (input: AdvanceInput): AdvanceResult => {
 
     const targets = causeTargets(cause);
     const runTargets = targets.map((targetId) => byTarget.get(targetId));
-    let measured = runTargets.every((target) => target !== undefined);
-    let clean = false;
+    if (runTargets.some((target) => target === undefined)) continue;
+    const present = runTargets as TargetRun[];
 
-    if (measured) {
-      const present = runTargets as TargetRun[];
-      if (cause.startsWith("source-empty:")) {
-        clean = present[0].exitCode !== EXIT_SOURCE_EMPTY;
-      } else if (cause.startsWith("transient:")) {
-        clean = present[0].exitCode !== EXIT_TRANSIENT;
-      } else if (cause.startsWith("refused:")) {
-        clean = !refused(present[0]);
-      } else {
-        // feed-overlap: measurable only when BOTH sets are non-empty and the floor is met, which
-        // is the same predicate the trip uses. A probe of a pair whose page came back empty
-        // measures nothing, so it earns no credit.
-        const pair = maxPairOverlap(present);
-        measured = pair !== null && pair.of >= OVERLAP_MIN_DENOMINATOR;
-        clean = pair !== null && pair.shared / pair.of < OVERLAP_ALARM_FRACTION;
+    if (cause.startsWith("feed-overlap:")) {
+      // POSITIVE EVIDENCE, and this branch always required it: both pages must have been fetched
+      // and parsed (non-empty id sets) and the denominator must clear the floor. The same
+      // predicate the trip uses, so "clean" and "tripped" cannot disagree about what was
+      // measurable. A probe of a pair whose page came back empty measures nothing.
+      const pair = maxPairOverlap(present);
+      if (pair === null || pair.of < OVERLAP_MIN_DENOMINATOR) continue;
+      if (pair.shared / pair.of >= OVERLAP_ALARM_FRACTION) {
+        value.cleanProbes = 0;
+        continue;
       }
+    } else {
+      /**
+       * DIRTY FIRST, THEN POSITIVE EVIDENCE -- AND THE ORDER OF THESE TWO CHECKS IS THE WHOLE
+       * FIX. Dirty has to reset `cleanProbes` even though a dirty code is never positive
+       * evidence of recovery, so it cannot be folded into the `measured` test.
+       */
+      const target = present[0];
+      const dirty = cause.startsWith("source-empty:")
+        ? target.exitCode === EXIT_SOURCE_EMPTY
+        : cause.startsWith("transient:")
+          ? target.exitCode === EXIT_TRANSIENT
+          : refused(target);
+
+      if (dirty) {
+        value.cleanProbes = 0;
+        continue;
+      }
+
+      /**
+       * A CLEAN PROBE NEEDS POSITIVE EVIDENCE THAT THE SOURCE WAS MEASURED, NOT MERELY THE
+       * ABSENCE OF THE CAUSE'S OWN EXIT CODE. THIS WAS A PURE NEGATION AND IT DEFEATED THE GUARD
+       * IN THE ONE CASE INVARIANT 5 CALLS UNRECOVERABLE.
+       *
+       * MEASURED, both halves:
+       *
+       *   `refused:a` latched, then two exit-4 runs -> `causes: []`. A PROVIDER_FAILURE measured
+       *   nothing -- the page changed shape and nothing was posted -- yet under a negation it was
+       *   not an exit 5 with a refusal reason, so it counted as a clean probe. Facebook
+       *   escalating a 429 into a login wall (exit 4, `blocked-redirect` is a 3xx but a
+       *   checkpoint page is a 200 of the wrong shape) therefore CLEARED the latch two runs
+       *   later and the collector went back to 9 requests per run into an active refusal.
+       *
+       *   A target alternating 3,3,3,5,5 forever held the latch on only 40 % of runs -- 232
+       *   requests over 40 runs against a 360 baseline -- because each condition treated the
+       *   OTHER condition's failure as evidence of its own recovery. That is the period-cycle
+       *   this file's own header says the design was chosen to avoid, reintroduced by the clean
+       *   predicate rather than by the latch.
+       *
+       * SO THE RULE IS THE ONE THE `feed-overlap` BRANCH ABOVE ALREADY FOLLOWED: only a run that
+       * really fetched and parsed the page is a measurement. EXIT_OK is one. EXIT_CONTRACT is
+       * one too, and that is not a loophole: at a target it is reachable ONLY after
+       * `classifyParsedPage` returned SUCCESS (`collector/run.ts` branches to it from the POST's
+       * 4xx and from `FAILED > 0`, both below the SUCCESS gate), so the SOURCE was measured and
+       * only the Worker write failed. Every other code -- 2 the row was unusable, 3 the cause's
+       * own signature, 4 the page changed shape, 5 either the cause's own signature or a POST
+       * failure that says nothing about Facebook -- is NOT MEASURED: no credit, no reset.
+       */
+      if (target.exitCode !== EXIT_OK && target.exitCode !== EXIT_CONTRACT) continue;
     }
 
-    if (!measured) continue;
-    if (!clean) {
-      value.cleanProbes = 0;
-      continue;
-    }
     value.cleanProbes += 1;
     if (value.cleanProbes >= CANARY_CLEAN_PROBES) dropped.push(cause);
   }

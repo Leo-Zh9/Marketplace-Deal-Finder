@@ -223,6 +223,13 @@ interface TargetOutcome {
    * every run's worth of the one file that is the real signal history.
    */
   listingIds?: readonly string[];
+  /**
+   * ALSO NOT LOGGED, and for a smaller reason: the query is already in the watch list the
+   * operator edits, so repeating it 216 times a day adds nothing. It reaches `advanceState` so
+   * that two rows carrying the SAME query under different component types are not read as a
+   * generic feed -- they make the identical request, so they overlap 1.000 by construction.
+   */
+  query: string;
 }
 
 /**
@@ -380,17 +387,31 @@ export const runAllTargets = async (
   const emit = async (line: RunLine): Promise<number> => {
     dependencies.log(JSON.stringify(line));
 
-    const reported = await dependencies.postHealth({
-      exitCode: line.exitCode,
-      complete: line.complete,
-      canary: line.canary,
-      dryRun: line.dryRun,
-      // `COLLECTOR_HTML_FILE` IS THE SAME LIE AS `COLLECTOR_DRY_RUN` BY A DIFFERENT MECHANISM:
-      // a punctual run, exit 0, `complete:true`, every listing stored -- off a saved page.
-      fixture: config.process.htmlFile !== null,
-      targets: line.targets,
-      alarms: line.alarms,
-    });
+    /**
+     * WRAPPED, AND THE REASON IS STRUCTURAL RATHER THAN A KNOWN BUG. `postRunHealth` catches its
+     * own `fetch` rejection, so nothing reachable throws here today -- but leaving it unwrapped
+     * makes invariant 1 ("the exit codes are the operator's only signal") rest on a CALLEE's
+     * internal discipline instead of on this function's shape. An unhandled rejection out of
+     * here would replace the operator's only signal with exit 1 and a stack trace, and launchd
+     * would record a failure for a health report. `writeState` below is wrapped for the same
+     * reason; the two seams now agree.
+     */
+    let reported: HealthPostResult;
+    try {
+      reported = await dependencies.postHealth({
+        exitCode: line.exitCode,
+        complete: line.complete,
+        canary: line.canary,
+        dryRun: line.dryRun,
+        // `COLLECTOR_HTML_FILE` IS THE SAME LIE AS `COLLECTOR_DRY_RUN` BY A DIFFERENT MECHANISM:
+        // a punctual run, exit 0, `complete:true`, every listing stored -- off a saved page.
+        fixture: config.process.htmlFile !== null,
+        targets: line.targets,
+        alarms: line.alarms,
+      });
+    } catch {
+      reported = { ok: false, reason: "threw" };
+    }
 
     if (!reported.ok) {
       dependencies.log(
@@ -551,6 +572,9 @@ export const runAllTargets = async (
         componentType: readString(raw, "componentType"),
         exitCode: EXIT_CONFIG,
         error: parsed.reason,
+        // `""` WHEN THE ROW HAD NO USABLE QUERY, and `maxPairOverlap` never treats two empty
+        // strings as equal: two broken rows are not the same search.
+        query: readString(raw, "query"),
       };
       outcomes.push(failed);
       emitTarget(failed);
@@ -573,6 +597,7 @@ export const runAllTargets = async (
         exitCode: result.exitCode,
         summary: result.summary,
         listingIds: result.listingIds,
+        query: target.query,
       };
     } catch (error) {
       // BELT AND BRACES for a throw `parseTarget` cannot anticipate. It is NOT the justification
@@ -582,6 +607,7 @@ export const runAllTargets = async (
         componentType: target.componentType,
         exitCode: EXIT_CONFIG,
         error: error instanceof Error ? error.message : String(error),
+        query: target.query,
       };
     }
 
@@ -604,6 +630,7 @@ export const runAllTargets = async (
     exitCode: outcome.exitCode,
     reason: outcome.summary?.reason ?? null,
     ids: outcome.listingIds ?? [],
+    query: outcome.query,
   }));
 
   const advanced = advanceState({
@@ -635,9 +662,21 @@ export const runAllTargets = async (
 
   const alarms = [
     ...advanced.causes,
-    // THE EXPIRY IS REPORTED AND THE ALARM STILL STANDS. It flips only `canary`; the cause is
-    // cleared only by clean probes. See MAX_CANARY_RUNS.
-    ...(plan.expired ? ["canary-expired"] : []),
+    /**
+     * THE EXPIRY IS REPORTED ONLY WHILE A CAUSE IS STILL LATCHED, AND THE EXTRA CONJUNCT IS A FIX.
+     *
+     * `plan.expired` is decided BEFORE the loop, from the state the previous run left. The expiry
+     * run is also the best possible probe -- it measures every cause and all 36 pairs -- so it is
+     * exactly the run most likely to CLEAR the last cause. Reporting `canary-expired`
+     * unconditionally therefore put an alarm on a fully recovered run: `exit 0`, nine of nine
+     * targets clean, every cause gone, and the page read `degraded` because
+     * `alarms.length > 0`. The operator's first good run in two days would have looked like a
+     * bad one.
+     *
+     * It still stands when a cause survived, which is the case it exists for: nine searches ran
+     * that run and the reduction is still in force, so the page has to say why.
+     */
+    ...(plan.expired && advanced.causes.length > 0 ? ["canary-expired"] : []),
     ...(guardBlind ? ["guard-blind"] : []),
   ].sort();
 

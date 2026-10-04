@@ -418,14 +418,27 @@ is "  ...and deleted the control observation"  0 "$(val "SELECT COUNT(*) FROM pr
 is "  ...leaving the 5080's own observation"   1 "$(val 'SELECT COUNT(*) FROM price_observations')"
 
 echo "== multi-target: a partial failure drops nothing =="
+# THE THREE QUERIES ARE DISTINCT, AND THAT IS A CORRECTION RATHER THAN A DETAIL. All three rows
+# carried 'graphics card' until the overlap guard learned that two rows with the SAME query make
+# the IDENTICAL request -- `buildSearchUrl` does not read the component type -- so they are one
+# search run three times and are correctly not a pair at all. Under that rule this block's
+# `overlap` assertion was measuring the duplicate-query case, not the feed case: it reported
+# `null` and the row went red. Distinct queries make the three genuinely different searches that
+# happen (by fixture) to return the same page, which is the actual shape of the measured
+# degradation and what E-4 claims to witness.
+#
+# NOTHING ELSE IN THIS BLOCK DEPENDS ON THE QUERY: COLLECTOR_HTML_FILE is set, so the query only
+# shapes a URL that is never fetched. The exit codes, the stored-listing counts, the wall-time
+# bound and `delayMs` are all unchanged, and the block is not resized.
+#
 # FULLY OFFLINE, NO SECOND FIXTURE. `a-bad` carries component_type='gpuu': storable (0005 puts no
 # CHECK on that column, deliberately) and refused LOUDLY by the ingest route as 400
 # INVALID_LISTINGS -> exit 6. It sorts FIRST, so the two good targets run AFTER a failure.
 ingest_tables
 sql "DELETE FROM watch_targets;
      INSERT INTO watch_targets (target_id, component_type, query) VALUES ('a-bad', 'gpuu', 'graphics card');
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('b-gpu', 'gpu', 'graphics card');
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('c-gpu', 'gpu', 'graphics card');" >/dev/null
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('b-gpu', 'gpu', 'rtx');
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('c-gpu', 'gpu', 'radeon');" >/dev/null
 # THIS BLOCK RUNS AT A REAL, NON-ZERO DELAY, AND THE WALL-TIME ASSERTION BELOW IS WHY.
 #
 # MEASURED HOLE THIS CLOSES: every unit test injects `sleep` and asserts it was CALLED with the
@@ -597,6 +610,98 @@ has "  ...naming the exit code"                '"exit-code:2"' "$(body)"
 # The file's checksum is the only thing at this layer that can see the difference between "wrote
 # the same values" and "did not write".
 is "  ...while leaving the guard state untouched" "$STATE_BEFORE" "$(cksum "$COLLECTOR_STATE" | awk '{print $1}')"
+
+echo "== two rows with the SAME query are one search, not a feed =="
+# PROCESS-LAYER WITNESS FOR THE DUPLICATE-QUERY GUARD. `buildSearchUrl` does not read the
+# component type, so these two rows fetch the IDENTICAL url and their id sets are identical by
+# construction. Without the guard the pair reports 6 of 6 and -- at a denominator above the floor
+# -- would latch every run and never clear: a permanent 78 % cut blamed on a generic feed when the
+# real fault is two watch rows that should be one.
+sql "DELETE FROM watch_targets;
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('dup-gpu', 'gpu', 'rtx');
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('dup-cpu', 'cpu', 'rtx');" >/dev/null
+ingest_tables
+rm -f "$COLLECTOR_STATE"
+collect
+is "two same-query rows both run"              2 "$(grep -c '"kind":"target"' /tmp/e2e-collector.out)"
+has "  ...and NO pair is measured at all"      '"overlap":null' "$(cat /tmp/e2e-collector.out)"
+has "  ...so nothing latches"                  '"alarms":[]' "$(cat /tmp/e2e-collector.out)"
+
+echo "== exit 4 is not a clean probe: a latch survives a page that changed shape =="
+# THE PROCESS-LAYER WITNESS FOR THE MOST SERIOUS DEFECT IN THIS SLICE, and it costs one `sed` and
+# NO new committed fixture.
+#
+# The shipped clean predicate was a pure NEGATION of the cause's own exit code, so an exit 4 --
+# the page changed shape, NOTHING was posted, nothing was measured -- counted as evidence of
+# recovery. Two of them cleared `refused:<t>` and sent the collector back to nine requests per run
+# INTO AN ACTIVE REFUSAL, which invariant 5 calls the one loss that backing off afterwards cannot
+# undo. Facebook escalating a 429 into a checkpoint page is exactly an exit 4.
+#
+# THE FIXTURE IS DERIVED IN ONE LINE FROM THE COMMITTED CAPTURE: renaming the listing anchor
+# leaves the 3 shell markers and 3 of the 4 evidence markers intact with ZERO parseable blocks,
+# which is `parser-blind` -> PROVIDER_FAILURE -> exit 4. Measured: 0 anchors, 2/14/2 shell,
+# 0/6/18/6 evidence. That is the one non-SUCCESS, non-EMPTY classification this gate can reach.
+sed 's/GroupCommerceProductItem/RenamedCommerceItem/g' \
+  collector/testing/fixtures/facebookSearchPage.html > /tmp/e2e-renamed.html
+sql "DELETE FROM watch_targets;
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('e2e-gpu', 'gpu', 'graphics card');
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('e2e-two', 'gpu', 'rtx');
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('e2e-three', 'gpu', 'radeon');" >/dev/null
+ingest_tables
+# ONE CLEAN PROBE SHORT OF CLEARING, so a single wrongly-credited run would drop the cause.
+cat > "$COLLECTOR_STATE" <<'STATE'
+{"version":1,"consecutive":{"e2e-gpu":{"sourceEmpty":0,"transient":0}},
+ "alarm":{"refused:e2e-gpu":{"runs":9,"cleanProbes":1}},"probe":0,"canaryRuns":2}
+STATE
+run_collector COLLECTOR_TARGET_DELAY_MS=0 COLLECTOR_HTML_FILE=/tmp/e2e-renamed.html
+is "a renamed-anchor page exits 4"             4 "$COLLECTOR_EXIT"
+has "  ...reporting PROVIDER_FAILURE"          '"state":"PROVIDER_FAILURE"' "$(cat /tmp/e2e-collector.out)"
+has "  ...as parser-blind"                     '"reason":"parser-blind"' "$(cat /tmp/e2e-collector.out)"
+has "  ...and the refusal latch SURVIVES it"   '"alarms":["refused:e2e-gpu"]' "$(cat /tmp/e2e-collector.out)"
+run_collector COLLECTOR_TARGET_DELAY_MS=0 COLLECTOR_HTML_FILE=/tmp/e2e-renamed.html
+has "  ...and survives a second one"           '"alarms":["refused:e2e-gpu"]' "$(cat /tmp/e2e-collector.out)"
+# ...AND THE VOLUME CUT IS STILL IN FORCE, which is the whole point: two of three targets, not
+# three of three back into a refusal.
+has "  ...with the cut still engaged"          '"canary":true' "$(cat /tmp/e2e-collector.out)"
+is "  ...running TWO of the three targets"     2 "$(grep -c '"kind":"target"' /tmp/e2e-collector.out)"
+rm -f "$COLLECTOR_STATE" /tmp/e2e-renamed.html
+
+echo "== the expiry run that CLEARS its last cause is not labelled degraded =="
+# THE STATE FILE IS HAND-WRITTEN HERE, which is the only way this gate can reach `canaryRuns = 48`
+# without 48 real runs -- and it is a second, independent proof that a real process PARSES the
+# file rather than only round-tripping its own output.
+#
+# ONE CLEAN PROBE SHORT OF CLEARING, at the volume bound. So this run is FULL (the expiry fired),
+# every target exits 0, the last cause clears -- and the run line must carry NO alarm. Reporting
+# `canary-expired` unconditionally put `degraded` on the operator's first fully recovered run.
+sql "DELETE FROM watch_targets;
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('e2e-gpu', 'gpu', 'graphics card');
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('e2e-two', 'gpu', 'rtx');
+     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('e2e-three', 'gpu', 'radeon');" >/dev/null
+ingest_tables
+cat > "$COLLECTOR_STATE" <<'STATE'
+{"version":1,"consecutive":{"e2e-gpu":{"sourceEmpty":3,"transient":0}},
+ "alarm":{"source-empty:e2e-gpu":{"runs":52,"cleanProbes":1}},"probe":0,"canaryRuns":48}
+STATE
+collect
+is "the expiry run exits 0"                    0 "$COLLECTOR_EXIT"
+is "  ...running ALL three targets"            3 "$(grep -c '"kind":"target"' /tmp/e2e-collector.out)"
+has "  ...as a full run"                       '"canary":false' "$(cat /tmp/e2e-collector.out)"
+has "  ...with the cause cleared and NO alarm" '"alarms":[]' "$(cat /tmp/e2e-collector.out)"
+is "  ...and the health row says so too"       '[]' "$(val 'SELECT alarms FROM collector_health WHERE id = 1')"
+rm -f "$COLLECTOR_STATE"
+
+echo "== an unreadable alarms column fails toward the alarm =="
+# THE COLUMN'S `alarms LIKE '[%]'` CHECK ACCEPTS `[refused:gpu-rtx]`, which is not JSON -- exactly
+# what a hand-written `wrangler d1 execute` produces, and this repository documents such a writer
+# corrupting search_revisions once already. Returning `[]` on a parse failure made the page read
+# `status:"ok", causes:[]` over a row REPORTING A REFUSAL: silence indistinguishable from health,
+# in the endpoint whose whole job is to tell those two apart.
+sql "UPDATE collector_health SET alarms='[refused:gpu-rtx]' WHERE id=1;" >/dev/null
+is "a corrupt alarms column still answers 200" 200 "$(code -H "Origin: $ORIGIN" "$BASE/api/status")"
+has "  ...as degraded, never ok"               '"status":"degraded"' "$(body)"
+has "  ...naming the unreadable list"          '"alarms-unreadable"' "$(body)"
+sql "UPDATE collector_health SET alarms='[]' WHERE id=1;" >/dev/null
 
 echo "== the dry-run trap, measured end to end =="
 # INVARIANT 3, AT THE PROCESS LAYER. With COLLECTOR_DRY_RUN set, every run emits

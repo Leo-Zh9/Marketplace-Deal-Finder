@@ -568,12 +568,48 @@ describe("the collector health row", () => {
    * that CHECK buys and why the handler's validation is the real guard. The comment in
    * `collectorHealth.ts` was corrected to say so rather than overstate the CHECK.
    */
-  it("an unparseable alarms column reads as no alarms rather than throwing", async () => {
-    await seed({ alarms: "[oops]" });
+  /**
+   * H-13: AN UNREADABLE `alarms` COLUMN IS `degraded`, NOT `ok`. IT FAILS TOWARD THE ALARM.
+   *
+   * THE MUTATION IS RETURNING `[]` ON A PARSE FAILURE, which is the obvious defensive reading and
+   * is wrong in the one direction that matters. MEASURED against the real reader:
+   * `alarms = '[refused:gpu-rtx]'` -- unquoted, so not JSON, and ACCEPTED by the column's own
+   * `alarms LIKE '[%]'` CHECK -- produced `status:"ok", causes:[]` over a row that was REPORTING
+   * A REFUSAL. Silence was indistinguishable from health in the function whose whole job is to
+   * tell those two apart, and the shape is not hypothetical: this repository already documents a
+   * hand-written `wrangler d1 execute` corrupting `search_revisions` in exactly this way.
+   *
+   * THE THIRD ROW IS THE SUBTLE ONE: a well-formed array with a number in it has LOST an alarm,
+   * and a lost alarm must not read as no alarm either.
+   */
+  it.each<[string, string]>([
+    ["unquoted text that passes the CHECK", "[refused:gpu-rtx]"],
+    // MEASURED while writing this: `["refused:gpu-rtx"` (no trailing `]`) is REFUSED by the
+    // column's own CHECK, so the seed threw. This form keeps the brackets the CHECK demands and
+    // still fails `JSON.parse` -- another measurement of exactly how little that CHECK buys.
+    ["an unterminated string inside brackets", '["refused:gpu-rtx]'],
+    ["an array with a non-string member", "[\"canary\",7]"],
+  ])("H-13: alarms stored as %s reads as degraded, never ok", async (_label, alarms) => {
+    await seed({ alarms });
 
     const result = await readCollectorHealth(database.db, now);
 
-    expect(result.status).toBe("ok");
-    expect(result.collector?.alarms).toEqual([]);
+    expect(result.status).toBe("degraded");
+    expect(result.status).not.toBe("ok");
+    expect(result.causes).toContain("alarms-unreadable");
+  });
+
+  it("H-13b: a readable array is NOT reported as unreadable", async () => {
+    await seed({ alarms: JSON.stringify(["refused:gpu-rtx"]) });
+
+    const result = await readCollectorHealth(database.db, now);
+
+    expect(result.causes).toEqual(["refused:gpu-rtx"]);
+    expect(result.causes).not.toContain("alarms-unreadable");
+    // ...and the empty case, which is the ordinary healthy row.
+    await seed({ alarms: "[]" });
+    const healthy = await readCollectorHealth(database.db, now);
+    expect(healthy.status).toBe("ok");
+    expect(healthy.causes).toEqual([]);
   });
 });

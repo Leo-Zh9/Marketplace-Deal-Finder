@@ -50,6 +50,21 @@ const initialSettings: SearchSettings = {
   },
 };
 
+/**
+ * 60 s. See the polling effect for why this page polls at all.
+ *
+ * `COLLECTOR_STALE_MINUTES` IS DUPLICATED FROM `worker/api/collectorHealth.ts` FOR THE SAME
+ * REASON `CANARY_TARGETS` IS DUPLICATED INTO THE PANEL, AND IT IS STATED RATHER THAN HIDDEN:
+ * `tsconfig.worker.json` compiles the Worker with `@cloudflare/workers-types` and
+ * `tsconfig.app.json` compiles this with DOM types, so neither can import the other. The Worker
+ * remains the AUTHORITY -- every word the badge shows is the Worker's except the single
+ * `ok` -> `stale` edge this page re-derives while a tab sits open. If the Worker's bound changes,
+ * change this with it; the only thing that would be wrong is how long an open tab takes to
+ * notice, and the next successful poll corrects it either way.
+ */
+const STATUS_POLL_MS = 60_000;
+const COLLECTOR_STALE_MINUTES = 45;
+
 const hasErrors = (errors: ValidationErrors) =>
   Object.keys(errors).length > 0;
 
@@ -108,9 +123,17 @@ function App({ identity, onSignOut, getToken }: AppProps) {
   const [previewedAt, setPreviewedAt] = useState<string | null>(null);
   const [requestError, setRequestError] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<string | null>(null);
-  /** `null` plus `collectionPending` false means the status read itself failed. */
-  const [collection, setCollection] = useState<CollectionStatus | null>(null);
+  /**
+   * THE LAST GOOD READING AND WHEN IT WAS TAKEN. `null` plus `collectionPending` false means no
+   * read has ever succeeded. `fetchedAt` is what lets the displayed age keep moving between
+   * polls and across a failed one, without ever comparing the browser's clock to the server's.
+   */
+  const [collection, setCollection] = useState<{
+    status: CollectionStatus;
+    fetchedAt: number;
+  } | null>(null);
   const [collectionPending, setCollectionPending] = useState(true);
+  const [statusNow, setStatusNow] = useState(() => Date.now());
 
   /**
    * BOTH READS, AND SAVE STAYS DISABLED UNTIL BOTH SUCCEED. MEASURED: a 503 on load plus one click
@@ -191,22 +214,76 @@ function App({ identity, onSignOut, getToken }: AppProps) {
    */
   useEffect(() => {
     let cancelled = false;
-    void (async () => {
+
+    const read = async () => {
       try {
         const status = await marketplaceClient.getStatus(getToken);
         if (cancelled) return;
-        setCollection(status);
+        setCollection({ status, fetchedAt: Date.now() });
       } catch {
+        // THE LAST GOOD READING IS KEPT ON A FAILED POLL, deliberately. Flapping the panel to
+        // "could not be read" and back on one dropped request would train the operator to ignore
+        // it; and the kept reading's age goes on GROWING, which is itself the signal. Only a page
+        // that has never had a reading says it could not be read.
         if (cancelled) return;
-        setCollection(null);
       } finally {
         if (!cancelled) setCollectionPending(false);
       }
-    })();
+    };
+
+    void read();
+
+    /**
+     * IT POLLS, AND A ONE-SHOT READ WAS A DEFECT RATHER THAN A SIMPLIFICATION.
+     *
+     * The brief establishes this page as the operator's ONLY notification channel -- no email, no
+     * push. A channel that cannot change state while it is open is the deleted panel's defect
+     * mirrored: that one could only ever say "no", and a one-shot read can only ever say what was
+     * true when the tab was opened. A dashboard left open on a second monitor would have read
+     * "Collecting -- 12 minutes ago" indefinitely, hours after collection died, which is a worse
+     * lie than saying nothing because the operator has been told it is fine.
+     *
+     * 60 s against a 30-minute collection cadence: 48 reads per hour of ONE singleton row, which
+     * `migrations/0006` already accounts for as negligible beside the 48 writes a day.
+     */
+    const timer = setInterval(() => {
+      setStatusNow(Date.now());
+      void read();
+    }, STATUS_POLL_MS);
+
     return () => {
       cancelled = true;
+      clearInterval(timer);
     };
   }, [getToken]);
+
+  /**
+   * THE DISPLAYED AGE IS DERIVED, SO THE NUMBER ON SCREEN IS NEVER FALSE.
+   *
+   * `ageMinutes` arrives from the server as "this row was N minutes old when I read it". Adding
+   * the time THIS PAGE has held that answer is skew-free: it never compares the browser's clock
+   * to the Worker's, only two readings of the browser's own. Recomputing from `reportedAt`
+   * against `Date.now()` would have made a laptop whose clock is ten minutes out report a
+   * ten-minute error in the one number the operator reads.
+   *
+   * ONLY THE `ok` -> `stale` EDGE IS RE-DERIVED LOCALLY, and the frozen precedence is why:
+   * `unknown > degraded > stale > ok` means `stale` is the ONLY word a passing clock can newly
+   * earn. A `degraded` row stays `degraded` however old it gets (that is H-10's whole point), and
+   * `unknown` is not about age at all. Without this, a page whose polls were failing would show a
+   * growing age next to the word "Collecting" -- the same contradiction one level over.
+   */
+  const displayedCollection = useMemo((): CollectionStatus | null => {
+    if (collection === null) return null;
+    const { status, fetchedAt } = collection;
+    if (status.collector === null) return status;
+
+    const ageMinutes = status.ageMinutes + Math.max(0, Math.floor((statusNow - fetchedAt) / 60_000));
+    return {
+      ...status,
+      status: status.status === "ok" && ageMinutes > COLLECTOR_STALE_MINUTES ? "stale" : status.status,
+      ageMinutes,
+    };
+  }, [collection, statusNow]);
 
   const selectedComponents = useMemo(
     () => settings.components.map((component) => componentById[component]),
@@ -754,7 +831,7 @@ function App({ identity, onSignOut, getToken }: AppProps) {
             * no listings.
             */}
           <aside className="results-column" id="preview-results">
-            <CollectionStatusPanel status={collection} pending={collectionPending} />
+            <CollectionStatusPanel status={displayedCollection} pending={collectionPending} />
 
             <section className="results-panel" aria-live="polite" aria-busy={pendingAction === "preview"}>
               <div className="results-heading">

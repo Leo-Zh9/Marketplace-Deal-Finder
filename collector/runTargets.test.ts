@@ -620,8 +620,19 @@ describe("running every target in the watch list", () => {
 
   /* ---------- the guard: the probe, the state file and the health report ---------- */
 
-  /** Nine targets, like production. `t0`..`t8`, so a cause can name a specific one. */
-  const nine = Array.from({ length: 9 }, (_value, index) => target(`t${index}`));
+  /**
+   * Nine targets, like production. `t0`..`t8`, so a cause can name a specific one.
+   *
+   * NINE DISTINCT QUERIES, BECAUSE THAT IS WHAT PRODUCTION IS -- `ryzen`, `cpu`, `radeon`, `rtx`,
+   * `graphics card`, `motherboard`, `power supply`, `ddr4 ram`, `ssd`. `target()`'s default query
+   * is shared, and nine rows sharing one query are not nine searches: they make the IDENTICAL
+   * request, so `maxPairOverlap` correctly refuses to call them a feed. MEASURED: leaving the
+   * default here turned L-23 and L-23b red, which is the guard working on a fixture that did not
+   * look like production.
+   */
+  const nine = Array.from({ length: 9 }, (_value, index) =>
+    target(`t${index}`, "gpu", `query-${index}`),
+  );
 
   /**
    * L-15: A LATCHED CAUSE MAKES THE NEXT RUN A PROBE OF THAT CAUSE'S TARGETS.
@@ -641,12 +652,16 @@ describe("running every target in the watch list", () => {
       }),
     });
 
-    expect(runCalls.map(targetIdOf)).toEqual(["t4"]);
+    // THE CAUSE'S OWN TARGET IS ALWAYS IN THE SET, and the second is topped up from watch-list
+    // order so the probe is a PAIR -- without which condition 3 is unmeasurable while the guard
+    // is engaged, which is the defect CANARY_TARGETS = 2 exists to prevent.
+    expect(runCalls.map(targetIdOf)).toEqual(["t0", "t4"]);
+    expect(runCalls.map(targetIdOf)).toContain("t4");
     expect(runLine.canary).toBe(true);
     expect(runLine.targets).toBe(9);
-    expect(runLine.exitCodes).toEqual({ "0": 1 });
-    // ONE target means ZERO sleeps: the throttle is between targets that RAN.
-    expect(sleeps).toEqual([]);
+    expect(runLine.exitCodes).toEqual({ "0": 2 });
+    // TWO targets means exactly ONE sleep: the throttle is between targets that RAN.
+    expect(sleeps).toEqual([60_000]);
     expect(exitCode).toBe(0);
   });
 
@@ -689,7 +704,7 @@ describe("running every target in the watch list", () => {
       state: stateFile({ alarm: { "source-empty:t4": { runs: 4, cleanProbes: 0 } } }),
     });
 
-    expect(runLine.exitCodes).toEqual({ "0": 1 });
+    expect(runLine.exitCodes).toEqual({ "0": 2 });
     expect(runLine.exitCode).toBe(0);
     expect(runLine.complete).toBe(false);
   });
@@ -943,6 +958,92 @@ describe("running every target in the watch list", () => {
   });
 
   /**
+   * L-29: `canary-expired` IS REPORTED ONLY WHILE A CAUSE IS STILL LATCHED.
+   *
+   * THE MUTATION IS APPENDING IT WHENEVER THE EXPIRY FIRED, and the failure shape is the one that
+   * matters most on a page whose whole job is to be believed: the expiry run is ALSO the best
+   * possible probe -- it measures every cause and all 36 pairs -- so it is the run most likely to
+   * clear the LAST cause. Under the mutation the operator's first fully recovered run in two days
+   * reads `degraded`, with nine of nine targets clean, exit 0 and every cause gone.
+   *
+   * BOTH ROWS ARE NEEDED. The second is what stops the fix being "never report it": while a cause
+   * survives, nine searches ran and the reduction is still in force, so the page has to say why.
+   */
+  it("L-29: an expiry run that CLEARS its last cause reports no alarm at all", async () => {
+    const { runLine, savedState, exitCode } = await harness({
+      targets: nine,
+      state: stateFile({
+        canaryRuns: MAX_CANARY_RUNS,
+        // One clean probe short of clearing, so this full run finishes the job.
+        alarm: { "source-empty:t4": { runs: 52, cleanProbes: 1 } },
+      }),
+    });
+
+    expect(exitCode).toBe(0);
+    expect(runLine.complete).toBe(true);
+    expect(savedState?.alarm).toEqual({});
+    // THE ASSERTION: a recovered run is not labelled degraded by its own recovery.
+    expect(runLine.alarms).toEqual([]);
+    expect(runLine.canary).toBe(false);
+  });
+
+  it("L-29b: an expiry run whose cause SURVIVES still reports canary-expired", async () => {
+    const { runLine } = await harness({
+      targets: nine,
+      codes: [0, 0, 0, 0, 3, 0, 0, 0, 0],
+      state: stateFile({
+        canaryRuns: MAX_CANARY_RUNS,
+        alarm: { "source-empty:t4": { runs: 52, cleanProbes: 0 } },
+      }),
+    });
+
+    expect(runLine.alarms).toEqual(["canary-expired", "source-empty:t4"]);
+  });
+
+  /**
+   * L-30: A THROWING `postHealth` DOES NOT TAKE THE PROCESS WITH IT.
+   *
+   * UNREACHABLE TODAY AND WRAPPED ANYWAY, and the reason is structural rather than a known bug.
+   * `postRunHealth` catches its own `fetch` rejection, so nothing shipped throws here -- but
+   * leaving it unwrapped makes invariant 1 ("the exit codes are the operator's only signal") rest
+   * on a CALLEE's internal discipline instead of on this function's shape. An unhandled rejection
+   * out of `emit` would replace the operator's only signal with exit 1 and a stack trace, and
+   * launchd would record a failure for a HEALTH REPORT while every target succeeded.
+   *
+   * THE MUTATION IS REMOVING THE try, which makes this row reject rather than resolve.
+   * `writeState` is wrapped for the same reason; the two seams now agree.
+   */
+  it("L-30: a postHealth that THROWS leaves the exit code alone and logs the reason", async () => {
+    const lines: string[] = [];
+    const { runAllTargetsExitCode, healthLines } = await (async () => {
+      const dependencies: RunAllTargetsDependencies = {
+        fetchTargets: async () => ({ ok: true, market, targets: [target("only")] }),
+        run: async () => ({ exitCode: 0, summary: summaryFor(0), listingIds: [] }),
+        sleep: async () => undefined,
+        log: (line) => lines.push(line),
+        readState: async () => null,
+        writeState: async () => undefined,
+        postHealth: () => {
+          throw new Error("the health client exploded");
+        },
+      };
+
+      const code = await runAllTargets(
+        { process: processConfig, delayMs: 0 },
+        dependencies,
+      );
+      const parsed = lines.map((line) => JSON.parse(line) as Record<string, unknown>);
+      return {
+        runAllTargetsExitCode: code,
+        healthLines: parsed.filter((line) => line.kind === "run-health"),
+      };
+    })();
+
+    expect(runAllTargetsExitCode).toBe(0);
+    expect(healthLines).toEqual([{ kind: "run-health", reported: false, reason: "threw" }]);
+  });
+
+  /**
    * L-28: THE `reason` REACHES `advanceState`, SO A REFUSAL LATCHES ON THE FIRST OCCURRENCE.
    *
    * THIS ROW EXISTS BECAUSE A MUTATION SURVIVED WITHOUT IT. `collector/runState.test.ts` G-6
@@ -972,7 +1073,8 @@ describe("running every target in the watch list", () => {
       state: JSON.stringify(first.savedState),
     });
 
-    expect(second.runCalls.map(targetIdOf)).toEqual(["t2"]);
+    expect(second.runCalls.map(targetIdOf)).toEqual(["t0", "t2"]);
+    expect(second.runCalls.map(targetIdOf)).toContain("t2");
     expect(second.runLine.canary).toBe(true);
   });
 
