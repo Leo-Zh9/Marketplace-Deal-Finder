@@ -1184,6 +1184,96 @@ describe("the control panel", () => {
   });
 
   /**
+   * A-8: A SLOW RESPONSE'S AGE IS ATTRIBUTED TO WHEN THE REQUEST WAS SENT, NOT WHEN IT ARRIVED.
+   *
+   * `ageMinutes` is the Worker's answer to "how old was this row WHEN I READ IT", so it belongs
+   * to the SEND time. Stamping `fetchedAt` after the await discards the latency silently, and
+   * the page then reads HEALTHIER THAN THE TRUTH -- the one direction this panel must never fail
+   * in, and the hazard the derivation's own comment names, arriving through latency instead of
+   * clock skew.
+   *
+   * THE MUTATION IS MOVING THE STAMP BACK AFTER THE AWAIT. Every `/api/status` response here
+   * takes ten minutes of (fake) time, so the server's 12 minutes plus the ten in flight is 22 --
+   * and under the mutation it renders 12.
+   */
+  it("A-8: ten minutes in flight shows 22 minutes, not 12", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const fetchMock = vi.fn<(url: string, init?: RequestInit) => Promise<Response>>(
+        async (url) => {
+          const path = String(url).split("?")[0];
+          const reply = (body: unknown) =>
+            new Response(JSON.stringify(body), {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            });
+          if (path === "/api/status") {
+            // TEN MINUTES IN FLIGHT, every time.
+            return new Promise<Response>((resolve) => {
+              setTimeout(() => resolve(reply({ ...HEALTHY_STATUS, ageMinutes: 12 })), 10 * 60_000);
+            });
+          }
+          if (path === "/api/settings") return reply({ settings: null });
+          if (path === "/api/watch") return reply(LIVE_WATCH);
+          return reply({ listings: [], truncated: false });
+        },
+      );
+      vi.stubGlobal("fetch", fetchMock);
+
+      render(<App getToken={noToken} />);
+      await vi.advanceTimersByTimeAsync(11 * 60_000);
+
+      expect(await screen.findByText(/22 minutes ago/)).toBeInTheDocument();
+      expect(screen.queryByText(/12 minutes ago/)).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /**
+   * A-9: THE STATUS READ CARRIES AN ABORT SIGNAL, which is what bounds A-8's error and stops two
+   * overlapping polls landing out of order and moving the displayed age BACKWARD. `apiClient`
+   * forwards `options.signal` and nothing else, so without it there is no ceiling at all.
+   *
+   * THE MUTATION IS DROPPING THE ARGUMENT: `init.signal` becomes undefined on the status call.
+   * The three other reads are asserted to carry none, so this is a claim about THIS request
+   * rather than about the transport.
+   */
+  it("A-9: /api/status is sent with an abort signal and the other reads are not", async () => {
+    const seen: { url: string; signal: unknown }[] = [];
+    const fetchMock = vi.fn<(url: string, init?: RequestInit) => Promise<Response>>(
+      async (url, init) => {
+        const path = String(url).split("?")[0];
+        seen.push({ url: path, signal: init?.signal });
+        const body =
+          path === "/api/status"
+            ? HEALTHY_STATUS
+            : path === "/api/settings"
+              ? { settings: null }
+              : path === "/api/watch"
+                ? LIVE_WATCH
+                : { listings: [], truncated: false };
+        return new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App getToken={noToken} />);
+    await waitForLoad("9 of 9 searches used");
+    await screen.findByText("Collecting");
+
+    const status = seen.filter((call) => call.url === "/api/status");
+    expect(status.length).toBeGreaterThanOrEqual(1);
+    expect(status[0].signal).toBeInstanceOf(AbortSignal);
+    for (const call of seen.filter((entry) => entry.url !== "/api/status")) {
+      expect(call.signal).toBeUndefined();
+    }
+  });
+
+  /**
    * A-7: A `degraded` ROW IS NEVER DOWNGRADED TO `stale` BY THE PASSING CLOCK.
    *
    * The frozen precedence is `unknown > degraded > stale > ok`, and H-10 is the Worker-side pin:

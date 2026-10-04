@@ -445,6 +445,29 @@ describe("the kept searches", () => {
     expect(status).toEqual(body);
   });
 
+  /**
+   * THE SIGNAL IS FORWARDED, PINNED AT THIS LAYER AS WELL AS THROUGH `App`. `apiClient` forwards
+   * `options.signal` and nothing else, so a `getStatus` that accepted the parameter and dropped
+   * it would leave the poll unbounded while `App`'s own call site still looked correct -- and the
+   * displayed age's error would have no ceiling.
+   */
+  it("forwards an abort signal to /api/status, and sends none when given none", async () => {
+    const fetchMock = stubJson({
+      status: "ok",
+      causes: [],
+      reportedAt: 1_800_000_000,
+      ageMinutes: 3,
+      collector: null,
+    });
+    const controller = new AbortController();
+
+    await marketplaceClient.getStatus(noToken, controller.signal);
+    expect(fetchMock.mock.calls[0][1]?.signal).toBe(controller.signal);
+
+    await marketplaceClient.getStatus(noToken);
+    expect(fetchMock.mock.calls[1][1]?.signal).toBeUndefined();
+  });
+
   it("passes a null collector through rather than inventing one", async () => {
     stubJson({
       status: "unknown",

@@ -216,10 +216,31 @@ function App({ identity, onSignOut, getToken }: AppProps) {
     let cancelled = false;
 
     const read = async () => {
+      /**
+       * STAMPED BEFORE THE AWAIT, AND THE DIFFERENCE IS NOT COSMETIC.
+       *
+       * `ageMinutes` is the Worker's answer to "how old was this row WHEN I READ IT", so it is
+       * anchored to the moment the request was SENT. Stamping after the await attributes it to
+       * the moment the response ARRIVED and silently discards the latency: MEASURED against the
+       * real component, a response that took ten minutes rendered "20 minutes ago" when the true
+       * age was ~30. That is the page reading healthier than the truth, which is the one
+       * direction this panel must never fail in -- and it is exactly the hazard the derivation's
+       * own comment names, arriving through latency instead of clock skew.
+       *
+       * `AbortSignal.timeout(STATUS_POLL_MS)` BOUNDS THE MAGNITUDE AND CLOSES THE OUT-OF-ORDER
+       * VARIANT IN ONE LINE. Unbounded, the error above has no ceiling; and two polls in flight
+       * at once can land in either order and move the displayed age BACKWARD. With the timeout
+       * equal to the interval, a request that has not resolved when the next one is sent is
+       * already aborted, so no two readings can overlap and no later reading can be older.
+       */
+      const sentAt = Date.now();
       try {
-        const status = await marketplaceClient.getStatus(getToken);
+        const status = await marketplaceClient.getStatus(
+          getToken,
+          AbortSignal.timeout(STATUS_POLL_MS),
+        );
         if (cancelled) return;
-        setCollection({ status, fetchedAt: Date.now() });
+        setCollection({ status, fetchedAt: sentAt });
       } catch {
         // THE LAST GOOD READING IS KEPT ON A FAILED POLL, deliberately. Flapping the panel to
         // "could not be read" and back on one dropped request would train the operator to ignore
