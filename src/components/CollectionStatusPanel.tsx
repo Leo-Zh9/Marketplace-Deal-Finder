@@ -73,6 +73,9 @@ const describeCause = (cause: string): string => {
   if (cause === "canary-expired") {
     return "The reduced schedule ran its course, so this run searched everything once to re-measure.";
   }
+  if (cause === "alarms-unreadable") {
+    return "The stored alarm list could not be read, so there may be an alarm this page is not showing.";
+  }
   if (cause === "guard-blind") {
     return "The collector could not save its own guard state, so the next run will not remember this one.";
   }

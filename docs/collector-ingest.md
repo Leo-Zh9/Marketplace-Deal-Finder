@@ -954,6 +954,20 @@ runs.
 one run on wake and coalesces the rest. Deliberately **not** done: `pmset` / `caffeinate` to keep
 the Mac awake (the user's machine, not ours).
 
+> **DEPLOY ORDER: THE MIGRATION GOES FIRST, OR TOGETHER.** `POST /api/collector-health` needs
+> `migrations/0006`. Deploy the Worker *before* the migration lands and the UPSERT answers 503
+> `COLLECTOR_HEALTH_STORAGE_FAILED` on every run, so `GET /api/status` reads `unknown` and the
+> panel says **"No collector run has reported yet"** while the collector is running perfectly —
+> a panel that can only say "no", which is the exact string class the previous monitoring panel
+> was deleted for. It self-heals the moment the migration lands, and the collector's own exit
+> codes are untouched throughout (the failure is one trailing `run-health` line per run), but
+> between the two steps the page lies in the direction this slice exists to prevent. Run
+> `npm run db:migrate` before `wrangler deploy`, or both in one change.
+>
+> **Before EITHER lands**, the route does not exist and the deployed Worker falls through to
+> `authenticateRequest`, so the POST answers **401 `AUTH_TOKEN_MISSING`** — measured, not
+> predicted. Same consequence: one trailing line, no change to any exit code.
+
 > **REVERSAL, RECORDED.** This paragraph also listed **a Worker-side "last collection at"
 > endpoint** as deliberately not done. It is now built: `POST /api/collector-health` and the
 > `collector_health` row behind `GET /api/status`. The reversal's reason is that the line was

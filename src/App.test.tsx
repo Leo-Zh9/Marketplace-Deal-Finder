@@ -965,13 +965,19 @@ describe("the control panel", () => {
    * `[getToken]` dependency plus React's strict double-invoke is a real way to double a read), and
    * the rendered badge is what catches a request whose answer is thrown away.
    */
-  it("A-1: the page reads /api/status once on mount and renders the badge", async () => {
+  /**
+   * A-1: THE PAGE READS `/api/status` ON MOUNT. AT LEAST ONCE, NOT EXACTLY ONCE.
+   *
+   * It was "exactly once" and that was the wrong assertion to pin, because the thing it pinned
+   * was a defect -- see A-5. A page that reads once cannot change state while it is open.
+   */
+  it("A-1: the page reads /api/status on mount and renders the badge", async () => {
     const calls = stubWire({ watch: LIVE_WATCH, settings: null });
     render(<App getToken={noToken} />);
     await waitForLoad("9 of 9 searches used");
 
     expect(await screen.findByText("Collecting")).toBeInTheDocument();
-    expect(calls.filter((call) => call.url === "/api/status")).toHaveLength(1);
+    expect(calls.filter((call) => call.url === "/api/status").length).toBeGreaterThanOrEqual(1);
     expect(screen.queryByText(/Reading the collector/)).not.toBeInTheDocument();
   });
 
@@ -1048,5 +1054,175 @@ describe("the control panel", () => {
     expect(await screen.findByText("Degraded")).toBeInTheDocument();
     expect(screen.getByText(/returned the same listings/)).toHaveTextContent("gpu-radeon");
     expect(screen.getByText(/reduced to 2 of 9 searches per run/)).toBeInTheDocument();
+  });
+
+  /**
+   * A-5: THE PAGE POLLS, AND A STATE CHANGE WHILE THE TAB IS OPEN REACHES THE BADGE.
+   *
+   * THE MUTATION IS DELETING THE `setInterval` -- i.e. the shipped one-shot read -- and the
+   * failure shape is a page still reading "Collecting" after the collector has started reporting
+   * `degraded`. The brief makes this page the operator's ONLY notification channel: no email, no
+   * push. A channel that cannot change state while open is the deleted panel's defect mirrored,
+   * and worse than silence, because the operator has been told it is fine.
+   *
+   * FAKE TIMERS, scoped to this test. `userEvent` is not used here, so there is no interaction
+   * with its own timer handling.
+   */
+  it("A-5: a status change reaches the badge without a reload", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      let answer: CollectionStatus = HEALTHY_STATUS;
+      const fetchMock = vi.fn<(url: string, init?: RequestInit) => Promise<Response>>(
+        async (url) => {
+          const path = String(url).split("?")[0];
+          const body =
+            path === "/api/status"
+              ? answer
+              : path === "/api/settings"
+                ? { settings: null }
+                : path === "/api/watch"
+                  ? LIVE_WATCH
+                  : { listings: [], truncated: false };
+          return new Response(JSON.stringify(body), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        },
+      );
+      vi.stubGlobal("fetch", fetchMock);
+
+      render(<App getToken={noToken} />);
+      expect(await screen.findByText("Collecting")).toBeInTheDocument();
+
+      // The collector latches a refusal between polls.
+      answer = {
+        status: "degraded",
+        causes: ["refused:gpu-rtx", "canary"],
+        reportedAt: 1_800_000_000,
+        ageMinutes: 1,
+        collector: {
+          exitCode: 5,
+          complete: false,
+          canary: true,
+          dryRun: false,
+          fixture: false,
+          targets: 9,
+          alarms: ["refused:gpu-rtx"],
+        },
+      };
+
+      await vi.advanceTimersByTimeAsync(61_000);
+
+      expect(await screen.findByText("Degraded")).toBeInTheDocument();
+      expect(screen.getByText(/Facebook refused/)).toHaveTextContent("gpu-rtx");
+      expect(screen.queryByText("Collecting")).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /**
+   * A-6: THE DISPLAYED AGE KEEPS MOVING, AND A ROW THAT GOES STALE WHILE THE TAB IS OPEN SAYS SO.
+   *
+   * THE MUTATION IS RENDERING THE WIRE'S `ageMinutes` VERBATIM, whose failure shape is a tab left
+   * open on a second monitor reading "12 minutes ago" for hours. The age is derived as the
+   * SERVER's age plus the time this page has held that answer, which never compares the browser's
+   * clock to the Worker's -- only two readings of the browser's own.
+   *
+   * THE SECOND HALF IS THE WORD, not just the number: 90 minutes beside "Collecting" is the same
+   * contradiction one level over, so the `ok` -> `stale` edge is re-derived locally. Driven here
+   * with the polls FAILING, which is the case that makes the local derivation load-bearing --
+   * with polls succeeding the server would have said `stale` itself within 60 s.
+   */
+  it("A-6: with polls failing, the age grows and ok becomes stale on its own", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      let statusCalls = 0;
+      const fetchMock = vi.fn<(url: string, init?: RequestInit) => Promise<Response>>(
+        async (url) => {
+          const path = String(url).split("?")[0];
+          if (path === "/api/status") {
+            statusCalls += 1;
+            // The first read succeeds at 40 minutes old; every later poll fails.
+            if (statusCalls > 1) throw new Error("network down");
+            return new Response(JSON.stringify({ ...HEALTHY_STATUS, ageMinutes: 40 }), {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+          const body =
+            path === "/api/settings"
+              ? { settings: null }
+              : path === "/api/watch"
+                ? LIVE_WATCH
+                : { listings: [], truncated: false };
+          return new Response(JSON.stringify(body), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        },
+      );
+      vi.stubGlobal("fetch", fetchMock);
+
+      render(<App getToken={noToken} />);
+      expect(await screen.findByText("Collecting")).toBeInTheDocument();
+      expect(screen.getByText(/40 minutes ago/)).toBeInTheDocument();
+
+      // Six minutes pass and every poll fails. 40 + 6 = 46, which is past the 45-minute bound.
+      await vi.advanceTimersByTimeAsync(6 * 61_000);
+
+      expect(await screen.findByText("No recent run")).toBeInTheDocument();
+      expect(screen.queryByText("Collecting")).not.toBeInTheDocument();
+      expect(screen.getByText(/46 minutes ago/)).toBeInTheDocument();
+      // THE LAST GOOD READING IS KEPT: a failed poll must not flap the panel to "could not be
+      // read", which would train the operator to ignore it.
+      expect(screen.queryByText(/could not be read/)).not.toBeInTheDocument();
+      expect(statusCalls).toBeGreaterThan(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /**
+   * A-7: A `degraded` ROW IS NEVER DOWNGRADED TO `stale` BY THE PASSING CLOCK.
+   *
+   * The frozen precedence is `unknown > degraded > stale > ok`, and H-10 is the Worker-side pin:
+   * a latched alarm on a ten-day-old row must not read as the benign "the Mac was asleep" cause.
+   * The local re-derivation must respect it, so only the `ok` edge moves.
+   */
+  it("A-7: a degraded row stays degraded however much time passes", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      stubWire({
+        watch: LIVE_WATCH,
+        settings: null,
+        status: {
+          status: "degraded",
+          causes: ["dry-run"],
+          reportedAt: 1_800_000_000,
+          ageMinutes: 100,
+          collector: {
+            exitCode: 0,
+            complete: true,
+            canary: false,
+            dryRun: true,
+            fixture: false,
+            targets: 9,
+            alarms: [],
+          },
+        },
+      });
+
+      render(<App getToken={noToken} />);
+      expect(await screen.findByText("Degraded")).toBeInTheDocument();
+
+      await vi.advanceTimersByTimeAsync(10 * 61_000);
+
+      expect(screen.getByText("Degraded")).toBeInTheDocument();
+      expect(screen.queryByText("No recent run")).not.toBeInTheDocument();
+      expect(screen.getByText(/COLLECTOR_DRY_RUN is set/)).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

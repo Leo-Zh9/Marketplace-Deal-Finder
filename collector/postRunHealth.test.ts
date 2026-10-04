@@ -167,6 +167,41 @@ describe("posting one health report to the Worker", () => {
     expect(REQUEST_TIMEOUT_MS).toBe(10_000);
   });
 
+  /**
+   * N6: A 200 IS NOT A SUCCESS UNTIL THE BODY SAYS `stored:true`.
+   *
+   * THE MUTATION IS RETURNING `{ok:true}` ON THE STATUS LINE ALONE, which is the shipped shape of
+   * the defect this whole slice exists to kill: `collector/run.ts`'s exit-0 docstring records
+   * that "a Worker whose every write failed answered 200 with FAILED:n and zero rows written",
+   * which is precisely why exit 0 requires the Worker's own report. Reporting an unverified
+   * success on the one request whose job is to say whether anything works would rebuild it.
+   *
+   * THE REACHABLE CASES, none of them exotic: a proxy answering 200 with an HTML error page, a
+   * future route that stops echoing the field, a 200 with an empty body.
+   */
+  it.each<[string, string, string]>([
+    ["an empty body", "", "status 200 with an unreadable body"],
+    ["an HTML error page", "<html>ok</html>", "status 200 with an unreadable body"],
+    ["JSON without the field", '{"ok":true}', "status 200 without stored:true"],
+    ["stored:false", '{"stored":false}', "status 200 without stored:true"],
+    ["stored as a string", '{"stored":"true"}', "status 200 without stored:true"],
+  ])("N6: a 200 with %s is NOT reported as stored", async (_label, raw, reason) => {
+    const fetchImplementation = (async () =>
+      new Response(raw, { status: 200 })) as unknown as typeof fetch;
+
+    await expect(postRunHealth(input, fetchImplementation)).resolves.toEqual({
+      ok: false,
+      reason,
+    });
+  });
+
+  it("N6b: a 200 that really says stored:true IS reported ok", async () => {
+    const fetchImplementation = (async () =>
+      jsonResponse(200, { stored: true })) as unknown as typeof fetch;
+
+    await expect(postRunHealth(input, fetchImplementation)).resolves.toEqual({ ok: true });
+  });
+
   /** N5: ONE request, NO retry -- the same rule `postListings` states, for the same reason. */
   it("N5: a 503 is not retried", async () => {
     let calls = 0;

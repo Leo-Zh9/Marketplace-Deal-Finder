@@ -171,6 +171,15 @@ describe("the collection status panel", () => {
    * reading "instead of all 9" -- a number the user never configured, on the one panel they are
    * meant to trust about what is running. Nine is production's count today and the cap, which is
    * exactly why it is the tempting literal.
+   *
+   * THE NUMERATOR IS A LITERAL CONSTANT AND THAT IS ONLY HONEST BECAUSE OF A PROPERTY PROVED
+   * ELSEWHERE. This panel renders `CANARY_TARGETS` against a `targets` count from the wire, so it
+   * is right only if the collector really runs `CANARY_TARGETS` whenever it reports `canary:true`.
+   * It did NOT before the probe top-up -- a single-target cause produced a ONE-target probe while
+   * the page said two -- and `collector/runState.test.ts` G-22e now asserts
+   * `indices.length === CANARY_TARGETS` over every watch-list size from 1 to 9 and four cause
+   * shapes. The alternative was putting the real count on the wire, which R4 forbids: no `ran`
+   * field, on the line or over HTTP.
    */
   it("P-8: a three-target watch list reads 2 of 3, not 2 of 9", () => {
     render(
@@ -293,6 +302,7 @@ describe("the collection status panel", () => {
     ["canary", /only some of your searches ran/, null],
     ["canary-expired", /searched everything once to re-measure/, null],
     ["guard-blind", /could not save its own guard state/, null],
+    ["alarms-unreadable", /stored alarm list could not be read/, null],
     ["exit-code:4", /The last run exited 4\./, null],
     ["source-empty:mobo-toronto", /no results several runs in a row/, "mobo-toronto"],
     ["transient:gpu-rtx", /has failed several runs in a row/, "gpu-rtx"],

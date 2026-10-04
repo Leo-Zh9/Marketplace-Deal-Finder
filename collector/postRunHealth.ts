@@ -80,7 +80,28 @@ export const postRunHealth = async (
     return { ok: false, reason: timedOut ? "timeout" : "network-error" };
   }
 
-  if (response.status === 200) return { ok: true };
+  /**
+   * A 200 IS NOT A SUCCESS UNTIL THE BODY SAYS SO, AND THIS REPOSITORY HAS THE SCAR TO PROVE IT.
+   * `collector/run.ts`'s exit-0 docstring records the measurement: "a Worker whose every write
+   * failed answered 200 with FAILED:n and zero rows written", which is why exit 0 requires the
+   * Worker's own report and not merely the status line. Reporting `ok` off the status alone here
+   * would rebuild exactly that -- a success this collector did not verify, on the one request
+   * whose entire job is to tell the operator whether anything is working.
+   *
+   * The reachable cases are not hypothetical: a proxy or a future route answering 200 with an
+   * empty body, or a Worker that accepted the request and stored nothing.
+   */
+  if (response.status === 200) {
+    let stored: unknown;
+    try {
+      stored = ((await response.json()) as { stored?: unknown }).stored;
+    } catch {
+      return { ok: false, reason: "status 200 with an unreadable body" };
+    }
+    return stored === true
+      ? { ok: true }
+      : { ok: false, reason: "status 200 without stored:true" };
+  }
 
   // THE CODE IS READ WHEN THERE IS ONE, because the two outcomes need different fixes: a 400
   // means this collector and this Worker disagree about the body (deploy), and a 503 means D1

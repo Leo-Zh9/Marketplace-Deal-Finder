@@ -247,15 +247,29 @@ export const handlePostCollectorHealth = async (
   return { ok: true, status: 200, body: { stored: true } };
 };
 
-/** `alarms` is read back defensively: the column is text, and the page renders what is in it. */
-const readAlarms = (raw: string): string[] => {
+/**
+ * `alarms` IS READ BACK DEFENSIVELY, AND AN UNREADABLE COLUMN FAILS TOWARD `degraded`.
+ *
+ * MEASURED DEFECT THIS FIXES: returning `[]` on a parse failure made the page read
+ * `status: "ok", causes: []` over a row that was REPORTING A REFUSAL. The column's own
+ * `alarms LIKE '[%]'` CHECK accepts `[refused:gpu-rtx]` -- unquoted, so not JSON -- which is
+ * precisely the shape a hand-written `wrangler d1 execute` produces, and this repository
+ * documents such a writer corrupting `search_revisions` once already. Silence was then
+ * indistinguishable from health, in the one function whose job is to tell those two apart.
+ *
+ * `readable` IS FALSE IF ANYTHING WAS DROPPED, not only if the parse threw: an array with a
+ * number in it has LOST an alarm, and a lost alarm must not read as no alarm.
+ */
+const readAlarms = (raw: string): { alarms: string[]; readable: boolean } => {
+  let parsed: unknown;
   try {
-    const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter((entry): entry is string => typeof entry === "string");
+    parsed = JSON.parse(raw);
   } catch {
-    return [];
+    return { alarms: [], readable: false };
   }
+  if (!Array.isArray(parsed)) return { alarms: [], readable: false };
+  const alarms = parsed.filter((entry): entry is string => typeof entry === "string");
+  return { alarms, readable: alarms.length === parsed.length };
 };
 
 /**
@@ -315,7 +329,7 @@ export const readCollectorHealth = async (
   // reports an age of roughly 29,000,000 minutes and the page claims the collector died in 1970.
   if (row === undefined || row.reported_at === 0) return unknown;
 
-  const alarms = readAlarms(row.alarms);
+  const { alarms, readable } = readAlarms(row.alarms);
   const collector = {
     exitCode: row.exit_code,
     complete: row.complete === 1,
@@ -338,6 +352,10 @@ export const readCollectorHealth = async (
   // exists to make unrepresentable. H-12 pins both halves.
   if (!collector.complete) causes.push(collector.canary ? "canary" : "incomplete");
   causes.push(...alarms);
+  // A SYNTHETIC CAUSE, so an unreadable column reads as `degraded` rather than as `ok`. It is
+  // pushed LAST because the alarms that WERE readable are the actionable ones; this says the
+  // list may be short. The panel names it in words.
+  if (!readable) causes.push("alarms-unreadable");
 
   // FLOORED SECONDS, so the boundary is reproducible: `docs/collector-ingest.md`'s check is
   // `age > 45`, so exactly 45 minutes is still `ok` and 46 is `stale`.

@@ -28,12 +28,29 @@ const fresh = (over: Partial<RunState> = {}): RunState => ({
   ...over,
 });
 
-/** A target that ran, with no ids. The default exit is 0, the ordinary clean case. */
+/**
+ * A target that ran, with no ids. The default exit is 0, the ordinary clean case.
+ *
+ * `query` DEFAULTS TO THE TARGET ID, i.e. DISTINCT PER TARGET, which is what production looks
+ * like: nine watch rows carrying nine DIFFERENT queries. It must be set, and the reason is worth
+ * the line -- `maxPairOverlap` now skips pairs whose queries are identical, because two rows with
+ * the same query make the same request and overlap 1.000 by construction. MEASURED: leaving this
+ * `undefined` made `undefined === undefined` true for every pair and silently skipped ALL of
+ * them, which turned thirteen overlap tests red at once. A test fixture that does not look like
+ * production is how that guard would have been written backwards.
+ */
 const ran = (
   targetId: string,
   exitCode = 0,
   over: Partial<TargetRun> = {},
-): TargetRun => ({ targetId, exitCode, reason: exitCode === 0 ? "ok" : null, ids: [], ...over });
+): TargetRun => ({
+  targetId,
+  exitCode,
+  reason: exitCode === 0 ? "ok" : null,
+  ids: [],
+  query: targetId,
+  ...over,
+});
 
 /** `n` distinct ids on a prefix. `ids("a", 24)` is a full page nothing else shares. */
 const ids = (prefix: string, count: number): string[] =>
@@ -523,27 +540,197 @@ describe("the collector's cross-run state", () => {
    * THE MUTATION IS DROPPING THE RESET: run 2 below then latches `source-empty:t1` off a streak
    * that was two runs old when an unrelated cause cleared.
    */
-  it("G-16: clearing a transient cause also resets that target's source-empty streak", () => {
+  it("G-16: clearing a feed cause also resets its targets' transient streaks", () => {
+    /**
+     * THE RESET'S REACHABLE CASE NARROWED AGAIN WHEN THE CLEAN PREDICATE GAINED ITS POSITIVE-
+     * EVIDENCE REQUIREMENT, AND THIS IS THE THIRD DRAFT OF THIS ROW. Recorded because the
+     * narrowing IS the finding:
+     *
+     *   Draft 1 asserted the oscillation and could not be made to fail -- the ordinary counter
+     *   update already zeroes a counter on any exit that is not its own code.
+     *   Draft 2 drove `transient:t1` clearing while `sourceEmpty` accumulated on an exit 3. That
+     *   is now UNREACHABLE: an exit 3 is no longer positive evidence of anything, so it cannot
+     *   clear a transient cause at all.
+     *
+     * WHAT IS LEFT IS THE ONE CROSSING THAT SURVIVES, and it is a real production shape: a
+     * `feed-overlap` pair clears while BOTH its targets are failing their POSTs. Exit 5 after a
+     * SUCCESS parse populates `listingIds` (R-2b), so the pair IS measurable and the feed really
+     * did go away -- while `transient` climbs on both targets, because the Worker is 5xx-ing.
+     * Dropping the cause resets both counters; without the reset a third such run latches
+     * `transient:a` off a streak the operator has no new evidence for.
+     */
     let state = fresh({
-      consecutive: { t1: { sourceEmpty: 1, transient: 0 } },
-      alarm: { "transient:t1": { runs: 4, cleanProbes: CANARY_CLEAN_PROBES - 1 } },
+      consecutive: { a: { sourceEmpty: 0, transient: 0 }, b: { sourceEmpty: 0, transient: 0 } },
+      alarm: { "feed-overlap:a+b": { runs: 4, cleanProbes: 0 } },
     });
 
-    // Run 1: t1 comes back EMPTY. That is a clean measurement of `transient:t1` (its exit is not
-    // 5), so the cause clears -- and the reset takes `sourceEmpty` from 2 back to 0.
-    const cleared = advance({ state, ran: [ran("t1", 3), ran("t2")] });
-    expect(cleared.causes).toEqual([]);
-    expect(cleared.state.consecutive.t1).toEqual({ sourceEmpty: 0, transient: 0 });
-    state = cleared.state;
+    // Two clean probes of the pair, both targets exiting 5 on a FAILED POST after a good parse.
+    for (let index = 0; index < CANARY_CLEAN_PROBES; index += 1) {
+      const result = advance({
+        state,
+        watchList: ["a", "b", "c"],
+        ran: [
+          ran("a", 5, { reason: "ok", ids: ids("a", 24) }),
+          ran("b", 5, { reason: "ok", ids: ids("b", 24) }),
+        ],
+        canary: true,
+      });
+      state = result.state;
+    }
 
-    // Runs 2 and 3: still empty. WITHOUT the reset, `sourceEmpty` was 2 at the end of run 1 and
-    // run 2 latches. With it, re-latching costs CONSECUTIVE_ALARM_RUNS runs of fresh evidence.
-    const second = advance({ state, ran: [ran("t1", 3), ran("t2")] });
-    expect(second.causes).toEqual([]);
-    const third = advance({ state: second.state, ran: [ran("t1", 3), ran("t2")] });
-    expect(third.causes).toEqual([]);
-    const fourth = advance({ state: third.state, ran: [ran("t1", 3), ran("t2")] });
-    expect(fourth.causes).toEqual(["source-empty:t1"]);
+    expect(state.alarm).toEqual({});
+    // THE ASSERTION: both counters are back to 0 although this run drove them UP to 2.
+    expect(state.consecutive.a).toEqual({ sourceEmpty: 0, transient: 0 });
+    expect(state.consecutive.b).toEqual({ sourceEmpty: 0, transient: 0 });
+
+    // ...and the consequence, which is what the reset is for: one more exit 5 does not latch.
+    const next = advance({
+      state,
+      watchList: ["a", "b", "c"],
+      ran: [ran("a", 5, { reason: "ok", ids: ids("a", 24) }), ran("b", 5, { reason: "ok", ids: ids("b", 24) })],
+    });
+    expect(next.causes).toEqual([]);
+  });
+
+  /* ---------- the clean predicate needs POSITIVE evidence, not a negation ---------- */
+
+  /**
+   * G-23: EXIT 2 AND EXIT 4 ARE NOT CLEAN PROBES OF ANYTHING, AND THIS IS THE SHARPEST ROW IN
+   * THE FILE.
+   *
+   * THE MUTATION IS A PURE NEGATION of the cause's own exit code -- `exitCode !== 3`,
+   * `exitCode !== 5`, `!refused(t)` -- which is the obvious implementation and was the shipped
+   * one. Under it NEITHER exit 2 (the row was unusable) NOR exit 4 (the page changed shape,
+   * nothing posted) is the cause's own code, so both counted as evidence of recovery.
+   *
+   * THE `refused` ROW IS THE ONE THAT MATTERS. Facebook escalating a 429 into a checkpoint page
+   * is an exit 4, and two of them cleared `refused:a` -- sending the collector back to nine
+   * requests per run INTO AN ACTIVE REFUSAL, which invariant 5 calls the one loss that backing
+   * off afterwards cannot undo.
+   */
+  it.each<[string]>([["source-empty:a"], ["transient:a"], ["refused:a"]])(
+    "G-23: %s survives any number of exit-2 and exit-4 runs",
+    (cause) => {
+      let state = fresh({ alarm: { [cause]: { runs: 4, cleanProbes: 0 } } });
+
+      for (const exitCode of [2, 4, 2, 4, 2, 4]) {
+        const result = advance({
+          state,
+          watchList: ["a", "b"],
+          ran: [ran("a", exitCode)],
+          canary: true,
+        });
+        state = result.state;
+        expect(result.causes).toEqual([cause]);
+      }
+
+      expect(state.alarm[cause].cleanProbes).toBe(0);
+    },
+  );
+
+  /**
+   * G-23b: THE OSCILLATION A NEGATION PRODUCED, MEASURED AS VOLUME.
+   *
+   * A target alternating 3,3,3,5,5 forever held the latch on only 40 % of runs under the
+   * negation, because each condition read the OTHER condition's failure as its own recovery:
+   * the exit 5s cleared `source-empty:a` and the exit 3s cleared `transient:a`, turn and turn
+   * about. 232 requests over 40 runs against a 360 baseline -- neither the 78 % cut nor a stable
+   * alarm, which is the period-cycle this design was chosen to avoid.
+   *
+   * THE ASSERTION IS THE FRACTION OF RUNS UNDER THE CUT, not a counter, because the fraction is
+   * what the operator pays.
+   */
+  it("G-23b: a target alternating 3,3,3,5,5 holds a latch on every run after the third", () => {
+    const pattern = [3, 3, 3, 5, 5];
+    const watchList = Array.from({ length: 9 }, (_value, index) => `t${index}`);
+    let state = fresh();
+    let latchedRuns = 0;
+
+    for (let index = 0; index < 40; index += 1) {
+      const exitCode = pattern[index % pattern.length];
+      const plan = selectProbe(state, watchList);
+      const running = plan.indices.map((position) => watchList[position]);
+      const result = advance({
+        state,
+        watchList,
+        ran: running.map((targetId) =>
+          ran(targetId, targetId === "t0" ? exitCode : 0, { reason: "ok", ids: ids(targetId, 24) }),
+        ),
+        canary: plan.canary,
+        expired: plan.expired,
+        nextProbe: plan.nextProbe,
+      });
+      state = result.state;
+      if (result.causes.length > 0) latchedRuns += 1;
+    }
+
+    // Runs 1 and 2 build the streak; every run from the third onwards is latched.
+    expect(latchedRuns).toBe(38);
+    expect(Object.keys(state.alarm)).toContain("source-empty:t0");
+  });
+
+  /**
+   * G-23c: EXIT 6 *IS* A CLEAN PROBE, and that is not a loophole.
+   *
+   * At a target, exit 6 is reachable ONLY after `classifyParsedPage` returned SUCCESS -- the POST
+   * was refused 4xx, or answered 200 with FAILED > 0. So the SOURCE was fetched and parsed and
+   * only the Worker write failed. Refusing to count it would make a Worker-side contract break
+   * pin a source alarm indefinitely, which is the opposite error: the collector would be unable
+   * to tell the operator that Facebook had recovered because its own backend was broken.
+   */
+  it("G-23c: two exit-6 runs clear a source-empty cause", () => {
+    let state = fresh({
+      consecutive: { a: { sourceEmpty: 3, transient: 0 } },
+      alarm: { "source-empty:a": { runs: 4, cleanProbes: 0 } },
+    });
+
+    for (let index = 0; index < CANARY_CLEAN_PROBES; index += 1) {
+      const result = advance({ state, watchList: ["a", "b"], ran: [ran("a", 6)], canary: true });
+      state = result.state;
+    }
+
+    expect(state.alarm).toEqual({});
+  });
+
+  /* ---------- two rows with the same query are one search, not a feed ---------- */
+
+  /**
+   * G-24: TWO WATCH ROWS CARRYING THE SAME QUERY ARE NOT A GENERIC FEED.
+   *
+   * `buildSearchUrl` reads the query, the location, the limit, the radius and the day window --
+   * NOT the component type -- so `('gpu','rtx')` and `('cpu','rtx')` fetch the IDENTICAL URL and
+   * their id sets are identical by construction. Without the guard the pair trips on the first
+   * run and can never be re-measured clean, because the next probe fetches the same URL twice
+   * again: a PERMANENT 78 % volume cut, explained to the operator as a generic feed when the real
+   * fault is two watch rows that should be one.
+   *
+   * THE SECOND ROW IS WHAT STOPS THE GUARD BEING WRITTEN TOO WIDE: two DIFFERENT queries that
+   * happen to return the same page are exactly the degradation this slice exists to detect, and
+   * must still latch.
+   */
+  it.each<[string, string, string, string[]]>([
+    ["the same query under two types", "rtx", "rtx", []],
+    ["two different queries", "rtx", "radeon", ["feed-overlap:a+b"]],
+  ])("G-24: %s raises %s", (_label, queryA, queryB, expected) => {
+    const feed = ids("feed", 24);
+    const result = advance({
+      ran: [
+        ran("a", 0, { ids: feed, query: queryA }),
+        ran("b", 0, { ids: feed, query: queryB }),
+      ],
+    });
+
+    expect(result.causes).toEqual(expected);
+  });
+
+  it("G-24b: an unvalidated row's empty query is not equal to another's", () => {
+    const feed = ids("feed", 24);
+    const result = advance({
+      ran: [ran("a", 0, { ids: feed, query: "" }), ran("b", 0, { ids: feed, query: "" })],
+    });
+
+    // Two broken rows are not "the same search", so the pair is still compared.
+    expect(result.causes).toEqual(["feed-overlap:a+b"]);
   });
 
   /**
@@ -625,7 +812,9 @@ describe("the collector's cross-run state", () => {
 
     expect(plan.expired).toBe(false);
     expect(plan.canary).toBe(true);
-    expect(plan.indices).toEqual([4]);
+    // TWO targets, not one: the cause's own target plus one topped up from watch-list order.
+    // A ONE-target probe cannot measure a pair, which is the whole reason CANARY_TARGETS is 2.
+    expect(plan.indices).toEqual([0, 4]);
   });
 
   /**
@@ -708,7 +897,7 @@ describe("the collector's cross-run state", () => {
     // THE CONSEQUENCE, NOT JUST THE FLAG: the expiry run searches all nine targets, which is the
     // measurement the probe suppresses. 48 probes plus this one full run is the 49-run cycle.
     expect(plan.canary).toBe(!expired);
-    expect(plan.indices).toHaveLength(expired ? 9 : 1);
+    expect(plan.indices).toHaveLength(expired ? 9 : CANARY_TARGETS);
   });
 
   it("G-19c: canaryRuns counts probe runs, and a cleared alarm resets it", () => {
@@ -795,7 +984,7 @@ describe("the collector's cross-run state", () => {
    * take a, then b, then stop at the cap having split nothing -- so the mutation has to be driven
    * from a cursor where the SINGLE-target cause comes first, which is `probe: 1`.
    */
-  it("G-22: a single-target cause first still leaves the pair whole", () => {
+  it("G-22: a single-target cause first leaves the pair uncredited, not half-probed", () => {
     const state = fresh({
       probe: 1,
       alarm: {
@@ -804,15 +993,76 @@ describe("the collector's cross-run state", () => {
       },
     });
 
-    // `probe: 1` starts at `source-empty:z`, which takes one slot; the pair needs two and does
-    // not fit, so it is skipped WHOLE rather than contributing one target.
+    /**
+     * `probe: 1` starts at `source-empty:z`, which takes one slot; the pair needs two and does
+     * not fit, so the CAUSE FILL skips it whole. The top-up then adds position 0 for volume
+     * parity, so `a` does run -- and THE DISTINCTION THAT MATTERS is that running half a pair
+     * is not the same as crediting it. The claim is no longer "the probe never contains half a
+     * pair" (the top-up can put one there) but "half a pair never earns the pair anything",
+     * which is the property that keeps the cause clearable only by a real measurement.
+     */
     const plan = selectProbe(state, ["a", "b", "z"]);
-    expect(plan.indices).toEqual([2]);
+    expect(plan.indices).toEqual([0, 2]);
+    expect(plan.indices).toHaveLength(CANARY_TARGETS);
     expect(plan.canary).toBe(true);
 
-    // ...and the next run's cursor reaches the pair, which then fits exactly.
+    // THE PROPERTY: that run gives the feed cause no credit at all, however often it repeats.
+    let credited = state;
+    for (let index = 0; index < CANARY_CLEAN_PROBES + 2; index += 1) {
+      const result = advance({
+        state: credited,
+        watchList: ["a", "b", "z"],
+        ran: [ran("a", 0, { ids: ids("a", 24) }), ran("z", 0, { ids: ids("z", 24) })],
+        canary: true,
+      });
+      credited = result.state;
+      expect(result.causes).toContain("feed-overlap:a+b");
+    }
+    expect(credited.alarm["feed-overlap:a+b"].cleanProbes).toBe(0);
+
+    // ...and the next run's cursor reaches the pair, which then fits exactly and IS measurable.
     const next = selectProbe({ ...state, probe: plan.nextProbe }, ["a", "b", "z"]);
     expect(next.indices).toEqual([0, 1]);
+  });
+
+  /**
+   * G-22e: THE PROBE IS ALWAYS EXACTLY `CANARY_TARGETS` WHEN IT CLAIMS TO BE A PROBE.
+   *
+   * THIS IS THE PROPERTY THE PAGE'S SENTENCE RESTS ON, asserted here rather than assumed there.
+   * `CollectionStatusPanel` renders "reduced to {CANARY_TARGETS} of {targets}" -- a literal
+   * numerator against a number from the wire -- and that is only honest if the code really runs
+   * `CANARY_TARGETS` whenever `canary` is true. Before the top-up it ran ONE for a single-target
+   * cause and the page said two.
+   *
+   * It holds by construction: the top-up fills to `min(CANARY_TARGETS, length)`, and `canary`
+   * requires that to be strictly less than `length`, which forces it to be `CANARY_TARGETS`.
+   * Driven over watch lists from 1 to 9 and over one, two and three latched causes.
+   */
+  it("G-22e: whenever canary is true, the probe is exactly CANARY_TARGETS targets", () => {
+    let probes = 0;
+    for (let size = 1; size <= 9; size += 1) {
+      const watchList = Array.from({ length: size }, (_value, index) => `t${index}`);
+      const causeSets: RunState["alarm"][] = [
+        { "source-empty:t0": { runs: 9, cleanProbes: 0 } },
+        { "source-empty:t0": { runs: 9, cleanProbes: 0 }, "transient:t0": { runs: 9, cleanProbes: 0 } },
+        { [`source-empty:t${size - 1}`]: { runs: 9, cleanProbes: 0 } },
+        { [`feed-overlap:t0+t${size - 1}`]: { runs: 9, cleanProbes: 0 } },
+      ];
+
+      for (const alarm of causeSets) {
+        for (let probe = 0; probe < 4; probe += 1) {
+          const plan = selectProbe(fresh({ alarm, probe }), watchList);
+          if (!plan.canary) continue;
+          probes += 1;
+          expect(plan.indices).toHaveLength(CANARY_TARGETS);
+          expect(plan.indices.length).toBeLessThan(watchList.length);
+          expect(new Set(plan.indices).size).toBe(plan.indices.length);
+        }
+      }
+    }
+
+    // Non-vacuity: the loop really produced probes rather than skipping every case.
+    expect(probes).toBeGreaterThan(20);
   });
 
   it("G-22b: a feed cause alone fills the probe exactly, and the cap is 2", () => {
