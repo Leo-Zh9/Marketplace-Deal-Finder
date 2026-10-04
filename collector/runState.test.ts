@@ -548,9 +548,16 @@ describe("the collector's cross-run state", () => {
 
   /**
    * G-16b: AND THE OSCILLATION IS STILL ASSERTED, because it is the property that matters even
-   * though the counter update is what prevents it. This row is the one that would go red if a
-   * future edit made a clean measurement stop zeroing the counter -- which is the OTHER way to
-   * reintroduce the period-3 cycle, and the one no mutation of the reset can reach.
+   * though the counter update is what prevents it.
+   *
+   * LABELLED, SO THE NEXT READER DOES NOT MISTAKE IT FOR A LIVE GUARD: THIS ROW HAS NO CURRENT
+   * KILLER. It is a PROPERTY, kept deliberately. Deleting the `consecutive` reset -- the edit it
+   * reads as being about -- leaves it green, because the ordinary counter update already zeroes
+   * `sourceEmpty` on any exit that is not 3 (G-16 is the row that goes red for that edit, and it
+   * had to be rewritten to the cross-condition case to get there). What this row WOULD catch is
+   * the OTHER way to reintroduce the period-3 cycle: an edit that made a clean measurement stop
+   * zeroing the counter. No mutation of the reset can reach it, and that is the point of keeping
+   * it rather than deleting it as unkillable.
    */
   it("G-16b: a cleared source-empty cause does not re-latch on the next dirty run", () => {
     const cleared = advance({
@@ -660,6 +667,48 @@ describe("the collector's cross-run state", () => {
 
     expect(plan.expired).toBe(false);
     expect(plan.canary).toBe(true);
+  });
+
+  /**
+   * G-19d: THE BOUND'S POSITION, AT LITERAL RUN COUNTS.
+   *
+   * THIS ROW EXISTS BECAUSE EVERY OTHER TEST OF THE EXPIRY WAS SELF-FULFILLING, AND THAT WAS
+   * MEASURED RATHER THAN SUSPECTED. G-19, G-19b, G-19c, G-20 and runTargets' L-27 all seed
+   * `canaryRuns` as `MAX_CANARY_RUNS` or `MAX_CANARY_RUNS - 1` -- so moving the constant moves
+   * the input with it and every one of them stays green. `MAX_CANARY_RUNS = 480` turned exactly
+   * ONE test red out of 132: the literal pin below. A pin is a record of the value, not a
+   * measurement of where the boundary SITS.
+   *
+   * THAT GAP IS THE EXPENSIVE ONE ON THIS PARTICULAR CONSTANT. Its entire derivation is that the
+   * probe re-asks the same question every run while a FULL run is the measurement
+   * OVERLAP_ALARM_FRACTION's Leg 2 needs -- 48 buys one full run per day for 9 requests per 49
+   * runs. An edit to 480 silently turns that into one full run per TEN days, which is the
+   * "discovered days later" failure the whole guard shape was chosen to avoid, and the 36-pair
+   * matrix the threshold is re-derived from stops arriving.
+   *
+   * THE THREE ROWS ARE LITERALS ON PURPOSE and they pin the comparison as `>=` rather than `>`:
+   * 47 is still a probe, 48 is the full run, 49 is too. A constant moved in EITHER direction goes
+   * red behaviourally -- 480 makes the 48 row read "not expired", 24 makes the 47 row read
+   * "expired".
+   */
+  it.each<[string, number, boolean]>([
+    ["47 runs, one below the bound", 47, false],
+    ["48 runs, exactly at the bound", 48, true],
+    ["49 runs, past it", 49, true],
+  ])("G-19d: with the cut engaged for %s, expired is %s", (_label, canaryRuns, expired) => {
+    const plan = selectProbe(
+      fresh({
+        canaryRuns,
+        alarm: { "source-empty:t4": { runs: canaryRuns + 4, cleanProbes: 0 } },
+      }),
+      Array.from({ length: 9 }, (_value, index) => `t${index}`),
+    );
+
+    expect(plan.expired).toBe(expired);
+    // THE CONSEQUENCE, NOT JUST THE FLAG: the expiry run searches all nine targets, which is the
+    // measurement the probe suppresses. 48 probes plus this one full run is the 49-run cycle.
+    expect(plan.canary).toBe(!expired);
+    expect(plan.indices).toHaveLength(expired ? 9 : 1);
   });
 
   it("G-19c: canaryRuns counts probe runs, and a cleared alarm resets it", () => {
