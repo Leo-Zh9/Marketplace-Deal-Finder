@@ -5,6 +5,7 @@ import schemaSql from "../../migrations/0001_initial_storage.sql?raw";
 import evaluationSql from "../../migrations/0002_evaluation_tasks.sql?raw";
 import monitorSql from "../../migrations/0004_monitor.sql?raw";
 import watchSql from "../../migrations/0005_watch_targets.sql?raw";
+import healthSql from "../../migrations/0006_collector_health.sql?raw";
 import { COMPONENT_TYPES } from "../api/listings";
 
 /**
@@ -56,14 +57,20 @@ afterAll(async () => {
 
 // Test 14 -- schema / migration.
 describe("0001_initial_storage.sql", () => {
-  // Test S1'. createTestDatabase applies 0001 through 0005, so this asserts what the five
+  // Test S1'. createTestDatabase applies 0001 through 0006, so this asserts what the six
   // migrations together create and NOTHING ELSE: 0002 is purely additive and creates no
   // table of its own, 0003 adds exactly the two 3E-a tables, 0004 adds exactly the two
-  // 3E-b ones, and 0005 adds exactly the two watch-list ones. monitor_lock used to be named
-  // here as the table that would show up if someone created it early; it is 3E-b's now, it has
-  // a reader (the run lock's ACQUIRE_LOCK and LOCK_HELD, every run), and a table nobody planned
-  // still shows up here and nowhere else.
-  it("creates exactly the ten tables 0001 through 0005 define", async () => {
+  // 3E-b ones, 0005 adds exactly the two watch-list ones, and 0006 adds exactly the one
+  // collector-health singleton. monitor_lock used to be named here as the table that would show
+  // up if someone created it early; it is 3E-b's now, it has a reader (the run lock's
+  // ACQUIRE_LOCK and LOCK_HELD, every run), and a table nobody planned still shows up here and
+  // nowhere else.
+  //
+  // S-n1: THIS ROW IS ALSO THE GUARD ON `applyMigrations`' LIST. Omitting 0006 from
+  // worker/testing/d1.ts leaves ten tables here and every row of
+  // worker/api/collectorHealth.test.ts failing with `no such table: collector_health` -- so the
+  // two failures together say which edit was missed.
+  it("creates exactly the eleven tables 0001 through 0006 define", async () => {
     // The filter is required: after the migration sqlite_master also holds D1's internal
     // _cf_METADATA and four sqlite_autoindex_* entries for the composite primary keys.
     const { results } = await database.db
@@ -73,6 +80,7 @@ describe("0001_initial_storage.sql", () => {
       .all<{ name: string }>();
 
     expect(results.map((row) => row.name)).toEqual([
+      "collector_health",
       "evaluation_tasks",
       "listings",
       "model_stats",
@@ -98,7 +106,12 @@ describe("0001_initial_storage.sql", () => {
   // `sql IS NULL` -- so it is invisible to this query by the same rule that hides the composite
   // primary keys. 0005 adds none by THE SAME RULE, measured: watch_targets' TEXT PRIMARY KEY
   // creates sqlite_autoindex_watch_targets_1 whose `sql IS NULL`, and watch_market.id is an
-  // INTEGER rowid alias. THE LIST BELOW NOT CHANGING IS ITSELF THE ASSERTION.
+  // INTEGER rowid alias. 0006 adds none for that same last reason -- collector_health.id is an
+  // INTEGER rowid alias, so SQLite builds nothing at all for it (S-n2).
+  // THE LIST BELOW NOT CHANGING IS ITSELF THE ASSERTION, AND S-n2 IS THEREFORE A WEAK KILLER
+  // AND IS LABELLED ONE: it is a regression pin on a pre-existing assertion, not a new claim.
+  // Adding a UNIQUE or a CREATE INDEX to 0006 adds a row here, which is the whole of what it
+  // catches.
   // The list below is byte-for-byte the one master returns.
   it("creates exactly the 0001 and 0002 indexes, and no others", async () => {
     const { results } = await database.db
@@ -613,4 +626,186 @@ describe("0005_watch_targets.sql", () => {
       .first<{ n: number }>();
     expect(row?.n).toBe(1);
   });
+});
+
+/**
+ * The alerting slice's additive migration. Same seam and the same file-is-the-source-of-truth
+ * discipline as the 0002, 0004 and 0005 blocks above.
+ *
+ * ONE DATABASE, NOT TWO, AND THE REASON IS THE DIFFERENCE FROM 0005. `watch_market`'s behavioural
+ * CHECK tests had to destroy the seed to insert a candidate, so 0005's block needed a throwaway
+ * second database. Every attempt below is REFUSED, so the shipped seed S-n5 reads is left exactly
+ * as it was found -- the same reason S7g can share `database`.
+ */
+describe("0006_collector_health.sql", () => {
+  /** Test S-n3. THE CHECKS, EXHAUSTIVELY -- a PRESENCE pin, exactly like S2b and S7b. */
+  it("S-n3: declares exactly these nine CHECK constraints, and no others", () => {
+    const checks = extractChecks(splitSqlStatements(healthSql).join("\n"));
+
+    expect(checks).toEqual([
+      "id = 1",
+      "typeof(reported_at) = 'integer' AND reported_at >= 0",
+      "typeof(exit_code) = 'integer' AND exit_code >= 0",
+      "complete IN (0, 1)",
+      "canary IN (0, 1)",
+      "dry_run IN (0, 1)",
+      "fixture IN (0, 1)",
+      "typeof(targets) = 'integer' AND targets >= 0",
+      "alarms LIKE '[%]'",
+    ]);
+  });
+
+  /** The columns, in order, all NOT NULL. Column ORDER is load-bearing: the UPSERT binds 8. */
+  it("S-n3b: carries exactly its nine columns, in order, all NOT NULL", async () => {
+    const { results } = await database.db
+      .prepare("SELECT name, `notnull`, pk FROM pragma_table_info('collector_health')")
+      .all<{ name: string; notnull: number; pk: number }>();
+
+    expect(results.map((row) => row.name)).toEqual([
+      "id",
+      "reported_at",
+      "exit_code",
+      "complete",
+      "canary",
+      "dry_run",
+      "fixture",
+      "targets",
+      "alarms",
+    ]);
+    // A nullable column here is not cosmetic: `readCollectorHealth` reads `row.complete === 1`
+    // and `JSON.parse(row.alarms)`, so a NULL would read as `complete:false` or throw into the
+    // `[]` fallback -- in both cases the page would say something the collector never reported.
+    expect(results.every((row) => row.notnull === 1)).toBe(true);
+    expect(results.find((row) => row.name === "id")?.pk).toBe(1);
+  });
+
+  /**
+   * Test S-n4. THE SINGLETON, BEHAVIOURALLY. S-n3 alone is a presence pin: deleting
+   * `CHECK (id = 1)` leaves a table that happily holds two health rows, and "the latest health"
+   * becomes whichever row the read happened to return first. All four routes to a second row are
+   * covered, including the OMITTED id -- which auto-assigns 2 and is what a hand-written
+   * `wrangler d1 execute` would plausibly do.
+   */
+  it("S-n4: all four routes to a second health row are refused, and one row survives", async () => {
+    const values = "0, 0, 0, 0, 0, 0, 0, '[]'";
+    const columns = "reported_at, exit_code, complete, canary, dry_run, fixture, targets, alarms";
+    const attempts: Array<[string, string]> = [
+      ["an explicit id 2", `INSERT INTO collector_health (id, ${columns}) VALUES (2, ${values})`],
+      ["an explicit id 0", `INSERT INTO collector_health (id, ${columns}) VALUES (0, ${values})`],
+      [
+        "an OMITTED id, which auto-assigns 2",
+        `INSERT INTO collector_health (${columns}) VALUES (${values})`,
+      ],
+      ["moving the existing row", "UPDATE collector_health SET id = 2 WHERE id = 1"],
+    ];
+
+    for (const [label, statement] of attempts) {
+      await expect(
+        database.db.prepare(statement).run(),
+        `${label} must be refused`,
+      ).rejects.toThrow(/CHECK constraint failed/);
+    }
+
+    const row = await database.db
+      .prepare("SELECT COUNT(*) AS n FROM collector_health")
+      .first<{ n: number }>();
+    expect(row?.n).toBe(1);
+  });
+
+  /**
+   * Test S-n5. THE SHIPPED SEED, VALIDATED RATHER THAN PINNED -- the same discipline as S7c, and
+   * for a sharper reason here: `reported_at = 0` is the value `readCollectorHealth` reads as
+   * `unknown`, and a seed of (say) 1 would read as a row roughly 29,000,000 minutes old. A
+   * freshly migrated database would then claim the collector died in 1970.
+   *
+   * `truncateAll` DELETES this row, so the gate and most of the suite never see it; this is the
+   * only thing in the suite that looks at the shipped values.
+   */
+  it("S-n5: the shipped seed is the inert unknown row", async () => {
+    const { results } = await database.db
+      .prepare("SELECT * FROM collector_health")
+      .all<Record<string, unknown>>();
+
+    expect(results).toEqual([
+      {
+        id: 1,
+        reported_at: 0,
+        exit_code: 0,
+        complete: 0,
+        canary: 0,
+        dry_run: 0,
+        fixture: 0,
+        targets: 0,
+        alarms: "[]",
+      },
+    ]);
+  });
+
+  /**
+   * Test S-n6. The FILE, not the applied result: a destructive statement would still leave the
+   * right table on a FRESH database while destroying the deployed one. 0001-0005 are APPLIED IN
+   * PRODUCTION and SQLite can neither drop a CHECK nor alter a primary key.
+   */
+  it("S-n6: is one CREATE TABLE and one seed INSERT, and nothing destructive", () => {
+    const statements = splitSqlStatements(healthSql);
+
+    expect(statements).toHaveLength(2);
+    expect(statements.filter((statement) => statement.startsWith("CREATE TABLE"))).toHaveLength(1);
+    expect(statements.filter((statement) => statement.startsWith("INSERT INTO"))).toHaveLength(1);
+
+    for (const statement of statements) {
+      expect(statement).not.toMatch(/\b(DROP|ALTER|UPDATE|DELETE)\b/);
+    }
+  });
+
+  /**
+   * Test S-n7. THE AFFINITY GUARDS, BEHAVIOURALLY. S-n3 is a presence pin: deleting the
+   * `typeof(reported_at) = 'integer'` term leaves a range-only check that a REAL timestamp passes
+   * -- MEASURED here, and it is the same affinity trap that jammed every settings PUT with a
+   * 60000.5 in search_revisions. A fractional `reported_at` makes `ageMinutes` fractional and
+   * the badge's 45-minute boundary unreproducible.
+   *
+   * THE BOOLEAN COLUMNS ARE THE SHARPER HALF: without `IN (0, 1)`, `complete = 2` stores and
+   * `readCollectorHealth`'s `row.complete === 1` reads it as FALSE -- so a complete run would
+   * read `degraded / incomplete` for a value nothing refused.
+   *
+   * Every row here is REFUSED, so the seed survives for S-n5 whatever order the suite runs in.
+   */
+  it.each<[string, string]>([
+    ["a REAL reported_at", "UPDATE collector_health SET reported_at = 1800000000.5 WHERE id = 1"],
+    ["a TEXT reported_at", "UPDATE collector_health SET reported_at = 'now' WHERE id = 1"],
+    ["a negative reported_at", "UPDATE collector_health SET reported_at = -1 WHERE id = 1"],
+    ["a REAL exit_code", "UPDATE collector_health SET exit_code = 0.5 WHERE id = 1"],
+    ["complete = 2", "UPDATE collector_health SET complete = 2 WHERE id = 1"],
+    ["canary = -1", "UPDATE collector_health SET canary = -1 WHERE id = 1"],
+    ["dry_run = 'true'", "UPDATE collector_health SET dry_run = 'true' WHERE id = 1"],
+    ["fixture = 2", "UPDATE collector_health SET fixture = 2 WHERE id = 1"],
+    ["a negative targets", "UPDATE collector_health SET targets = -1 WHERE id = 1"],
+    ["alarms as a bare string", "UPDATE collector_health SET alarms = 'boom' WHERE id = 1"],
+    ["alarms as an object", "UPDATE collector_health SET alarms = '{}' WHERE id = 1"],
+  ])("S-n7: %s is refused", async (_label, statement) => {
+    await expect(database.db.prepare(statement).run()).rejects.toThrow(/CHECK constraint failed/);
+  });
+
+  /**
+   * S-n7b: THE MEASURED WIDTH OF `alarms LIKE '[%]'`, STATED RATHER THAN OVERSTATED. It accepts
+   * `[1,2]` and `[oops]`, so it cannot tell an array of cause strings from an array of numbers or
+   * from bracketed text. That is why `handlePostCollectorHealth` validates the array itself and
+   * H-4 is the real guard; this row is here so nobody reads the CHECK as more than it is.
+   */
+  it.each<[string]>([["[1,2]"], ["[oops]"], ["[]"]])(
+    "S-n7b: the alarms CHECK accepts %s, which is why the handler validates too",
+    async (alarms) => {
+      await database.db
+        .prepare("UPDATE collector_health SET alarms = ?1 WHERE id = 1")
+        .bind(alarms)
+        .run();
+      const row = await database.db
+        .prepare("SELECT alarms FROM collector_health WHERE id = 1")
+        .first<{ alarms: string }>();
+      expect(row?.alarms).toBe(alarms);
+      // Restored, so S-n5 sees the shipped value whatever order the suite runs in.
+      await database.db.prepare("UPDATE collector_health SET alarms = '[]' WHERE id = 1").run();
+    },
+  );
 });

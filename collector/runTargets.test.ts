@@ -1,7 +1,14 @@
 // @vitest-environment node
 
+import type { HealthPostResult, RunHealthReport } from "./postRunHealth.ts";
 import * as exitCodes from "./run.ts";
 import type { CollectorConfig, RunSummary } from "./run.ts";
+import {
+  CANARY_TARGETS,
+  MAX_CANARY_RUNS,
+  serializeRunState,
+  type RunState,
+} from "./runState.ts";
 import {
   EXIT_PRECEDENCE,
   MAX_TARGETS_PER_RUN,
@@ -43,13 +50,22 @@ const summaryFor = (exitCode: number): RunSummary => ({
 });
 
 /**
- * EVERY RUN LINE THIS FILE PRODUCES IS CHECKED AGAINST THE TWO-CLAUSE INVARIANT AS IT IS
+ * EVERY RUN LINE THIS FILE PRODUCES IS CHECKED AGAINST THE THREE-CLAUSE INVARIANT AS IT IS
  * EMITTED, not only in L-11's own test. The property is the point; a test that only inspected
  * the cases it remembered to name would be exactly the hole the invariant exists to close.
+ *
+ * `ran` IS THE NUMBER OF `kind:"target"` LINES THE SAME RUN PRINTED, which is the only
+ * observable `probeSet.length` has -- there is no `ran` field on the run line and the docstring
+ * forbids adding one. The run line is always last, so the count is complete when it arrives.
  */
-const runLines: RunLine[] = [];
+interface ObservedRunLine {
+  line: RunLine;
+  ran: number;
+}
 
-const assertInvariant = (line: RunLine): void => {
+const runLines: ObservedRunLine[] = [];
+
+const assertInvariant = (line: RunLine, ran: number): void => {
   const sum = Object.values(line.exitCodes).reduce((total, count) => total + count, 0);
   if (line.error !== undefined) {
     // error present => exitCodes EMPTY.
@@ -57,11 +73,41 @@ const assertInvariant = (line: RunLine): void => {
       case: line.error,
       exitCodes: {},
     });
-  } else {
-    // error absent => the histogram sums to the count the SERVER returned.
+  } else if (!line.canary) {
+    // error absent, full run => the histogram sums to the count the SERVER returned.
     expect({ sum, targets: line.targets }).toEqual({ sum: line.targets, targets: line.targets });
+  } else {
+    // error absent, PROBE => the histogram sums to the probe set, which is a NON-EMPTY STRICT
+    // subset. `0 < ran` is the conjunct that keeps "a run that collected nothing and exited 0"
+    // unrepresentable; without it `sum === ran < targets` holds vacuously at ran = 0.
+    expect({ sum, ran, strict: sum > 0 && sum < line.targets }).toEqual({
+      sum: ran,
+      ran,
+      strict: true,
+    });
   }
 };
+
+/**
+ * `targetId` IS ON THE RUNTIME CONFIG AND NOT ON `CollectorConfig`, and that is the shipped
+ * state rather than a gap this slice introduces: `perTargetConfig` is built as
+ * `{...process, ...market, ...target}` and a SPREAD is exempt from TypeScript's excess-property
+ * check, so the field is present at runtime (L-1 asserts the whole object) and absent from the
+ * type. This reader is where that is said out loud instead of a bare cast at each use.
+ */
+const targetIdOf = (config: CollectorConfig): string =>
+  (config as CollectorConfig & { targetId?: string }).targetId ?? "";
+
+/** A state file's bytes, built from a partial so each test says only what it is about. */
+const stateFile = (over: Partial<RunState> = {}): string =>
+  serializeRunState({
+    version: 1,
+    consecutive: {},
+    alarm: {},
+    probe: 0,
+    canaryRuns: 0,
+    ...over,
+  });
 
 interface HarnessOptions {
   targets?: readonly unknown[];
@@ -70,9 +116,22 @@ interface HarnessOptions {
   fetchResult?: FetchWatchTargetsResult;
   /** Per-target exit code, by index, for the injected `run`. */
   codes?: readonly number[];
+  /** Per-target `reason`, by index. Only the two refusal reasons change any behaviour. */
+  reasons?: readonly (string | undefined)[];
+  /** Per-target listing ids, BY TARGET ID, so a probe's ids do not shift with the slice. */
+  ids?: Record<string, readonly string[]>;
   /** Index whose `run` throws instead of resolving. */
   throwAt?: number;
   dryRun?: boolean;
+  htmlFile?: string | null;
+  /** The state file's bytes. `undefined` means "no file", the first-ever-run case. */
+  state?: string | null;
+  /** `readState` rejects instead of resolving. */
+  readStateThrows?: boolean;
+  /** `writeState` rejects instead of resolving. */
+  writeStateThrows?: boolean;
+  /** What the health POST answers. */
+  healthResult?: HealthPostResult;
 }
 
 const harness = async (options: HarnessOptions = {}) => {
@@ -81,9 +140,12 @@ const harness = async (options: HarnessOptions = {}) => {
   const sleeps: number[] = [];
   /** An ordered trace, so "printed as it happens" can be asserted rather than assumed. */
   const events: string[] = [];
+  const written: string[] = [];
+  const healthReports: RunHealthReport[] = [];
 
   const targets = options.targets ?? [target("only")];
   const codes = options.codes ?? [];
+  let ranLines = 0;
 
   const dependencies: RunAllTargetsDependencies = {
     fetchTargets: async () =>
@@ -96,9 +158,26 @@ const harness = async (options: HarnessOptions = {}) => {
       const index = runCalls.length;
       runCalls.push(config);
       if (options.throwAt === index) throw new Error(`target ${index} exploded`);
-      const exitCode = codes[index] ?? 0;
+      // BY TARGET ID WHERE THE TEST SUPPLIES ONE, so that a probe running targets 3 and 7 gets
+      // THEIR codes rather than the first two in the list -- a by-index lookup would make the
+      // probe tests silently assert the wrong targets' outcomes.
+      const id = targetIdOf(config);
+      const byId = targets.findIndex(
+        (row) =>
+          typeof row === "object" && row !== null && (row as { targetId?: string }).targetId === id,
+      );
+      const slot = byId === -1 ? index : byId;
+      const exitCode = codes[slot] ?? 0;
       events.push(`run:${config.componentType}:${index}`);
-      return { exitCode, summary: summaryFor(exitCode) };
+      return {
+        exitCode,
+        summary: {
+          ...summaryFor(exitCode),
+          reason: (options.reasons?.[slot] ??
+            summaryFor(exitCode).reason) as RunSummary["reason"],
+        },
+        listingIds: options.ids?.[id] ?? [],
+      };
     },
     sleep: async (milliseconds) => {
       sleeps.push(milliseconds);
@@ -108,17 +187,36 @@ const harness = async (options: HarnessOptions = {}) => {
       lines.push(line);
       const parsed = JSON.parse(line) as { kind: string; target?: string };
       events.push(`log:${parsed.kind}:${parsed.target ?? ""}`);
+      if (parsed.kind === "target") ranLines += 1;
       if (parsed.kind === "run") {
         const runLine = JSON.parse(line) as RunLine;
-        runLines.push(runLine);
-        assertInvariant(runLine);
+        runLines.push({ line: runLine, ran: ranLines });
+        assertInvariant(runLine, ranLines);
       }
+    },
+    readState: async () => {
+      if (options.readStateThrows === true) throw new Error("EACCES: permission denied");
+      return options.state ?? null;
+    },
+    writeState: async (serialized) => {
+      if (options.writeStateThrows === true) throw new Error("EROFS: read-only file system");
+      written.push(serialized);
+      events.push("write-state");
+    },
+    postHealth: async (report) => {
+      healthReports.push(report);
+      events.push("post-health");
+      return options.healthResult ?? { ok: true };
     },
   };
 
   const exitCode = await runAllTargets(
     {
-      process: { ...processConfig, dryRun: options.dryRun ?? processConfig.dryRun },
+      process: {
+        ...processConfig,
+        dryRun: options.dryRun ?? processConfig.dryRun,
+        htmlFile: options.htmlFile ?? processConfig.htmlFile,
+      },
       delayMs: options.delayMs ?? 0,
     },
     dependencies,
@@ -132,8 +230,14 @@ const harness = async (options: HarnessOptions = {}) => {
     runCalls,
     sleeps,
     events,
+    written,
+    healthReports,
+    /** The state the run persisted, or `undefined` when it wrote none at all. */
+    savedState:
+      written.length === 0 ? undefined : (JSON.parse(written[written.length - 1]) as RunState),
     targetLines: parsedLines.filter((line) => line.kind === "target"),
-    runLine: parsedLines[parsedLines.length - 1] as unknown as RunLine,
+    healthLines: parsedLines.filter((line) => line.kind === "run-health"),
+    runLine: parsedLines.find((line) => line.kind === "run") as unknown as RunLine,
   };
 };
 
@@ -163,7 +267,10 @@ describe("running every target in the watch list", () => {
     expect(sleeps).toEqual([60_000, 60_000]);
     // NOT before the first and NOT after the last -- the trace, not just the count.
     expect(events[0]).toBe("run:gpu:0");
-    expect(events[events.length - 1]).toBe("log:run:");
+    // THE LAST EVENT IS THE HEALTH POST, NOT THE RUN LINE, AND THAT IS THE RULED ORDER: the run
+    // line goes out FIRST and synchronously, then the POST is awaited. See `emit`.
+    expect(events[events.length - 1]).toBe("post-health");
+    expect(events[events.length - 2]).toBe("log:run:");
     expect(events.filter((event) => event === "sleep")).toHaveLength(2);
 
     const single = await harness({ targets: [target("a")], delayMs: 60_000 });
@@ -231,8 +338,20 @@ describe("running every target in the watch list", () => {
    * L-5: LINES ARE EMITTED DURING THE RUN, NOT BUFFERED. A process killed mid-run must still
    * leave the record of everything that completed -- and a test that only reads the final output
    * is blind to the difference.
+   *
+   * IT NOW ALSO PINS THE WHOLE TAIL'S ORDER, AND THAT IS A RULING RATHER THAN A DETAIL.
+   * `write-state` -> `log:run:` -> `post-health` is the only order in which the run line -- the
+   * laptop's ONLY durable record, and what `docs/collector-ingest.md`'s shipped health check
+   * reads -- cannot be lost to a 10 s network call. Awaiting the POST first would make it
+   * losable, and the exposure window would be LONGEST EXACTLY WHEN THE WORKER IS UNREACHABLE,
+   * i.e. in the scenario this slice exists for: the loss probability would be correlated with
+   * the failure being reported, not a flat 10 s in 1,800.
+   *
+   * `write-state` BEFORE the run line is the other half: `guard-blind` has to be known before
+   * the line is serialized, or the log's `alarms` and the health row's `alarms` differ by
+   * construction -- two authorities on one field. It is a local file write, not a network call.
    */
-  it("L-5: target 1's line is printed before the first sleep", async () => {
+  it("L-5: target 1's line is printed before the first sleep, and the run line before the POST", async () => {
     const { events } = await harness({ targets: [target("a"), target("b")], delayMs: 60_000 });
 
     expect(events).toEqual([
@@ -241,7 +360,9 @@ describe("running every target in the watch list", () => {
       "sleep",
       "run:gpu:1",
       "log:target:b",
+      "write-state",
       "log:run:",
+      "post-health",
     ]);
   });
 
@@ -497,36 +618,523 @@ describe("running every target in the watch list", () => {
     await expect(realSleep(0)).resolves.toBeUndefined();
   });
 
+  /* ---------- the guard: the probe, the state file and the health report ---------- */
+
+  /** Nine targets, like production. `t0`..`t8`, so a cause can name a specific one. */
+  const nine = Array.from({ length: 9 }, (_value, index) => target(`t${index}`));
+
   /**
-   * L-11: THE TWO-CLAUSE INVARIANT, AS A PROPERTY OVER EVERY CASE IN THIS FILE.
+   * L-15: A LATCHED CAUSE MAKES THE NEXT RUN A PROBE OF THAT CAUSE'S TARGETS.
    *
-   *   error !== undefined  =>  exitCodes is EMPTY
-   *   error === undefined  =>  sum(Object.values(exitCodes)) === targets
+   * `targets` still reports NINE -- the count the server returned -- while two ran, which is the
+   * whole reason the run line's `targets` is defined the way it is. The mutation that matters is
+   * ignoring `state.alarm` when choosing the set: nine targets run, `sleep` is called eight
+   * times, and the line says `canary:false` while the page claims a reduction.
+   */
+  it("L-15: a latched cause probes its own targets, reports canary:true and targets:9", async () => {
+    const { runCalls, runLine, sleeps, exitCode } = await harness({
+      targets: nine,
+      delayMs: 60_000,
+      state: stateFile({
+        consecutive: { t4: { sourceEmpty: 3, transient: 0 } },
+        alarm: { "source-empty:t4": { runs: 4, cleanProbes: 0 } },
+      }),
+    });
+
+    expect(runCalls.map(targetIdOf)).toEqual(["t4"]);
+    expect(runLine.canary).toBe(true);
+    expect(runLine.targets).toBe(9);
+    expect(runLine.exitCodes).toEqual({ "0": 1 });
+    // ONE target means ZERO sleeps: the throttle is between targets that RAN.
+    expect(sleeps).toEqual([]);
+    expect(exitCode).toBe(0);
+  });
+
+  /**
+   * L-15b: TWO SINGLE-TARGET CAUSES FILL THE PROBE, and the cursor is what picks which two.
+   * `probe: 1` over the sorted cause list starts at the second cause, so the walk is cyclic
+   * rather than a prefix -- a prefix implementation would run t1 and t3 on every run forever and
+   * `source-empty:t8` could never clear.
+   */
+  it("L-15b: the probe is two causes from the cursor, cyclically, and never exceeds the cap", async () => {
+    const { runCalls, runLine, sleeps } = await harness({
+      targets: nine,
+      delayMs: 60_000,
+      state: stateFile({
+        probe: 2,
+        alarm: {
+          "source-empty:t1": { runs: 9, cleanProbes: 0 },
+          "source-empty:t3": { runs: 9, cleanProbes: 0 },
+          "source-empty:t8": { runs: 9, cleanProbes: 0 },
+        },
+      }),
+    });
+
+    // Sorted causes are [t1, t3, t8]; `probe: 2` starts at t8 and wraps to t1.
+    expect(runCalls.map(targetIdOf)).toEqual(["t1", "t8"]);
+    expect(runCalls.length).toBeLessThanOrEqual(CANARY_TARGETS);
+    expect(runLine.canary).toBe(true);
+    expect(sleeps).toEqual([60_000]);
+  });
+
+  /**
+   * L-16: A PROBE REPORTS `complete:false`, AND THAT IS HONEST RATHER THAN AWKWARD. Two of nine
+   * searches ran, so the run is not complete. The mutation is making `isComplete` count what
+   * ran, which reports `complete:true` on a run that collected two ninths of the data -- and
+   * `complete` is one of the four conjuncts the page's health derivation reads.
+   */
+  it("L-16: a probe run reports complete:false although every target that ran exited 0", async () => {
+    const { runLine } = await harness({
+      targets: nine,
+      state: stateFile({ alarm: { "source-empty:t4": { runs: 4, cleanProbes: 0 } } }),
+    });
+
+    expect(runLine.exitCodes).toEqual({ "0": 1 });
+    expect(runLine.exitCode).toBe(0);
+    expect(runLine.complete).toBe(false);
+  });
+
+  /**
+   * L-17: A PROBE TARGET THAT FAILS VALIDATION IS STILL A RESULT -- TWO CODES, NOT ONE.
+   *
+   * THE MUTATION IS `filter(parseOk)` INSIDE THE PROBE SET, which is the natural implementation
+   * when the watch list has to be turned into ids: build it from validated rows and the probe
+   * silently shrinks by exactly the broken rows, so `exitCodes` sums to 1 and the invariant's
+   * third clause still holds. The run line would then report a clean probe of a target whose
+   * configuration is broken.
+   */
+  it("L-17: a probe target whose row fails validation still produces its own exit 2", async () => {
+    const { runLine, targetLines } = await harness({
+      targets: [
+        target("t0"),
+        { targetId: "t1", componentType: "", query: "cpu" },
+        target("t2"),
+        target("t3"),
+      ],
+      state: stateFile({
+        alarm: {
+          "source-empty:t1": { runs: 4, cleanProbes: 0 },
+          "source-empty:t3": { runs: 4, cleanProbes: 0 },
+        },
+      }),
+    });
+
+    expect(targetLines.map((line) => line.target)).toEqual(["t1", "t3"]);
+    expect(runLine.exitCodes).toEqual({ "0": 1, "2": 1 });
+    expect(
+      Object.values(runLine.exitCodes).reduce((total, count) => total + count, 0),
+    ).toBe(2);
+    expect(runLine.canary).toBe(true);
+  });
+
+  /**
+   * L-18: VOLUME NEVER INCREASES, AS A PROPERTY OVER EVERY CASE IN THIS FILE.
+   *
+   * INVARIANT 5 is the one invariant whose violation is not recoverable: losing the residential
+   * IP cannot be undone by backing off afterwards. So this is asserted as a property over every
+   * run line the file produced, not as a row about the case someone remembered.
+   *
+   * The mutations are `CANARY_TARGETS = 12` and running the probe set twice; either makes the
+   * inequality false. It runs late on purpose, like L-11'.
+   */
+  it("L-18: no run ever ran more targets than the watch list, and a probe never exceeds the cap", () => {
+    expect(runLines.length).toBeGreaterThan(20);
+
+    for (const { line, ran } of runLines) {
+      expect(ran).toBeLessThanOrEqual(Math.min(line.targets, MAX_TARGETS_PER_RUN));
+      if (line.canary) expect(ran).toBeLessThanOrEqual(CANARY_TARGETS);
+    }
+
+    // Non-vacuity: at least one line really was a probe, or the second clause never ran.
+    expect(runLines.some(({ line }) => line.canary)).toBe(true);
+  });
+
+  /**
+   * L-26: AN EMPTY PROBE SET, OR ONE EQUAL TO THE WHOLE LIST, IS A FULL RUN WITH `canary:false`.
+   *
+   * THE MUTATION IS RUNNING THE EMPTY SET, and its failure shape is the sharpest in the file: a
+   * run that makes ZERO requests, stores NOTHING, and exits 0 -- `exitCodes:{}` with `error`
+   * absent, which also violates the invariant. `watch_targets` has no `enabled` column, so the
+   * only way to pause a search is to DELETE its row, which is how a cause comes to name a target
+   * that is gone.
+   */
+  it("L-26: a cause naming only absent targets is a FULL run, not an empty probe", async () => {
+    const { runCalls, runLine, savedState } = await harness({
+      targets: [target("t0"), target("t1")],
+      state: stateFile({ alarm: { "source-empty:deleted-target": { runs: 9, cleanProbes: 0 } } }),
+    });
+
+    expect(runCalls.map(targetIdOf)).toEqual(["t0", "t1"]);
+    expect(runLine.canary).toBe(false);
+    expect(runLine.exitCodes).toEqual({ "0": 2 });
+    // ...and the unprobeable cause is pruned rather than left to strand the next run too.
+    expect(savedState?.alarm).toEqual({});
+    expect(runLine.alarms).toEqual([]);
+  });
+
+  /**
+   * L-26b: A SINGLE-TARGET WATCH LIST WITH THAT TARGET LATCHED IS A FULL RUN. The probe set
+   * would be `{t0}`, which EQUALS the whole list -- not a reduction -- so reporting `canary:true`
+   * would be the page claiming a cut that did not happen.
+   */
+  it("L-26b: a probe set equal to the whole watch list reports canary:false", async () => {
+    const { runCalls, runLine } = await harness({
+      targets: [target("t0")],
+      state: stateFile({ alarm: { "source-empty:t0": { runs: 9, cleanProbes: 0 } } }),
+    });
+
+    expect(runCalls).toHaveLength(1);
+    expect(runLine.canary).toBe(false);
+    expect(runLine.targets).toBe(1);
+  });
+
+  /**
+   * L-19: A THROWING `writeState` CHANGES NO EXIT CODE, AND IS REPORTED AS `guard-blind`.
+   *
+   * A health surface that manufactures an exit 2 out of a read-only disk is worse than none: the
+   * exit code is launchd's `LastExitStatus` and the operator's only signal. But a write that
+   * failed means the NEXT run forgets this one, so it is loud in the log instead.
+   *
+   * `guard-blind` NEVER ENTERS `state.alarm` -- the guard's mode is decided from `state.alarm`
+   * and never from the run line's `alarms`, because otherwise a read-only disk would pin the
+   * collector at 2 of 9 over a local filesystem problem that reducing Facebook traffic does
+   * nothing whatsoever about.
+   */
+  it("L-19: a write failure is reported as guard-blind and the exit code is untouched", async () => {
+    const { exitCode, runLine, healthReports } = await harness({
+      targets: [target("t0"), target("t1")],
+      writeStateThrows: true,
+    });
+
+    expect(exitCode).toBe(0);
+    expect(runLine.exitCode).toBe(0);
+    expect(runLine.alarms).toEqual(["guard-blind"]);
+    expect(runLine.canary).toBe(false);
+    // THE SENT BODY AND THE LOGGED LINE CARRY THE SAME ARRAY. Two authorities on one field is
+    // the defect that the emit ordering exists to make unrepresentable.
+    expect(healthReports[0].alarms).toEqual(["guard-blind"]);
+  });
+
+  /**
+   * L-20: A FAILING HEALTH POST CHANGES NO EXIT CODE, AND IS REPORTED ON A TRAILING LINE.
+   *
+   * THE MUTATION IS FOLDING THE HEALTH RESULT INTO `codes`, which makes a 400 from the health
+   * route exit 6 -- so a Worker deploy that renamed a field would take the collector's exit
+   * status with it and launchd would report a write failure that never happened.
+   *
+   * IT IS A TRAILING LINE AND NOT AN `alarms` ENTRY, which is the ordering ruling: the POST's
+   * outcome is not known until the run line is already printed, and the alternative -- reporting
+   * it in the log but not in the body that was sent -- makes the two `alarms` arrays differ by
+   * construction.
+   */
+  it("L-20: a health POST failure is a trailing run-health line, not an exit code", async () => {
+    const { exitCode, runLine, healthLines } = await harness({
+      targets: [target("t0")],
+      healthResult: { ok: false, reason: "status 400, INVALID_COLLECTOR_HEALTH" },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(runLine.exitCode).toBe(0);
+    expect(runLine.alarms).toEqual([]);
+    expect(healthLines).toEqual([
+      { kind: "run-health", reported: false, reason: "status 400, INVALID_COLLECTOR_HEALTH" },
+    ]);
+  });
+
+  it("L-20b: a health POST that succeeded appends no trailing line", async () => {
+    const { healthLines, healthReports } = await harness({ targets: [target("t0")] });
+
+    expect(healthLines).toEqual([]);
+    expect(healthReports).toHaveLength(1);
+  });
+
+  /**
+   * L-21: THE HEALTH REPORT IS SENT UNDER DRY-RUN, CARRYING `dryRun:true`. INVARIANT 3.
+   *
+   * THE MUTATION IS `if (dryRun) return` BEFORE THE POST, and it is the obvious reading -- "do
+   * not report a run that collected nothing". It rebuilds exactly the lie this slice exists to
+   * kill, in the STALE disguise: a dry-run collector would read `stale` on the page, and "stale"
+   * reads as a broken cron, whereas `dry_run:1` says WHY nothing is being collected.
+   *
+   * `fixture` IS THE SAME LIE BY A DIFFERENT MECHANISM and is asserted in the same row: a
+   * punctual run, exit 0, `complete:true`, every listing stored -- off a saved page.
+   */
+  it("L-21: the health report is SENT under dry-run and under a fixture, carrying both flags", async () => {
+    const dry = await harness({ targets: [target("t0")], dryRun: true });
+    expect(dry.healthReports).toHaveLength(1);
+    expect(dry.healthReports[0]).toMatchObject({ dryRun: true, exitCode: 0, complete: true });
+
+    const fixture = await harness({
+      targets: [target("t0")],
+      htmlFile: "collector/testing/fixtures/facebookSearchPage.html",
+    });
+    expect(fixture.healthReports).toHaveLength(1);
+    expect(fixture.healthReports[0]).toMatchObject({ fixture: true, dryRun: false });
+
+    const live = await harness({ targets: [target("t0")] });
+    expect(live.healthReports[0]).toMatchObject({ fixture: false, dryRun: false });
+  });
+
+  /**
+   * L-24: HEALTH IS POSTED ON EVERY WHOLE-RUN FAILURE PATH -- ALL SIX, TABLE-DRIVEN.
+   *
+   * THE MUTATION IS POSTING ONLY AFTER THE LOOP, and the consequence is the one the plan's own
+   * round-one draft had: a configuration error posts NO health at all, so the page says nothing
+   * is wrong until the row goes stale 45 minutes later -- AND THEN BLAMES THE LAPTOP FOR A
+   * CONFIG ERROR. All six paths return BEFORE the loop and all six have `apiBase` and `token` in
+   * hand, so there is no path on which reporting is impossible.
+   */
+  it.each<[string, HarnessOptions]>([
+    ["a bad delay", { delayMs: -1 }],
+    ["a delay that cannot fit the window", { delayMs: 600_000 }],
+    [
+      "an unreadable watch list",
+      { fetchResult: { ok: false, status: 503, code: null, reason: "http-server-error", retryable: true } },
+    ],
+    ["an empty watch list", { targets: [] }],
+    [
+      "a list over the cap",
+      { targets: Array.from({ length: 10 }, (_value, index) => target(`t${index}`)) },
+    ],
+    ["a null market", { market: null }],
+  ])("L-24: %s still posts exactly one health report", async (_label, options) => {
+    const { healthReports, runLine } = await harness(options);
+
+    expect(healthReports).toHaveLength(1);
+    expect(healthReports[0]).toMatchObject({
+      exitCode: runLine.exitCode,
+      complete: false,
+      canary: false,
+      targets: runLine.targets,
+      alarms: [],
+    });
+    expect(runLine.error).toBeDefined();
+  });
+
+  /**
+   * L-25: A WHOLE-RUN FAILURE WRITES NO STATE AT ALL.
+   *
+   * THE MUTATION IS WRITING STATE ON THE FAILURE PATHS, and its failure shape is a laundered
+   * streak: a cap refusal between two empty runs resets a real `source-empty` counter, so the
+   * alarm the operator needs can be held off indefinitely by an unrelated configuration error.
+   * No targets ran, so there is NO EVIDENCE -- `consecutive` must not reset, `cleanProbes` must
+   * not advance, and `canaryRuns` must not advance because no requests were made. Not writing
+   * makes all three structural rather than careful.
+   */
+  it.each<[string, HarnessOptions]>([
+    ["a bad delay", { delayMs: -1 }],
+    ["an empty watch list", { targets: [] }],
+    [
+      "a list over the cap",
+      { targets: Array.from({ length: 10 }, (_value, index) => target(`t${index}`)) },
+    ],
+    ["a null market", { market: null }],
+  ])("L-25: %s writes no state", async (_label, options) => {
+    const { written, savedState } = await harness({
+      ...options,
+      state: stateFile({
+        consecutive: { t0: { sourceEmpty: 2, transient: 0 } },
+        canaryRuns: 7,
+      }),
+    });
+
+    expect(written).toEqual([]);
+    expect(savedState).toBeUndefined();
+  });
+
+  /**
+   * L-28: THE `reason` REACHES `advanceState`, SO A REFUSAL LATCHES ON THE FIRST OCCURRENCE.
+   *
+   * THIS ROW EXISTS BECAUSE A MUTATION SURVIVED WITHOUT IT. `collector/runState.test.ts` G-6
+   * drives the two IMMEDIATE_REFUSAL_REASONS with CONSTRUCTED input, so it is blind to whether
+   * anything ever hands it a real `reason` -- and replacing this file's
+   * `reason: outcome.summary?.reason ?? null` with a flat `null` left the whole unit suite green
+   * with the rate-limit guard silently disarmed. That is the same hole `realSleep` fell into, one
+   * layer up: a value only as good as what observes it.
+   *
+   * THE SECOND HALF IS WHAT MAKES IT A LINK TEST RATHER THAN A RESTATEMENT OF G-6: the NEXT run
+   * must be a probe of that target, which can only happen if the cause was written to the state
+   * file the previous run produced.
+   */
+  it("L-28: one exit 5 with reason rate-limited latches on the first run and cuts the next", async () => {
+    const first = await harness({
+      targets: nine,
+      codes: [0, 0, 5, 0, 0, 0, 0, 0, 0],
+      reasons: [undefined, undefined, "rate-limited"],
+    });
+
+    expect(first.runLine.alarms).toEqual(["refused:t2"]);
+    expect(first.runLine.canary).toBe(false);
+    expect(first.healthReports[0].alarms).toEqual(["refused:t2"]);
+
+    const second = await harness({
+      targets: nine,
+      state: JSON.stringify(first.savedState),
+    });
+
+    expect(second.runCalls.map(targetIdOf)).toEqual(["t2"]);
+    expect(second.runLine.canary).toBe(true);
+  });
+
+  /**
+   * L-28b: AN ORDINARY EXIT 5 DOES NOT. The real log's only exit 5 is a POST failure carrying
+   * `reason:"ok"`, so without this row L-28 would pass against a mutation that latched on EVERY
+   * exit 5 -- which would cut volume by 78 % the first time D1 hiccupped.
+   */
+  it("L-28b: one exit 5 whose reason is ok latches nothing", async () => {
+    const { runLine } = await harness({
+      targets: nine,
+      codes: [0, 0, 5, 0, 0, 0, 0, 0, 0],
+      reasons: [undefined, undefined, "ok"],
+    });
+
+    expect(runLine.alarms).toEqual([]);
+    expect(runLine.exitCode).toBe(5);
+  });
+
+  /**
+   * L-27: AT `MAX_CANARY_RUNS` THE RUN IS FULL, `canary-expired` JOINS `alarms`, AND THE ALARM
+   * STANDS.
+   *
+   * This is the reporting half of the expiry; `collector/runState.test.ts` G-19 owns the state
+   * half. THE MUTATION IS DROPPING `canary-expired` FROM THE REPORTED ARRAY, whose failure shape
+   * is a page that reads `degraded` with the cause still named but no explanation for why nine
+   * searches ran that run -- the operator concludes the guard cleared itself and stops looking.
+   *
+   * It is sorted into the array rather than appended, so the order is deterministic whatever
+   * causes are latched.
+   */
+  it("L-27: the expiry run is FULL, reports canary-expired, and keeps the cause", async () => {
+    const { runCalls, runLine, savedState } = await harness({
+      targets: nine,
+      state: stateFile({
+        canaryRuns: MAX_CANARY_RUNS,
+        alarm: { "source-empty:t4": { runs: 52, cleanProbes: 0 } },
+      }),
+    });
+
+    expect(runCalls).toHaveLength(9);
+    expect(runLine.canary).toBe(false);
+    expect(runLine.alarms).toEqual(["canary-expired", "source-empty:t4"]);
+    // THE ALARM IS STILL RAISED. The expiry flips only the volume cut.
+    expect(Object.keys(savedState?.alarm ?? {})).toEqual(["source-empty:t4"]);
+    expect(savedState?.canaryRuns).toBe(0);
+  });
+
+  /**
+   * L-22: AN UNREADABLE STATE FILE IS A FRESH STATE AND THE RUN PROCEEDS AT FULL VOLUME.
+   *
+   * THE MUTATION IS DEFAULTING TO A PROBE, whose failure shape is a FIRST-EVER run pinned at 2 of
+   * 9 -- the absent file is the normal case, not an exceptional one, because nothing writes it
+   * until the first run finishes. A read failure is deliberately NOT reported as `guard-blind`:
+   * ENOENT on the first run would put a permanent alarm on the page, and the condition is
+   * already visible in what the run does.
+   */
+  it.each<[string, HarnessOptions]>([
+    ["no file at all", {}],
+    ["a read that threw", { readStateThrows: true }],
+    ["an empty file", { state: "" }],
+    ["garbage", { state: "{not json" }],
+    ["a latch with no version", { state: '{"alarm":{"source-empty:t0":{"runs":9,"cleanProbes":0}}}' }],
+  ])("L-22: %s runs at FULL volume with no alarms", async (_label, options) => {
+    const { runCalls, runLine } = await harness({ targets: nine, ...options });
+
+    expect(runCalls).toHaveLength(9);
+    expect(runLine.canary).toBe(false);
+    expect(runLine.alarms).toEqual([]);
+  });
+
+  /**
+   * L-23: THE OVERLAP IS COMPUTED FROM ID SETS, NOT FROM COUNTS.
+   *
+   * THE MUTATION IS COMPARING `summary.parsed` OR `summary.contributions`, both of which are on
+   * the per-target summary and both of which are IDENTICAL on nine targets that returned nine
+   * DISJOINT pages -- the ordinary healthy run. Under it every healthy run latches
+   * `feed-overlap` and the guard pins the collector at 2 of 9 forever.
+   *
+   * 24 ids each, which is a real page's yield, so the floor is cleared and the pair loop really
+   * does evaluate all 36 pairs.
+   */
+  it("L-23: nine targets with 24 DISJOINT ids each raise no alarm", async () => {
+    const ids: Record<string, readonly string[]> = {};
+    for (let index = 0; index < 9; index += 1) {
+      ids[`t${index}`] = Array.from({ length: 24 }, (_value, slot) => `t${index}-listing-${slot}`);
+    }
+
+    const { runLine } = await harness({ targets: nine, ids });
+
+    expect(runLine.alarms).toEqual([]);
+    expect(runLine.canary).toBe(false);
+    // ...and the measurement is reported anyway, which is what makes the absence above evidence
+    // rather than the silence of a feature that never ran.
+    expect(runLine.overlap).toEqual({ a: "t0", b: "t1", shared: 0, of: 24 });
+  });
+
+  /**
+   * L-23b: THE SAME NINE TARGETS SERVING ONE IDENTICAL PAGE LATCH EXACTLY ONE CAUSE, and the run
+   * line reports the measurement. This is the shape of the degradation actually observed: three
+   * different queries, one answer, every run exiting 0.
+   */
+  it("L-23b: nine targets serving ONE identical 24-listing page latch one feed cause", async () => {
+    const feed = Array.from({ length: 24 }, (_value, slot) => `shared-${slot}`);
+    const ids = Object.fromEntries(nine.map((row) => [row.targetId, feed]));
+
+    const { runLine, savedState, exitCode } = await harness({ targets: nine, ids });
+
+    expect(exitCode).toBe(0);
+    expect(runLine.alarms).toEqual(["feed-overlap:t0+t1"]);
+    expect(runLine.overlap).toEqual({ a: "t0", b: "t1", shared: 24, of: 24 });
+    expect(Object.keys(savedState?.alarm ?? {})).toEqual(["feed-overlap:t0+t1"]);
+    // THE LATCH DOES NOT CUT THIS RUN. The cut starts on the NEXT run, because this one had
+    // already made its nine requests by the time the overlap was measurable.
+    expect(runLine.canary).toBe(false);
+  });
+
+  /**
+   * L-11': THE THREE-CLAUSE INVARIANT, AS A PROPERTY OVER EVERY CASE IN THIS FILE.
+   *
+   *   error !== undefined             =>  exitCodes is EMPTY
+   *   error === undefined && !canary  =>  sum(Object.values(exitCodes)) === targets
+   *   error === undefined && canary   =>  sum === probeSet.length AND 0 < probeSet.length < targets
    *
    * Every run line above was checked as it was emitted; this test proves the property is not
-   * VACUOUS -- that both branches were actually exercised, and that a `targets:N, exitCodes:{}`
-   * line really does occur, which is the case the single-clause "the sum always equals targets"
-   * form gets wrong. THIS ROW IS WHAT STOPS A LATER EDIT REDEFINING `targets` AS THE COUNT THAT
-   * RAN: under that redefinition the cap refusal and the null market both report targets:0.
+   * VACUOUS -- that all three branches were actually exercised, and that a `targets:N,
+   * exitCodes:{}` line really does occur, which is the case the single-clause "the sum always
+   * equals targets" form gets wrong. THIS ROW IS WHAT STOPS A LATER EDIT REDEFINING `targets` AS
+   * THE COUNT THAT RAN: under that redefinition the cap refusal and the null market both report
+   * targets:0.
+   *
+   * CLAUSE 3'S `0 < probeSet.length` CONJUNCT IS ASSERTED HERE AND NOT ONLY IN L-26. The shorter
+   * `sum === probeSet.length < targets` form HOLDS at length 0 -- `0 === 0 && 0 < targets` --
+   * which pushes the guarantee out of the invariant and into a behaviour test. Both are kept.
    *
    * It runs last on purpose: `runLines` is filled by every harness call in this file.
    */
-  it("L-11: both clauses hold on every run line, and both branches were exercised", () => {
+  it("L-11': all three clauses hold on every run line, and all three branches were exercised", () => {
     expect(runLines.length).toBeGreaterThan(20);
 
-    for (const line of runLines) {
+    for (const { line, ran } of runLines) {
       const sum = Object.values(line.exitCodes).reduce((total, count) => total + count, 0);
       if (line.error !== undefined) {
         expect(line.exitCodes).toEqual({});
-      } else {
+      } else if (!line.canary) {
         expect(sum).toBe(line.targets);
+      } else {
+        expect(sum).toBe(ran);
+        expect(sum).toBeGreaterThan(0);
+        expect(sum).toBeLessThan(line.targets);
       }
     }
 
-    // Non-vacuity, both ways.
-    expect(runLines.some((line) => line.error !== undefined)).toBe(true);
-    expect(runLines.some((line) => line.error === undefined && line.targets > 0)).toBe(true);
+    // Non-vacuity, all three ways.
+    expect(runLines.some(({ line }) => line.error !== undefined)).toBe(true);
+    expect(
+      runLines.some(({ line }) => line.error === undefined && !line.canary && line.targets > 0),
+    ).toBe(true);
+    // THE NEW CLAUSE'S OWN NON-VACUITY. Without a probe run anywhere in this file, clause 3 is
+    // never evaluated and the loop above is a two-clause check wearing a three-clause comment.
+    expect(runLines.some(({ line }) => line.error === undefined && line.canary)).toBe(true);
     // The case the one-clause form gets wrong: an error line whose `targets` is NOT zero.
-    expect(runLines.some((line) => line.error !== undefined && line.targets > 0)).toBe(true);
+    expect(runLines.some(({ line }) => line.error !== undefined && line.targets > 0)).toBe(true);
   });
 });

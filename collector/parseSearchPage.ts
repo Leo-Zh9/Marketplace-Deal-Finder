@@ -20,8 +20,17 @@
  *
  * HONEST LIMIT, stated here rather than buried: the four evidence markers are NOT independent.
  * One wholesale response rename could remove all four together with the anchor, and we would
- * report SOURCE_EMPTY forever. A single response cannot rule that out; the residual defence is
- * an alarm on N consecutive empty runs, which needs cross-run state and is NOT built here.
+ * report SOURCE_EMPTY forever. A single response cannot rule that out.
+ *
+ * THE RESIDUAL DEFENCE NOW EXISTS, AND IT IS STILL NOT IN THIS FILE. The sentence that stood here
+ * ended "an alarm on N consecutive empty runs, which needs cross-run state and is NOT built
+ * here", and both halves were true: it needed cross-run state, and a single-page parser is the
+ * wrong place for it. `collector/runState.ts` holds that state -- a per-target counter in
+ * `~/.marketplace-collector-state.json` that latches `source-empty:<target>` at three consecutive
+ * exit 3s -- and `collector/runTargets.ts` drives it. NOTHING IN THIS FILE CHANGED, and nothing
+ * here should: the parser still answers for ONE page and the alarm still answers for a sequence
+ * of runs. The honest limit above is unchanged too; what changed is that a wholesale rename is
+ * now LOUD within 90 minutes instead of silent forever.
  */
 
 import { buildListingUrl } from "./searchUrl.ts";

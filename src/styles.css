@@ -1359,3 +1359,101 @@ input[aria-invalid="true"] {
   width: 100%;
   margin-top: 0;
 }
+
+/* THE COLLECTION PANEL. Every class below is reached from CollectionStatusPanel.tsx, and
+   src/styles.test.ts discovers that file by globbing the component tree -- so a class here that
+   the component stops using, or one the component uses that is not here, fails that test on the
+   next run without anyone adding it to a list. That guard exists because this repository has
+   shipped a class with no rule TWICE.
+
+   THE GLOB PATTERN IS DESCRIBED RATHER THAN QUOTED, AND IT HAD TO BE. Writing it literally puts
+   the two characters that END a CSS comment inside one, so everything after it became live
+   stylesheet text -- MEASURED: `styles.test.ts`'s own last line (`.tsx` must appear in prose
+   only) went red, which is the only thing in the repository that would have noticed.
+
+   `collection-badge--${status}` IS A TEMPLATE LITERAL, so styles.test.ts checks only the static
+   prefix `collection-badge` and is BLIND to the four generated endings. They are written out in
+   full below for the reason the `.status-badge--not_deal` comment records: when the
+   EvaluationStatus union was renamed, the generated selector stopped matching anything and the
+   commonest badge on the page rendered with no pill at all, and nothing in the repository
+   noticed. Rename the union and these together or neither. */
+/* THE CARD IS WRITTEN OUT RATHER THAN BORROWED FROM `.configuration-panel, .results-panel`.
+   MEASURED WHILE WRITING THIS: the component first carried `className="panel collection-panel"`
+   on the assumption that a shared `.panel` base existed, and `src/styles.test.ts` went red with
+   `./components/CollectionStatusPanel.tsx -> .panel` -- there is no such rule; the base lives on
+   a two-selector list. Adding this panel to that list would have been the smaller diff, and it is
+   not taken: the two rules there are the FORM and the RESULTS, both 26 px padding and both much
+   taller, and a status badge wants less. So the shared values are repeated here deliberately, and
+   the duplication is the thing to notice if the card style ever changes. */
+.collection-panel {
+  padding: 20px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-top: 3px solid var(--blue-600);
+  border-radius: 14px;
+  box-shadow: 0 8px 24px rgba(28, 42, 67, 0.07);
+}
+
+.collection-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: baseline;
+}
+
+.collection-badge {
+  padding: 4px 9px;
+  border-radius: 999px;
+  font-size: 0.64rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.collection-badge--ok {
+  color: var(--success);
+  background: var(--success-soft);
+}
+
+/* `stale` AND `degraded` ARE BOTH WARNINGS AND NEITHER IS STYLED AS AN ERROR, deliberately.
+   `stale` survived a 12h46m closed lid on AC in testing -- 26 of 26 runs fired -- so it is a real
+   signal; but the untested case is a lid closed on battery, where launchd coalesces the missed
+   windows, and a red alarm the user learns to dismiss is worse than an amber one they read. */
+.collection-badge--stale {
+  color: var(--warning);
+  background: var(--warning-soft);
+}
+
+.collection-badge--degraded {
+  color: #8e1f2b;
+  background: var(--danger-soft);
+}
+
+.collection-badge--unknown {
+  color: var(--muted);
+  background: #eef1f5;
+}
+
+.collection-timestamp {
+  margin-bottom: 0;
+  color: var(--muted);
+  font-size: 0.76rem;
+}
+
+.collection-causes {
+  padding-left: 18px;
+  margin: 12px 0 0;
+  color: #172033;
+  font-size: 0.78rem;
+  line-height: 1.5;
+}
+
+.collection-reduced {
+  padding: 10px 12px;
+  margin: 12px 0 0;
+  color: #172033;
+  background: var(--warning-soft);
+  border-radius: 8px;
+  font-size: 0.78rem;
+  line-height: 1.5;
+}

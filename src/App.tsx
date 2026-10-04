@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { CollectionStatusPanel } from "./components/CollectionStatusPanel";
 import { ComponentSelector } from "./components/ComponentSelector";
 import { DealRuleForm } from "./components/DealRuleForm";
 import { ListingCard } from "./components/ListingCard";
@@ -15,6 +16,7 @@ import {
   type StoredTarget,
 } from "./services/watchSelection";
 import type {
+  CollectionStatus,
   ComponentType,
   Listing,
   ModelSelection,
@@ -106,6 +108,9 @@ function App({ identity, onSignOut, getToken }: AppProps) {
   const [previewedAt, setPreviewedAt] = useState<string | null>(null);
   const [requestError, setRequestError] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<string | null>(null);
+  /** `null` plus `collectionPending` false means the status read itself failed. */
+  const [collection, setCollection] = useState<CollectionStatus | null>(null);
+  const [collectionPending, setCollectionPending] = useState(true);
 
   /**
    * BOTH READS, AND SAVE STAYS DISABLED UNTIL BOTH SUCCEED. MEASURED: a 503 on load plus one click
@@ -163,6 +168,39 @@ function App({ identity, onSignOut, getToken }: AppProps) {
             "Could not read your saved searches. Saving is disabled until it loads.",
           ),
         );
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [getToken]);
+
+  /**
+   * THE STATUS READ IS A SEPARATE EFFECT AND IT MUST STAY ONE.
+   *
+   * IT IS NOT IN THE `Promise.all` ABOVE AND IT NEVER TOUCHES `loaded`. That effect's two reads
+   * gate Save for a measured reason: a 503 on load plus one click on a Save seeded from
+   * `initialSettings` wipes the live watch list and appends a search revision that re-opens the
+   * whole evaluation corpus. NONE of that applies to the collector's status -- it is a read-only
+   * badge -- so folding it in would make a failure of the ONE endpoint that is designed never to
+   * fail loudly (a missing DB binding is 200 `unknown`, not 503) take the user's ability to save
+   * their searches with it. A-2 is the guard and its mutation is adding it to the gate.
+   *
+   * A FAILURE IS A SENTENCE IN THE PANEL, NOT THE PAGE'S ERROR BANNER, for the same reason: the
+   * banner is about the thing the user was trying to do.
+   */
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const status = await marketplaceClient.getStatus(getToken);
+        if (cancelled) return;
+        setCollection(status);
+      } catch {
+        if (cancelled) return;
+        setCollection(null);
+      } finally {
+        if (!cancelled) setCollectionPending(false);
       }
     })();
     return () => {
@@ -686,19 +724,38 @@ function App({ identity, onSignOut, getToken }: AppProps) {
           </section>
 
           {/*
-            * THE MONITORING PANEL IS GONE, AND DELETING IT IS THE HONEST END OF DELETING THE
-            * Start/Stop BUTTONS. Those buttons were a fiction -- the browser never started
-            * collection, a launchd cron does -- but they were also the ONLY writers of the status
-            * the panel rendered. With them gone the panel could answer exactly one thing, forever:
-            * "Not running / Stopped / Next scan —", beside a line saying the collector reads this
-            * list every 30 minutes. A widget that can only say "no" to "is anything collecting?"
-            * is a worse lie than the buttons were.
+            * THE MONITORING PANEL CAME BACK, AND IT CAME BACK WITH A WRITER. The comment that
+            * stood here recorded why it had been deleted, and that reason was sound: the
+            * Start/Stop buttons were a fiction -- the browser never started collection, a launchd
+            * cron does -- but they were also the ONLY writers of the status the panel rendered,
+            * so with them gone the panel could answer exactly one thing forever, "Not running /
+            * Stopped / Next scan —", beside a line promising a 30-minute collector.
             *
-            * THE REAL THING NEEDS A READER FOR `monitor_runs`, which no browser route exposes:
-            * `GET /api/status` answers liveness, not runs. That is a slice, not a line, and it is
-            * the one to write before this panel comes back.
+            * WHAT CHANGED IS THE WRITER, NOT THE JUDGEMENT. `collector/runTargets.ts` now posts
+            * one health report per run line, through `POST /api/collector-health`, into a
+            * singleton D1 row that `GET /api/status` serves -- so every field below is written by
+            * the process that actually collects, 48 times a day, including on all six whole-run
+            * failure paths and including under COLLECTOR_DRY_RUN. The panel renders no field the
+            * writer does not write, and with nothing reported it says so in words rather than
+            * rendering "Stopped".
+            *
+            * THE OLD COMMENT'S LITERAL CONDITION IS STILL NOT MET, AND SAYING OTHERWISE WOULD BE
+            * THE SAME DEFECT ONE LEVEL UP. It named a reader for `monitor_runs`; there is still
+            * no such reader and no browser route exposes that table. What exists is a reader for a
+            * DIFFERENT table, written for this purpose. The evaluation-run history remains
+            * unreachable from the page.
+            */}
+          {/*
+            * INSIDE `results-column`, ABOVE THE PREVIEW, and the placement is not decoration.
+            * `dashboard-layout` is a TWO-COLUMN grid (`minmax(0, 1.05fr) minmax(390px, 0.95fr)`),
+            * so a third direct child would wrap onto a second grid row and sit under the form at
+            * half width. `results-column` is `display: grid; gap: 18px` -- already built to stack
+            * panels -- and above the preview is where the user looks before asking why there are
+            * no listings.
             */}
           <aside className="results-column" id="preview-results">
+            <CollectionStatusPanel status={collection} pending={collectionPending} />
+
             <section className="results-panel" aria-live="polite" aria-busy={pendingAction === "preview"}>
               <div className="results-heading">
                 <div>

@@ -402,4 +402,62 @@ describe("the kept searches", () => {
     expect(init?.method).toBe("PUT");
     expect(JSON.parse(String(init?.body)).preservedTargetIds).toEqual(["cpu-toronto"]);
   });
+
+  /**
+   * THE STATUS READ IS A GET TO `/api/status` WITH THE TOKEN AND NO BODY, and the body is passed
+   * through UNFLATTENED.
+   *
+   * THE MUTATION THAT MATTERS IS RESHAPING IT HERE -- picking fields, or defaulting `collector`
+   * to an object. Every field below is rendered by the panel, and the panel's whole contract is
+   * that it renders nothing the collector did not report; a client that invented a `collector`
+   * where the server sent `null` would make "No collector run has reported yet" unreachable,
+   * which is the state the deleted panel's "Stopped" occupied.
+   *
+   * `getStatus` IS THE SIXTH METHOD ON THE CLIENT AND IT DELIBERATELY DOES NOT JOIN THE TWO
+   * MOUNT READS. See `MarketplaceClient` for why: those two gate Save, and this one must not.
+   */
+  it("reads GET /api/status with the token and passes the body through unchanged", async () => {
+    const body = {
+      status: "degraded",
+      causes: ["canary", "feed-overlap:gpu-radeon+gpu-rtx"],
+      reportedAt: 1_800_000_000,
+      ageMinutes: 6,
+      collector: {
+        exitCode: 0,
+        complete: false,
+        canary: true,
+        dryRun: false,
+        fixture: false,
+        targets: 9,
+        alarms: ["feed-overlap:gpu-radeon+gpu-rtx"],
+      },
+      authentication: "firebase-google",
+    };
+    const fetchMock = stubJson(body);
+
+    const status = await marketplaceClient.getStatus(async () => "a-firebase-id-token");
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/api/status");
+    expect(init?.method).toBe("GET");
+    expect(init?.body).toBeUndefined();
+    expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer a-firebase-id-token");
+    expect(status).toEqual(body);
+  });
+
+  it("passes a null collector through rather than inventing one", async () => {
+    stubJson({
+      status: "unknown",
+      causes: [],
+      reportedAt: 0,
+      ageMinutes: 0,
+      collector: null,
+      authentication: "local-development",
+    });
+
+    const status = await marketplaceClient.getStatus(noToken);
+
+    expect(status.collector).toBeNull();
+    expect(status.status).toBe("unknown");
+  });
 });

@@ -725,7 +725,7 @@ filtered out.
 |---|---|
 | **0** | listings parsed, the POST returned 200, **and the Worker reported zero FAILED** |
 | 2 | a configuration error. Nothing self-heals: a required variable is missing, the watch list is empty or over the cap, the market is absent or unusable, a target row is unusable, or a negative/fractional target delay |
-| 3 | `SOURCE_EMPTY` — nothing posted. Normal on a quiet day; see the alarm note below |
+| 3 | `SOURCE_EMPTY` — nothing posted. Normal on a quiet day; **three in a row at one target latches an alarm** — see "The alarm" below |
 | 4 | `PROVIDER_FAILURE` — the page changed shape. **A human must look.** Nothing posted |
 | 5 | transient: the source was unavailable or rate-limited, the watch-list `GET` failed with 5xx/transport/timeout, or the POST failed with 5xx or a network error. The next run is the retry |
 | 6 | the POST was refused with a 4xx, or returned 200 while the Worker reported `FAILED > 0`; or the watch-list `GET` answered 4xx or a 200 of the wrong shape |
@@ -748,8 +748,48 @@ write outage carries the quieter code and would otherwise retry silently forever
 **A repeated exit 3 is also worth looking at.** The four evidence markers are field names in one
 GraphQL response and are not independent: a single wholesale rename could remove all four at the
 same time as the listing anchor, and the collector would report an empty market forever. One
-response cannot rule that out. The residual defence is an alarm on N consecutive empty runs,
-which needs cross-run state and **is not built**.
+response cannot rule that out.
+
+### The alarm, which is now built
+
+**Both of those sentences used to end "and is not built".** They do now. `collector/runState.ts`
+keeps cross-run state in `~/.marketplace-collector-state.json` (mode 600, outside the repository)
+and latches a **cause** when any of three conditions holds:
+
+| condition | cause | threshold |
+|---|---|---|
+| N consecutive exit 3 **at one target** | `source-empty:<target>` | `CONSECUTIVE_ALARM_RUNS = 3` |
+| N consecutive exit 5 **at one target** | `transient:<target>` | `CONSECUTIVE_ALARM_RUNS = 3` |
+| one exit 5 whose `reason` is `rate-limited` or `blocked-redirect` | `refused:<target>` | **1** |
+| two DIFFERENT queries in ONE run returning the same listings | `feed-overlap:<a>+<b>` | `OVERLAP_ALARM_FRACTION = 0.80`, only when `min(\|A\|,\|B\|) >= 12` |
+
+**The counters are per target, never per run**, because `worstExitCode` folds a run to one code —
+a run-level counter lets one target be empty for a hundred runs while another target's occasional
+5 resets it, and the real log shows exactly that interleaving (three different non-zero codes at
+three different targets in 52 runs).
+
+**The fourth condition is the one that was actually observed, and it needs no cross-run state at
+all.** Three live searches with different queries (`rtx 4060`, `rtx 3060`, `rtx 3070`) returned
+the identical three matched listings after ~17 live requests in ~17 minutes. **Every one of those
+runs would have exited 0** — the page parsed, 24 listings were extracted, the POST succeeded. One
+run drives nine targets with nine different queries, so substantial listing-id overlap *between
+different queries in the same run* is a generic feed.
+
+**What a latched cause does: a 2-target probe, never a stop.** The next run searches only the
+latched cause's own targets (`CANARY_TARGETS = 2`, a 78 % volume cut) and the run line reports
+`"canary":true`. Stopping instead would be **indistinguishable from a broken cron** and would be
+discovered days later, which is how this project shipped "evaluation is running" over 498 dead
+cron runs. A cause clears only when **its own cause** is re-measured clean twice
+(`CANARY_CLEAN_PROBES = 2`), and the cut — not the alarm — expires after `MAX_CANARY_RUNS = 48`
+so one full run per day keeps re-measuring everything. **`refused:*` never expires:** that is the
+case where Facebook has refused this IP, and staying low is the entire point.
+
+**The exit-code numbers do not change and there is no seventh code.** A probe that comes back
+clean exits 0. The alarm **adds** a signal — the run line's `alarms`, a health row, and the badge
+on the dashboard — and launchd still reads the same `LastExitStatus` it always did.
+
+**The override is one command:** `rm ~/.marketplace-collector-state.json`. The next run then goes
+back to full volume with no memory, which is also what happens on a first-ever run.
 
 ### Schedule
 
@@ -860,7 +900,17 @@ else:
     if age > 45: problems.append(f"last run was {age:.0f} minutes ago")
     if line.get("dryRun"): problems.append("COLLECTOR_DRY_RUN is set -- NOTHING IS BEING COLLECTED")
     if line.get("exitCode") != 0: problems.append(f"exitCode {line['exitCode']}")
-    if not line.get("complete"): problems.append(f"incomplete: {line.get('exitCodes')}")
+    # THE CANARY BRANCH COMES FIRST AND IT IS NOT COSMETIC. A probe run reports complete:false BY
+    # DESIGN -- two of nine searches ran because a guard is latched -- and without this branch the
+    # line below printed `UNHEALTHY: incomplete: {"0":2}`, which reads as "seven of your searches
+    # silently vanished": precisely the confusion the run line's two-clause invariant exists to
+    # make unrepresentable.
+    if line.get("canary"):
+        problems.append(f"CANARY: a guard is latched, so only some of your {line['targets']} searches ran")
+    elif not line.get("complete"): problems.append(f"incomplete: {line.get('exitCodes')}")
+    # THE CAUSES, VERBATIM. `source-empty:<target>`, `transient:<target>`, `refused:<target>`,
+    # `feed-overlap:<a>+<b>`, plus `canary-expired` and `guard-blind`. See "The alarm" above.
+    if line.get("alarms"): problems.append("alarms: " + ", ".join(line["alarms"]))
     print(("UNHEALTHY: " + "; ".join(problems)) if problems else
           f"healthy: {line['targets']} targets, all clean, {age:.0f} minutes ago")
 EOF
@@ -878,9 +928,39 @@ check that did not read it would make the field decorative. The same applies to 
 **hours** means the Mac slept or the job is not loaded. Every line in the log is timestamped by
 the wrapper, so **a missed window is a gap in a file** rather than an absence of evidence.
 
+**THAT FOUR-CONJUNCT DEFINITION IS NOW ALSO THE WORKER'S**, verbatim, in
+`worker/api/collectorHealth.ts` — reusing this page's own `45` rather than inventing a second
+bound, because two staleness numbers in one product is the "second authority that can drift" this
+page names elsewhere. If you change 45 here, change it there.
+
+**What the 45 actually measures, stated at the width it was measured at.** Across 51 intervals
+over 24.7 h: min gap 9.7 min, max **30.1**, none above 35, **zero** stale reports. `caffeinate
+-dimsu` has held this Mac awake since 14 Sep with no `-t`, against `pmset` idle sleep of 1 minute
+on both AC and battery — so it is tempting to say the bound only ever measured a machine that
+could not sleep. **The full `pmset -g log` refutes that.** The long lid-closed periods on this
+machine are `Entering DarkWake … 'Clamshell Sleep' … Using AC`: 858 min on 09-28, 768 on 09-30,
+643 on 10-01 and **766 on 10-03 (02:28:54–15:14:54 local), which is inside the log window** — and
+across it **26 of 26 expected runs fired, max gap 30.1 min, min 29.9**. The three real `Entering
+Sleep state` transitions in the 8-day history are **all on battery and all short**.
+
+**So the bound survived a 12 h 46 m closed lid on AC, which is the overnight case.** The untested
+case is narrower than "every morning": **lid closed on battery**, where `StartCalendarInterval`
+coalesces the missed windows into one run on wake. Do not read this as "expect stale every
+morning" — that would be an argument for softening the one signal that catches the job genuinely
+not being loaded, which is how this project shipped "evaluation is running" over 498 dead cron
+runs.
+
 **Sleep, stated rather than solved.** Coverage equals uptime; `StartCalendarInterval` recovers
 one run on wake and coalesces the rest. Deliberately **not** done: `pmset` / `caffeinate` to keep
-the Mac awake (the user's machine, not ours), and a Worker-side "last collection at" endpoint.
+the Mac awake (the user's machine, not ours).
+
+> **REVERSAL, RECORDED.** This paragraph also listed **a Worker-side "last collection at"
+> endpoint** as deliberately not done. It is now built: `POST /api/collector-health` and the
+> `collector_health` row behind `GET /api/status`. The reversal's reason is that the line was
+> written when the only notification channel was a terminal script reading a log **on the
+> laptop** — and the channel is now the **web page**, which cannot read that log. The terminal
+> check above is kept as a *second* channel, not replaced: it is a command you have to remember
+> to run, and the page is not.
 
 **Uninstall:** `launchctl bootout gui/$UID/com.marketplace-deal-finder.collector` and delete the
 plist.

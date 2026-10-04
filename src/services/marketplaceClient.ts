@@ -5,7 +5,14 @@ import { requestJsonWithAuth } from "./apiClient";
  * into the Worker's tsc program. See that file's header.
  */
 import { verdictsQuery, type StoredTarget, type WatchSaveBody } from "./watchSelection";
-import type { ComponentType, DealRule, Listing, PreviewResult, SearchSettings } from "../types";
+import type {
+  CollectionStatus,
+  ComponentType,
+  DealRule,
+  Listing,
+  PreviewResult,
+  SearchSettings,
+} from "../types";
 
 export type { StoredTarget, WatchSaveBody } from "./watchSelection";
 
@@ -38,6 +45,13 @@ export interface MarketplaceClient {
   saveWatch(body: WatchSaveBody, getToken: GetToken): Promise<WatchWire>;
   getSettings(getToken: GetToken): Promise<WireSettings | null>;
   saveDealRule(rule: DealRule, getToken: GetToken): Promise<void>;
+  /**
+   * THE COLLECTOR'S HEALTH. It is a SEPARATE read from `getWatch`/`getSettings` and must stay
+   * one: those two gate Save -- a failed read there costs the write, because starting from the
+   * form's defaults and saving is how a live watch list of nine rows gets replaced -- whereas a
+   * failed status read must cost nothing but the badge. A-2 is the guard.
+   */
+  getStatus(getToken: GetToken): Promise<CollectionStatus>;
 }
 
 interface VerdictsResponse {
@@ -150,5 +164,9 @@ export const marketplaceClient: MarketplaceClient = {
       method: "PUT",
       body: dealRuleToSettings(rule),
     });
+  },
+
+  getStatus(getToken) {
+    return requestJsonWithAuth<CollectionStatus>("/api/status", getToken);
   },
 };

@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import App from "./App";
 import type { AuthenticatedIdentity } from "./auth/authTypes";
 import { componentById } from "./data/catalog";
-import type { Listing } from "./types";
+import type { CollectionStatus, Listing } from "./types";
 import type { WatchWire, WireSettings } from "./services/marketplaceClient";
 
 const wireListing = (over: Partial<Listing> = {}): Listing => ({
@@ -63,6 +63,23 @@ const LIVE_WATCH: WatchWire = {
   ],
 };
 
+/** A healthy collector, 12 minutes ago, nine targets -- what production looks like when fine. */
+const HEALTHY_STATUS: CollectionStatus = {
+  status: "ok",
+  causes: [],
+  reportedAt: 1_800_000_000,
+  ageMinutes: 12,
+  collector: {
+    exitCode: 0,
+    complete: true,
+    canary: false,
+    dryRun: false,
+    fixture: false,
+    targets: 9,
+    alarms: [],
+  },
+};
+
 const EMPTY_WATCH: WatchWire = {
   selection: { components: [], models: {}, location: null, radiusKm: null },
   storedTargets: [],
@@ -80,6 +97,9 @@ interface Wire {
   settingsStatus?: number;
   settingsPutStatus?: number;
   verdicts?: { listings: Listing[]; truncated: boolean };
+  /** What `GET /api/status` answers. The default is a healthy nine-target collector. */
+  status?: CollectionStatus;
+  statusStatus?: number;
 }
 
 interface Call {
@@ -129,6 +149,18 @@ const stubWire = (wire: Wire = {}) => {
       }
       if (path === "/api/verdicts") {
         return reply(wire.verdicts ?? { listings: [], truncated: false });
+      }
+      /**
+       * THE `/api/status` BRANCH IS MANDATORY, NOT OPTIONAL, and that is the router's default
+       * `throw` below doing its job: every one of this file's existing tests now makes THREE
+       * reads on mount, and without this branch they would all fail with `unexpected request`
+       * rather than quietly rendering a panel with no data. That is what makes the status read
+       * impossible to ship without also wiring the page's only notification channel.
+       */
+      if (path === "/api/status") {
+        return wire.statusStatus !== undefined && wire.statusStatus !== 200
+          ? reply({ error: { code: "AUTH_KEYS_UNAVAILABLE" } }, wire.statusStatus)
+          : reply(wire.status ?? HEALTHY_STATUS);
       }
       throw new Error(`unexpected request: ${method} ${String(url)}`);
     },
@@ -920,5 +952,101 @@ describe("the control panel", () => {
       await screen.findByText("Radius must be a whole number between 1 and 25 km."),
     ).toBeInTheDocument();
     expect(putTo(calls, "/api/watch")).toBeUndefined();
+  });
+
+  /* ---------- the collection status panel's wiring ---------- */
+
+  /**
+   * A-1: THE PAGE FETCHES `/api/status` ONCE ON MOUNT.
+   *
+   * THE MUTATION IS DELETING THE EFFECT, which leaves the panel on its initial `pending` state
+   * forever -- "Reading the collector's status…" instead of the badge, and no request in `calls`.
+   * BOTH halves are asserted: the request count is what catches an effect that fires twice (the
+   * `[getToken]` dependency plus React's strict double-invoke is a real way to double a read), and
+   * the rendered badge is what catches a request whose answer is thrown away.
+   */
+  it("A-1: the page reads /api/status once on mount and renders the badge", async () => {
+    const calls = stubWire({ watch: LIVE_WATCH, settings: null });
+    render(<App getToken={noToken} />);
+    await waitForLoad("9 of 9 searches used");
+
+    expect(await screen.findByText("Collecting")).toBeInTheDocument();
+    expect(calls.filter((call) => call.url === "/api/status")).toHaveLength(1);
+    expect(screen.queryByText(/Reading the collector/)).not.toBeInTheDocument();
+  });
+
+  /**
+   * A-2: A FAILED `/api/status` DOES NOT BLOCK SAVE.
+   *
+   * THE MUTATION IS ADDING THE STATUS READ TO App's `loaded` GATE, whose failure shape is a
+   * DISABLED Save button. That gate exists for a measured reason -- a 503 on load plus one click
+   * on a Save seeded from the form's defaults wipes a live nine-row watch list and appends a
+   * search revision that re-opens the whole evaluation corpus -- and NONE of it applies to a
+   * read-only badge. `/api/status` is also the one endpoint designed never to fail loudly (a
+   * missing DB binding is 200 `unknown`), so making it gate the write would couple the save path
+   * to the one route that must not go dark.
+   */
+  it("A-2: a 503 from /api/status leaves Save enabled and the searches untouched", async () => {
+    stubWire({ watch: LIVE_WATCH, settings: null, statusStatus: 503 });
+    render(<App getToken={noToken} />);
+    await waitForLoad("9 of 9 searches used");
+
+    expect(await screen.findByText(/status could not be read/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save searches" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Preview listings" })).toBeEnabled();
+    // ...and the page's own error banner is NOT the channel for it. `requestError` renders with
+    // `role="alert"`, and the absence of ANY alert is the assertion: a status failure must not
+    // put a page-level error over the form the user came to edit.
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  /**
+   * A-3: THE OTHER DIRECTION, so A-2 cannot pass by Save simply always being enabled. A failed
+   * `GET /api/watch` still disables it, and the status panel still renders beside the refusal.
+   */
+  it("A-3: a 503 from /api/watch still disables Save, and the panel still renders", async () => {
+    stubWire({ watchStatus: 503 });
+    render(<App getToken={noToken} />);
+
+    // A 503 carries the transport's OWN message, which is what A-load asserts too; the fallback
+    // sentence is reached only when the throw is not an `ApiRequestError`.
+    expect(await screen.findByRole("alert")).toHaveTextContent(/temporarily unavailable/);
+    expect(screen.getByRole("button", { name: "Save searches" })).toBeDisabled();
+    // THE PANEL IS INDEPENDENT IN BOTH DIRECTIONS, which is what makes A-2 a real claim rather
+    // than Save simply always being enabled.
+    expect(await screen.findByText("Collecting")).toBeInTheDocument();
+  });
+
+  /**
+   * A-4: THE DEGRADED CASE REACHES THE PAGE WITH ITS CAUSE, through the real client and the real
+   * transport. The panel's own suite covers the rendering; this is the link -- that the body
+   * `GET /api/status` answers arrives at the panel unflattened.
+   */
+  it("A-4: a latched feed alarm reaches the page naming the pair and the reduction", async () => {
+    stubWire({
+      watch: LIVE_WATCH,
+      settings: null,
+      status: {
+        status: "degraded",
+        causes: ["canary", "feed-overlap:gpu-radeon+gpu-rtx"],
+        reportedAt: 1_800_000_000,
+        ageMinutes: 6,
+        collector: {
+          exitCode: 0,
+          complete: false,
+          canary: true,
+          dryRun: false,
+          fixture: false,
+          targets: 9,
+          alarms: ["feed-overlap:gpu-radeon+gpu-rtx"],
+        },
+      },
+    });
+    render(<App getToken={noToken} />);
+    await waitForLoad("9 of 9 searches used");
+
+    expect(await screen.findByText("Degraded")).toBeInTheDocument();
+    expect(screen.getByText(/returned the same listings/)).toHaveTextContent("gpu-radeon");
+    expect(screen.getByText(/reduced to 2 of 9 searches per run/)).toBeInTheDocument();
   });
 });
