@@ -1,13 +1,62 @@
-# Marketplace Deal Finder
+# Undercut
 
-Watches marketplace listings for a set of PC components, learns what each model
-normally sells for, and flags the ones priced below that.
+**Finds underpriced PC parts on local resale marketplaces.**
 
-Runs entirely on Cloudflare: a Worker for the API, D1 for storage, Workflows for the
-scheduled work, and a React frontend. Sign-in is Firebase Google auth restricted to an
-explicit allowlist.
+Undercut watches listings for the components you care about and matches each one to a specific model. It keeps a running price for every model and flags listings that come in below it.
+
+*(Previously "Marketplace Deal Finder". The repository name is unchanged.)*
 
 ---
+
+## What it does
+
+- **Watch list.** From the control panel you choose component types, models, a location and a search radius. The collector runs one search per target.
+- **Model matching.** Listing titles are normalized against a catalog of **336 models across nine component types**, two generations back. A title that can't be matched with confidence is marked invalid rather than guessed.
+- **Reference prices.** Every stored listing feeds a running price aggregate per model, so "normal price" comes from the market Undercut has actually seen.
+- **Verdicts.** Scheduled evaluation compares each new listing with its model's reference price, and the dashboard shows the resulting deals.
+- **Private by default.** Sign-in is Firebase Google auth restricted to an allowlist. The collector uses its own credential, which can reach only two routes.
+
+## How it works
+
+```
+local collector ──GET /api/watch-targets──▶ Cloudflare Worker ◀── React dashboard
+      │                                           │                (Firebase sign-in)
+      └──POST /api/listings (collector token)──▶  │
+                                                  ▼
+                         D1: listings, dedup, running price aggregate per model
+                                                  │
+                     Cron (every 30 min) ─▶ Workflow: monitoring run ─▶ evaluation ─▶ verdicts
+                     Cron (daily)        ─▶ Workflow: stale-listing cleanup
+```
+
+Everything runs on Cloudflare except the fetch itself (see
+[Collection runs on your machine](#collection-runs-on-your-machine-not-on-cloudflare) for the
+measurement behind that).
+
+## Engineering notes
+
+- **Hybrid by measurement, not by default.** Identical code fetched 10 listings from a residential IP and 0 from Cloudflare (a login wall served with HTTP 200). So collection moved to a small local Node process, and everything else stayed serverless.
+- **Source-agnostic pipeline.** Storage, pricing, evaluation and scheduling never branch on `source`. Adding a marketplace means adding a provider module, not redesigning anything.
+- **Durable, fenced evaluation.** Evaluation runs as durable tasks under a run lock, so overlapping scheduled runs can't double-process a listing.
+- **Two verification gates.** `npm run check` runs offline: lint, unit tests, build and typechecks. `npm run e2e:local` drives a real `wrangler dev` Worker over HTTP against a real local D1, proving the pieces actually connect.
+- **Additive-only migrations.** The applied migrations are live, so every schema change is a new numbered migration.
+- **Mutation-checked tests.** Every test names the code change that makes it fail.
+
+## Stack
+
+| Layer | Technology |
+|---|---|
+| Frontend | React, TypeScript, Vite |
+| API | Cloudflare Workers (TypeScript) |
+| Storage | Cloudflare D1 (SQLite) |
+| Scheduling | Cloudflare Cron Triggers + Workflows |
+| Auth | Firebase Google sign-in, verified in the Worker with `jose`; a separate collector token |
+| Collector | Node.js |
+| Testing | Vitest, Testing Library, Miniflare, local end-to-end run against `wrangler dev` |
+
+---
+
+# Development
 
 ## Requirements
 
@@ -140,19 +189,7 @@ one included — as deals.
 
 ---
 
-## How it fits together
-
-```
-collector (your Mac)  ->  POST /api/listings  ->  storage  ->  running price aggregate
-                                                                    |
-                                                    scheduled monitoring run
-                                                                    |
-                                                           evaluation -> verdict
-```
-
-Storage, pricing, evaluation and scheduling are **source-agnostic**: `source` is an
-opaque caller-supplied value and nothing downstream branches on it. Adding a marketplace
-is a provider module, not a redesign.
+## Docs
 
 | doc | covers |
 |---|---|
