@@ -124,9 +124,13 @@ const agePhrase = (ageMinutes: number): string => {
 /**
  * THE COUNTS, for `on` and `webhook-rejected` only. `sent24h` is a ROLLING 24-hour window
  * (worker/notify/status.ts), so the sentence says "in the last 24 hours", never "today".
+ * `pending` and `failed` appear only when non-zero: without them a sender that has stalled
+ * (rows piling up PENDING) or is being refused (FAILED) reads exactly like a quiet day.
  */
 const countsPhrase = (counts: NotificationCounts): string => {
-  const phrase = `${counts.sent24h} sent in the last 24 hours, ${counts.deliveryUnknown} delivery unknown`;
+  let phrase = `${counts.sent24h} sent in the last 24 hours, ${counts.deliveryUnknown} delivery unknown`;
+  if (counts.pending > 0) phrase += `, ${counts.pending} pending`;
+  if (counts.failed > 0) phrase += `, ${counts.failed} failed`;
   return phrase;
 };
 
