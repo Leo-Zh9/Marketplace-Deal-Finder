@@ -24,12 +24,13 @@ describe("replay -- parsing wrangler's --json output", () => {
       "fx-quantity",
       "fx-no-price",
       "fx-multiline",
+      "fx-same",
       "fx-skipped",
     ]);
   });
 
   it("tolerates the banner lines wrangler prints without --json", () => {
-    expect(parseD1Export(`🌀 Executing on remote database\n${FIXTURE}`)).toHaveLength(11);
+    expect(parseD1Export(`🌀 Executing on remote database\n${FIXTURE}`)).toHaveLength(12);
   });
 
   it("refuses a failed statement, a non-export and a SELECT with the wrong columns", () => {
@@ -48,20 +49,21 @@ describe("replay -- the report", () => {
   const report = replay(parseD1Export(FIXTURE));
 
   it("lists a row whose type is outside the nine instead of replaying it", () => {
-    expect(report.rows).toBe(11);
+    expect(report.rows).toBe(12);
     expect(report.skipped).toEqual([{ listingId: "fx-skipped", componentType: "gpuu" }]);
   });
 
   it("(a) breaks the replayed rows down by reason", () => {
     expect(report.reasons).toEqual({
       "component-unconfirmed": 2,
-      matched: 3,
+      matched: 4,
       "model-unmatched": 2,
       "unknown-quantity": 1,
       "whole-system": 2,
     });
   });
 
+  /** `fx-same` appears twice (the same id under a second source): ids, not rows, are counted. */
   it("(b) counts distinct keyed listing ids, stored and at this commit", () => {
     expect(report.keyedListingIds).toEqual({ stored: 3, commit: 3 });
   });

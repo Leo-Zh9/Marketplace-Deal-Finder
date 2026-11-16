@@ -21,7 +21,7 @@ describe("scripts/replay-normalization.ts", () => {
   it("replays a wrangler --json export under plain node and prints all four sections", () => {
     const result = run("worker/normalize/testing/d1ListingsExport.json");
     expect(result.status).toBe(0);
-    expect(result.stdout).toContain("rows replayed: 10 of 11");
+    expect(result.stdout).toContain("rows replayed: 11 of 12");
     expect(result.stdout).toContain("(a) reasons at this commit");
     expect(result.stdout).toContain("  stored 3\n  commit 3\n");
     expect(result.stdout).toContain("(c) stored vs this commit: 5 rows differ");

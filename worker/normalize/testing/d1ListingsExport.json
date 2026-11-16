@@ -82,6 +82,14 @@
         "model_key": null
       },
       {
+        "listing_id": "fx-same",
+        "title": "GIGABYTE EAGLE RTX 5070 12GB VRAM",
+        "price_cents": 119900,
+        "component_type": "gpu",
+        "validity": "VALID",
+        "model_key": "GeForce RTX 5070"
+      },
+      {
         "listing_id": "fx-skipped",
         "title": "AMD RX 580 8G GDDR5 Graphics Card",
         "price_cents": 15000,
@@ -98,7 +106,7 @@
       "last_row_id": 0,
       "changed_db": false,
       "size_after": 0,
-      "rows_read": 11,
+      "rows_read": 12,
       "rows_written": 0
     }
   }
