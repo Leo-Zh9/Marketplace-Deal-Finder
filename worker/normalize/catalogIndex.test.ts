@@ -198,6 +198,10 @@ describe("catalog index -- every vocabulary element, one at a time", () => {
     expect(match("motherboard", "ASUS B850-F Gaming WiFi")).toBeNull();
     expect(match("motherboard", "ASUS Gaming B760-Plus WiFi")).toBeNull();
     expect(match("motherboard", "Gigabyte B850 Elite WiFi7")).toBeNull();
+    // `pro` is not admitted either: MSI PRO is its own line, and the word is a TIER on other
+    // types' names. Dropping it would key a base kit or drive as its Pro sibling.
+    expect(match("ram", "Crucial 32GB DDR5")).toBeNull();
+    expect(match("storage", "Samsung 990 2TB")).toBeNull();
     // The brand word is not optional: dropping `MAG` leaves `MSI B850 ...`, not `B850 ...`.
     expect(match("motherboard", "B850 Tomahawk MAX WiFi")).toBeNull();
   });
