@@ -65,21 +65,24 @@ const simulate = (
   let state = initial;
   let cut = 0;
   let requests = 0;
+  let alarmed = 0;
   for (let run = 0; run < runs; run += 1) {
     const plan = selectProbe(state, watchList);
     const answers = plan.indices.map((index) => answer(watchList[index], run));
     if (plan.canary) cut += 1;
     requests += answers.length;
-    state = advanceState({
+    const advanced = advanceState({
       state,
       watchList,
       ran: answers,
       canary: plan.canary,
       expired: plan.expired,
       nextProbe: plan.nextProbe,
-    }).state;
+    });
+    if (advanced.causes.length > 0) alarmed += 1;
+    state = advanced.state;
   }
-  return { state, cut, requests };
+  return { state, cut, requests, alarmed };
 };
 
 /** `n` distinct ids on a prefix. `ids("a", 24)` is a full page nothing else shares. */
@@ -531,32 +534,37 @@ describe("the collector's cross-run state", () => {
   });
 
   /**
-   * G-12c: A PROBE OF BOTH HALVES WHOSE PAGES CAME BACK TOO THIN IS UNANSWERABLE, SO THE CAUSE IS
-   * DROPPED -- AND NOT CREDITED. RULING REVERSED IN REVIEW ROUND 5: this row used to keep the
-   * cause standing, which meant a feed that settled below the floor pinned the cut forever
-   * (measured, 195 of 200 runs). 5 ids each is still no evidence either way, so the drop goes
-   * through `unmeasurable`: the targets' `consecutive` counters are left exactly as they were.
+   * G-12c: A PROBE OF BOTH HALVES WHOSE PAGES CAME BACK TOO THIN IS UNANSWERABLE, AND AFTER
+   * CANARY_CLEAN_PROBES OF THEM IN A ROW THE CAUSE IS DROPPED -- AND NOT CREDITED. Before round 5
+   * this row kept the cause standing forever (a feed settled below the floor cut 195 of 200
+   * runs). It needs a SECOND probe since the debounce: dropping on the first let a flickering
+   * real feed drop and re-latch (G-12g). 5 ids each is still no evidence either way, so the
+   * drop goes through `unmeasurable` and the targets' `consecutive` counters are left as they
+   * were.
    */
-  it("G-12c: a probe of both halves below the floor drops the cause without credit", () => {
-    const result = advance({
-      state: fresh({
-        consecutive: { a: { sourceEmpty: 0, transient: 0 }, b: { sourceEmpty: 0, transient: 1 } },
-        alarm: { "feed-overlap:a+b": { runs: 2, cleanProbes: 0 } },
-      }),
-      watchList: ["a", "b", "c"],
-      ran: [ran("a", 0, { ids: ids("a", 5) }), ran("b", 5, { reason: "ok", ids: ids("b", 5) })],
-      canary: true,
-    });
+  it("G-12c: two probes of both halves below the floor drop the cause without credit", () => {
+    const probe = (state: RunState) =>
+      advance({
+        state,
+        watchList: ["a", "b", "c"],
+        ran: [ran("a", 0, { ids: ids("a", 5) }), ran("b", 5, { reason: "ok", ids: ids("b", 5) })],
+        canary: true,
+      });
 
-    expect(result.causes).toEqual([]);
-    expect(result.state.consecutive.b).toEqual({ sourceEmpty: 0, transient: 2 });
+    const first = probe(fresh({ alarm: { "feed-overlap:a+b": { runs: 2, cleanProbes: 0 } } }));
+    expect(first.causes).toEqual(["feed-overlap:a+b"]);
+
+    const second = probe(first.state);
+    expect(second.causes).toEqual([]);
+    expect(second.state.consecutive.b).toEqual({ sourceEmpty: 0, transient: 2 });
   });
 
   /**
-   * G-12d: THE OTHER EDGES OF "UNANSWERABLE". One feed at the floor's edge (24 against 8), and one
-   * side a parsed EMPTY page (exit 3), are both dropped. A side whose page did NOT parse -- a 5xx,
-   * no ids -- measured nothing, so the cause stands; that row is what stops the drop being
-   * "any probe that is not clean".
+   * G-12d: THE OTHER EDGES OF "UNANSWERABLE", each one probe short of the drop. One feed at the
+   * floor's edge (24 against 8), and one side a parsed EMPTY page (exit 3), both complete it. A
+   * side whose page did NOT parse -- a 5xx, no ids -- measured nothing, so the cause stands and
+   * the count does not move; that row is what stops the drop being "any probe that is not
+   * clean".
    */
   it.each<[string, TargetRun, string[]]>([
     ["one feed thinned to 8 ids", ran("b", 0, { ids: ids("feed", 8) }), []],
@@ -564,7 +572,9 @@ describe("the collector's cross-run state", () => {
     ["one side a transient failure", ran("b", 5), ["feed-overlap:a+b"]],
   ])("G-12d: %s leaves causes %j", (_label, other, causes) => {
     const result = advance({
-      state: fresh({ alarm: { "feed-overlap:a+b": { runs: 9, cleanProbes: 0 } } }),
+      state: fresh({
+        alarm: { "feed-overlap:a+b": { runs: 9, cleanProbes: CANARY_CLEAN_PROBES - 1 } },
+      }),
       watchList: ["a", "b", "c"],
       ran: [ran("a", 0, { ids: ids("feed", 24) }), other],
       canary: true,
@@ -575,8 +585,8 @@ describe("the collector's cross-run state", () => {
 
   /**
    * G-12e: THE STUCK CASE, OVER 200 RUNS. The pair was latched on a real feed, then `b`'s page
-   * settled at 8 ids for good. Before the fix: 195 of 200 runs cut. After: the first probe drops
-   * it and nothing re-latches, because 8 is below the floor the trip uses too.
+   * settled at 8 ids for good. Before round 5: 195 of 200 runs cut. Now: two probes drop it
+   * and nothing re-latches, because 8 is below the floor the trip uses too.
    */
   it("G-12e: a latched pair whose feed settles below the floor does not pin the cut", () => {
     const watchList = Array.from({ length: 9 }, (_value, index) => `t${index}`);
@@ -593,7 +603,50 @@ describe("the collector's cross-run state", () => {
     );
 
     expect(result.state.alarm).toEqual({});
-    expect(result.cut).toBe(1);
+    expect(result.cut).toBe(CANARY_CLEAN_PROBES);
+  });
+
+  /**
+   * G-12f: A DIRTY PROBE RESETS THE UNANSWERABLE COUNT. Alternating "still the same feed" and
+   * "one side came back empty" is a real feed that flickers, and it must never drop. The
+   * mutation is counting unanswerable probes on their own, which drops it on the third run.
+   */
+  it("G-12f: alternating dirty and unanswerable probes never drop the cause", () => {
+    let state = fresh({ alarm: { "feed-overlap:a+b": { runs: 9, cleanProbes: 0 } } });
+    for (let run = 0; run < 10; run += 1) {
+      const result = advance({
+        state,
+        watchList: ["a", "b", "c"],
+        ran: [
+          ran("a", 0, { ids: ids("feed", 24) }),
+          run % 2 === 0 ? ran("b", 0, { ids: ids("feed", 24) }) : ran("b", 3),
+        ],
+        canary: true,
+      });
+      expect(result.causes).toEqual(["feed-overlap:a+b"]);
+      state = result.state;
+    }
+  });
+
+  /**
+   * G-12g: THE FLICKER, OVER 200 RUNS, AT THE NUMBERS THE REVIEW MEASURED. `t2` and `t3` serve
+   * the same merged feed; every third run `t3` comes back a parsed empty page. Dropping on one
+   * unanswerable probe made this 869 of 1800 requests with the alarm on 134 of 200 runs. With
+   * the debounce it is the same as a feed that never flickers: 435 requests (1 full run that
+   * latches, 195 probes of 2 and 4 expiry runs of 9: 9 + 390 + 36) and the alarm on every run.
+   */
+  it("G-12g: a merged feed whose one side is empty every third run stays latched", () => {
+    const watchList = Array.from({ length: 9 }, (_value, index) => `t${index}`);
+    const result = simulate(watchList, 200, (targetId, run) =>
+      targetId === "t3" && run % 3 === 2
+        ? ran("t3", 3)
+        : targetId === "t2" || targetId === "t3"
+          ? ran(targetId, 0, { ids: ids("gen", 24) })
+          : ran(targetId, 0, { ids: ids(targetId, 24) }),
+    );
+
+    expect(result.requests).toBe(435);
+    expect(result.alarmed).toBe(200);
   });
 
   /**
