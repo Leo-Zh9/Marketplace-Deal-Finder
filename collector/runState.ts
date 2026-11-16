@@ -758,12 +758,20 @@ export const advanceState = (input: AdvanceInput): AdvanceResult => {
        * measured, 195 of 200 runs cut. Dropping costs one full run; if the feed is real at the
        * floor, that run re-latches it. A page that did NOT parse (a 5xx, a block) is still
        * "not measured" and keeps the cause.
+       *
+       * AFTER CANARY_CLEAN_PROBES CONSECUTIVE UNANSWERABLE PROBES, NOT ON THE FIRST. Dropping on
+       * one let a real merged feed that flickers (one side empty or thin every few runs) drop,
+       * re-latch on the full run, and drop again: measured, 869 of 1800 requests and the alarm
+       * on 134 of 200 runs, against 435 and 200 of 200 without the drop. Counted on
+       * `cleanProbes`, so a dirty probe in between resets it exactly as for a clean one; it
+       * still goes through `unmeasurable`, so no counters are touched when it drops.
        */
       const bothParsed = present.every(
         (target) => target.ids.length > 0 || target.exitCode === EXIT_SOURCE_EMPTY,
       );
       if (bothParsed && (pair === null || pair.of < OVERLAP_MIN_DENOMINATOR)) {
-        unmeasurable.push(cause);
+        value.cleanProbes += 1;
+        if (value.cleanProbes >= CANARY_CLEAN_PROBES) unmeasurable.push(cause);
         continue;
       }
       if (pair === null || pair.of < OVERLAP_MIN_DENOMINATOR) continue;

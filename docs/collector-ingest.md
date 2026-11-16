@@ -787,8 +787,10 @@ but runs stay full. A cause clears only when **its own cause** is re-measured cl
 credited by a run in which `t` itself got a parsed empty page (exit 3), another target exited 0,
 and nothing was refused. A 403, an off-site redirect or a checkpoint page at `t` earns no such
 credit. And a cause whose question can no longer be answered is dropped without credit: a pair
-whose two rows became the same query, or whose pages both parsed but cannot clear the
-denominator floor. The cut — not the alarm — expires after `MAX_CANARY_RUNS = 48`
+whose two rows became the same query (at once), or whose pages both parsed but cannot clear the
+denominator floor (after `CANARY_CLEAN_PROBES = 2` such probes in a row; a probe that still
+shows the feed resets the count, so a real feed whose one side flickers empty stays latched).
+The cut — not the alarm — expires after `MAX_CANARY_RUNS = 48`
 so one full run per day keeps re-measuring everything. **`refused:*` never expires:** that is the
 case where Facebook has refused this IP, and staying low is the entire point.
 
