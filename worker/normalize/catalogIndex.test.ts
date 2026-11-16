@@ -166,6 +166,37 @@ describe("catalog index -- every vocabulary element, one at a time", () => {
   });
 
   /**
+   * T14b. INNER_SUB_BRAND, element by element, with the count map as the evidence that each word
+   * is carried by real catalog names (not inert). Each row drops the word from a catalog name
+   * and must still resolve to that name; the NOT-ADMITTED rows pin the words deliberately left
+   * out, whose omission must stay a miss.
+   */
+  it("T14b: MSI's inner sub-brand words are droppable, and no other line's are", () => {
+    const inner: Record<string, number> = { mag: 0, mpg: 0, meg: 0 };
+    for (const componentType of WORKER_TYPES) {
+      for (const model of catalogModels(componentType)) {
+        tokenize(model).forEach((token, index) => {
+          if (index > 0 && token.value in inner) inner[token.value] += 1;
+        });
+      }
+    }
+    expect(inner).toEqual({ mag: 9, mpg: 3, meg: 1 });
+
+    expect(match("motherboard", "MSI B850 Tomahawk Max Wifi")).toBe("MSI MAG B850 Tomahawk MAX WiFi");
+    expect(match("motherboard", "MSI X870E Carbon WiFi")).toBe("MSI MPG X870E Carbon WiFi");
+    expect(match("psu", "MSI Ai1300P PCIE5")).toBe("MSI MEG Ai1300P PCIE5");
+    // The full names still match: the variant is an extra entry point, never a replacement.
+    expect(match("motherboard", "MSI MAG B850 Tomahawk MAX WiFi")).toBe("MSI MAG B850 Tomahawk MAX WiFi");
+
+    // NOT ADMITTED. Each would merge a board with a cheaper sibling of the same model number.
+    expect(match("motherboard", "ASUS B850-F Gaming WiFi")).toBeNull();
+    expect(match("motherboard", "ASUS Gaming B760-Plus WiFi")).toBeNull();
+    expect(match("motherboard", "Gigabyte B850 Elite WiFi7")).toBeNull();
+    // Only an INNER word drops: a sub-brand at the start is not a sub-brand of anything.
+    expect(match("motherboard", "B850 Tomahawk MAX WiFi")).toBeNull();
+  });
+
+  /**
    * T20. SUFFIX_WORDS, element by element: each one, following an otherwise-complete model name,
    * must refuse the match. The control is what stops this being satisfiable by a matcher that
    * refuses EVERY trailing word.
@@ -358,16 +389,24 @@ describe("catalog index -- exhaustive properties", () => {
     // A LITERAL MIRROR OF OPTIONAL_LEADING TOO, for the same reason as SUFFIX_MIRROR: importing
     // it would make this blind to a deletion from it.
     const LEADING_MIRROR = new Set(["geforce", "nvidia", "radeon", "amd", "intel", "core"]);
-    // Every core buildModelIndex inserts: the full token sequence, plus each suffix obtained by
-    // dropping leading optional tokens. `< length - 1` mirrors the production loop's guard
-    // against a name that is entirely optional-leading tokens collapsing to an empty core.
+    // And of INNER_SUB_BRAND: the sub-brand-dropped name is an entry point too, and a prefix
+    // relation that exists only between two dropped names pools exactly as badly.
+    const INNER_MIRROR = new Set(["mag", "mpg", "meg"]);
+    // Every core buildModelIndex inserts: the full token sequence and its sub-brand-dropped
+    // variant, plus each suffix obtained by dropping leading optional tokens. `< length - 1`
+    // mirrors the production loop's guard against a name that is entirely optional-leading
+    // tokens collapsing to an empty core.
     const cores = (model: string): string[][] => {
-      const sequence = tokenValues(tokenize(model));
-      const out = [sequence];
-      let start = 0;
-      while (start < sequence.length - 1 && LEADING_MIRROR.has(sequence[start])) {
-        start += 1;
-        out.push(sequence.slice(start));
+      const full = tokenValues(tokenize(model));
+      const dropped = full.filter((value, index) => index === 0 || !INNER_MIRROR.has(value));
+      const out: string[][] = [];
+      for (const sequence of dropped.length < full.length ? [full, dropped] : [full]) {
+        out.push(sequence);
+        let start = 0;
+        while (start < sequence.length - 1 && LEADING_MIRROR.has(sequence[start])) {
+          start += 1;
+          out.push(sequence.slice(start));
+        }
       }
       return out;
     };

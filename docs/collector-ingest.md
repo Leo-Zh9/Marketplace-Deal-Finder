@@ -362,9 +362,11 @@ converge on their next sighting, as a `CHANGED` re-write.
 
 **The residual, stated honestly.** A cross-type title evidenced by a **marker only** still flips
 between `VALID` with a null key and `INVALID_REFERENCE` across searches — measured over the
-132-id live sample (217 sightings from nine searches), **4 ids**: `"MSI B850 Tomahawk Max Wifi
-Motherboard Only"`, `"Ram DDR4 16gb 2x8gb 3000MHz"`, `"5-Bay Hard Drive Station"` and a Microsoft
-Surface Pro whose only marker is `SSD`. They carry no key, so **no aggregate ever moves**. Their
+132-id live sample (217 sightings from nine searches), **4 ids** when this was written:
+`"MSI B850 Tomahawk Max Wifi Motherboard Only"`, `"Ram DDR4 16gb 2x8gb 3000MHz"`,
+`"5-Bay Hard Drive Station"` and a Microsoft Surface Pro whose only marker is `SSD`. **Part 2 took
+the first off the list**: with MSI's inner `MAG` droppable, that board now names its catalog model,
+resolves to `motherboard` from every search, and is keyed — **3 ids** remain. They carry no key, so **no aggregate ever moves**. Their
 stored validity is whichever search saw them last, but **evaluation is NOT re-queued by the flip**:
 `recordSightings` queues a task only on `NEW` or when the contribution changes, and a listing with
 no key has none on either side. So the verdict goes **stale relative to the stored validity** —

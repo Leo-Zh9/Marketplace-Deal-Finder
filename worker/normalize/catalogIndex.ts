@@ -241,6 +241,26 @@ const SUFFIX_WORDS = new Set([
   "argb",
 ]);
 
+/**
+ * MSI's sub-brand words, droppable from INSIDE a catalog name (never from its first token).
+ * `"MSI B850 Tomahawk Max Wifi Motherboard Only"` is the live title; the catalog name is
+ * `MSI MAG B850 Tomahawk MAX WiFi`, and sellers leave `MAG` out. Like OPTIONAL_LEADING this only
+ * ADDS entry points: the full name is still inserted first and still matches.
+ *
+ * WHY THESE THREE AND NO OTHERS. Each names a tier of a board or PSU whose model number is unique
+ * without it, so dropping it cannot merge two products. MEASURED over the 336 names: the 13 that
+ * carry one (`mag` 9, `mpg` 3, `meg` 1) produce 13 new entry points, 0 of them equal to any other
+ * name or entry point, and the T47 prefix-pair set is unchanged (the one pair they touch,
+ * `MSI MAG B550 Tomahawk < ... MAX WiFi`, is already a reviewed row).
+ *
+ * NOT ADMITTED, AND THAT IS DELIBERATE: ASUS `ROG Strix` and `TUF`, Gigabyte `Aorus`, MSI `PRO`.
+ * `PRO` is a separate MSI product line, not a tier word over the same board, and `Aorus` /
+ * `ROG Strix` / `TUF` each name boards whose model number is shared with a cheaper sibling
+ * (`B650 Aorus Elite` vs `B650 Gaming X`), so dropping them is how two prices pool. A seller who
+ * omits one of those words gets no match -- a miss, which is safe.
+ */
+const INNER_SUB_BRAND = new Set(["mag", "mpg", "meg"]);
+
 /** A prefix trie node; the exported index is its root. */
 export interface ModelIndex {
   children: Map<string, ModelIndex>;
@@ -273,14 +293,18 @@ export const buildModelIndex = (models: readonly string[]): ModelIndex => {
   };
 
   for (const model of models) {
-    const sequence = tokenValues(tokenize(model));
-    insert(sequence, model);
-    // `< length - 1`: a model whose name is ENTIRELY optional-leading tokens never becomes an
-    // empty core, which would make the root itself terminal and match every title.
-    let start = 0;
-    while (start < sequence.length - 1 && OPTIONAL_LEADING.has(sequence[start])) {
-      start += 1;
-      insert(sequence.slice(start), model);
+    const full = tokenValues(tokenize(model));
+    const withoutSubBrand = full.filter((value, index) => index === 0 || !INNER_SUB_BRAND.has(value));
+    const variants = withoutSubBrand.length < full.length ? [full, withoutSubBrand] : [full];
+    for (const sequence of variants) {
+      insert(sequence, model);
+      // `< length - 1`: a model whose name is ENTIRELY optional-leading tokens never becomes an
+      // empty core, which would make the root itself terminal and match every title.
+      let start = 0;
+      while (start < sequence.length - 1 && OPTIONAL_LEADING.has(sequence[start])) {
+        start += 1;
+        insert(sequence.slice(start), model);
+      }
     }
   }
   return root;

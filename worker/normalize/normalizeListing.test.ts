@@ -258,7 +258,9 @@ const TYPE_RESOLUTION: Case[] = [
   // the search's type this live title would be refused as a whole system. SOLE killer of that.
   ["TR-r5: live -- retail cpu wording found by a gpu search", "AMD Ryzen 5 5600 Desktop Processor", 22300, "gpu", "VALID", "Ryzen 5 5600", "matched", "cpu"],
   ["TR-m1: live -- a RAM kit by marker only, in a gpu search", "Ram DDR4 16gb 2x8gb 3000MHz", 12100, "gpu", "INVALID_REFERENCE", null, "wrong-component"],
-  ["TR-m2: live -- a motherboard by marker only, in a cpu search", "MSI B850 Tomahawk Max Wifi Motherboard Only", 26300, "cpu", "INVALID_REFERENCE", null, "wrong-component"],
+  // Was TR-m2, a marker-only residual, until MSI's inner `MAG` became droppable (catalogIndex.ts
+  // INNER_SUB_BRAND): the title now names its catalog model, so it moves like any other.
+  ["TR-r6: live -- a board without its MAG sub-brand, in a cpu search", "MSI B850 Tomahawk Max Wifi Motherboard Only", 26300, "cpu", "VALID", "MSI MAG B850 Tomahawk MAX WiFi", "matched", "motherboard"],
   ["TR-m3: live -- a drive dock by marker only, in a ram search", "5-Bay Hard Drive Station", 7700, "ram", "INVALID_REFERENCE", null, "wrong-component"],
   ["TR-m4: live -- a tablet whose only marker is ssd, in a psu search", "Microsoft Surface Pro 11th Edition \u2013 Snapdragon X Elite \u2013 16GB RAM \u2013 512GB SSD", 95300, "psu", "INVALID_REFERENCE", null, "wrong-component"],
   // The live "Gaming PC – Ryzen 7 9800X3D / RTX 5080 16GB" with its whole-system words removed,
