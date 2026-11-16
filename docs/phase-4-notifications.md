@@ -53,6 +53,26 @@ nothing more than that.
 - Rows written in one step share the run's `now`, so ties are possible. A rejection stops the step,
   which makes the rejected row the last fetch of that step, so a tie resolves to the rejected row.
 
+### On the dashboard
+
+The Collection panel renders `notifications` as one line (`src/components/CollectionStatusPanel.tsx`):
+
+| `notifications` | The panel reads |
+|---|---|
+| `unconfigured` | Discord alerts: not configured |
+| `invalid-url` | Discord alerts: webhook URL invalid |
+| `off` | Discord alerts: off (webhook ready) |
+| `on` with counts | Discord alerts: on, N sent in the last 24 hours, M delivery unknown |
+| `on` with no counts (the Worker could not read the table) | Discord alerts: on (counts unavailable) |
+| `webhook-rejected` | Discord alerts: webhook rejected, replace the secret. N sent in the last 24 hours, M delivery unknown |
+| present but malformed | Discord alerts: status unreadable |
+| absent (an API Worker older than this backend) | no line; the rest of the panel renders as before |
+
+`N` is `sent24h`, a rolling 24-hour window rather than a calendar day, and `M` is
+`deliveryUnknown`. The counts appear only for `on` and `webhook-rejected`. The client
+(`src/services/marketplaceClient.ts`) checks the field separately from the rest of the status
+body, so a malformed field costs this one line and never fails the status poll.
+
 ## The table
 
 There is one row per listing, ever: `PRIMARY KEY (source, listing_id)`. PLAN.md §18 asks for
@@ -268,9 +288,8 @@ Discord account):
 **Always pass `--name`.** Run from another directory, wrangler targets a different Worker or
 offers to create one, and still reports success.
 
-The dashboard should then read "Off (webhook ready)". **This PR does not render that label.** Until
-the dashboard change that reads `notifications.state` lands, confirm the state with the
-`notify state=off` log line or with `GET /api/status`.
+The dashboard's Collection panel should then read **"Discord alerts: off (webhook ready)"**. The
+`notify state=off` log line and `GET /api/status` say the same thing.
 
 **The agent then enables sending.** It does this only once at least 10 models have
 `model_stats.count >= 5` and at least one evidence verdict exists:
