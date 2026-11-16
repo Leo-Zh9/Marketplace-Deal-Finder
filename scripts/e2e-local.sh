@@ -666,6 +666,21 @@ is "  ...so the next run runs all three"       3 "$(grep -c '"kind":"target"' /t
 has "  ...with the volume cut lifted"          '"canary":false' "$(cat /tmp/e2e-collector.out)"
 rm -f "$COLLECTOR_STATE"
 
+echo "== a manual fixture run leaves the live guard state alone =="
+# COLLECTOR_HTML_FILE with NO COLLECTOR_STATE_FILE is how an operator replays a saved page by
+# hand. Every target gets the same page, so a state file written to the default path would carry
+# a feed-overlap latch into the next launchd run. HOME IS A THROWAWAY DIRECTORY HERE, so even a
+# broken build writes there and never to the operator's real ~/.marketplace-collector-state.json.
+E2E_HOME=$(mktemp -d /tmp/e2e-home.XXXXXX)
+env -u COLLECTOR_STATE_FILE HOME="$E2E_HOME" \
+    COLLECTOR_API_BASE="$BASE" COLLECTOR_TOKEN="$COLLECTOR_TOKEN" COLLECTOR_LIMIT=4 \
+    COLLECTOR_HTML_FILE=collector/testing/fixtures/facebookSearchPage.html \
+    COLLECTOR_TARGET_DELAY_MS=0 \
+    node collector/main.ts >/tmp/e2e-collector.out 2>&1
+is "a manual fixture run exits 0"              0 "$?"
+is "  ...and writes no guard state at all"     "absent" "$([ -e "$E2E_HOME/.marketplace-collector-state.json" ] && echo present || echo absent)"
+rm -rf "$E2E_HOME"
+
 echo "== exit 4 is not a clean probe: a latch survives a page that changed shape =="
 # THE PROCESS-LAYER WITNESS FOR THE MOST SERIOUS DEFECT IN THIS SLICE, and it costs one `sed` and
 # NO new committed fixture.

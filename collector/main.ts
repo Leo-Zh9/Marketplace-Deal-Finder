@@ -99,8 +99,17 @@ const processConfig: ProcessConfig = {
  * write the file the operator's real launchd collector reads, and the gate's deliberately
  * identical fixtures would LATCH THE PRODUCTION GUARD. E-1 is the only layer that can see that.
  */
-const STATE_FILE =
-  process.env.COLLECTOR_STATE_FILE?.trim() || join(homedir(), ".marketplace-collector-state.json");
+const EXPLICIT_STATE_FILE = process.env.COLLECTOR_STATE_FILE?.trim() || null;
+const STATE_FILE = EXPLICIT_STATE_FILE ?? join(homedir(), ".marketplace-collector-state.json");
+
+/**
+ * A FIXTURE RUN DOES NOT TOUCH THE LIVE GUARD STATE UNLESS IT NAMES A STATE FILE ITSELF.
+ * `COLLECTOR_HTML_FILE` serves the SAME page to every target, so a manual
+ * `COLLECTOR_HTML_FILE=... node collector/main.ts` trips `feed-overlap` by construction; written
+ * to the default path, the operator's next launchd runs became probes. Unset, such a run starts
+ * fresh (full volume) and writes nothing. The gate sets COLLECTOR_STATE_FILE, so it keeps state.
+ */
+const GUARD_STATE_OFF = processConfig.htmlFile !== null && EXPLICIT_STATE_FILE === null;
 
 /**
  * ABSENT IS `null`, NOT A THROW, AND IT IS THE NORMAL CASE: there is no state file until the
@@ -109,6 +118,7 @@ const STATE_FILE =
  * take the whole run with it over a file that is an optimisation, not a prerequisite.
  */
 const readState = async (): Promise<string | null> => {
+  if (GUARD_STATE_OFF) return null;
   try {
     return await readFile(STATE_FILE, "utf8");
   } catch {
@@ -129,6 +139,7 @@ const readState = async (): Promise<string | null> => {
  * BEFORE the rename so the file is never visible at its final path with a wider mode.
  */
 const writeState = async (serialized: string): Promise<void> => {
+  if (GUARD_STATE_OFF) return;
   const temporary = `${STATE_FILE}.tmp`;
   await writeFile(temporary, serialized, { mode: 0o600 });
   await chmod(temporary, 0o600);
