@@ -52,6 +52,35 @@ const ran = (
   ...over,
 });
 
+/**
+ * `runs` real runs: `selectProbe` plans each, only the planned targets answer, and
+ * `advanceState` folds the answers in. `cut` counts runs with the volume cut engaged.
+ */
+const simulate = (
+  watchList: readonly string[],
+  runs: number,
+  answer: (targetId: string, run: number) => TargetRun,
+) => {
+  let state = fresh();
+  let cut = 0;
+  let requests = 0;
+  for (let run = 0; run < runs; run += 1) {
+    const plan = selectProbe(state, watchList);
+    const answers = plan.indices.map((index) => answer(watchList[index], run));
+    if (plan.canary) cut += 1;
+    requests += answers.length;
+    state = advanceState({
+      state,
+      watchList,
+      ran: answers,
+      canary: plan.canary,
+      expired: plan.expired,
+      nextProbe: plan.nextProbe,
+    }).state;
+  }
+  return { state, cut, requests };
+};
+
 /** `n` distinct ids on a prefix. `ids("a", 24)` is a full page nothing else shares. */
 const ids = (prefix: string, count: number): string[] =>
   Array.from({ length: count }, (_value, index) => `${prefix}-${index}`);
@@ -1286,6 +1315,115 @@ describe("the collector's cross-run state", () => {
 
     expect(plan.canary).toBe(false);
     expect(plan.indices).toEqual([0, 1, 2]);
+  });
+
+  /**
+   * G-26: A REFUSAL IS CREDITED BY AN EXIT 0 ANYWHERE IN THE RUN, BECAUSE A REFUSAL IS OF THE IP.
+   *
+   * The stuck case is literal: `t0` refused once and then quiet for good (exit 3). Before the
+   * fix `refused:t0` waited for `t0` itself to exit 0, which never came, and a refusal never
+   * expires: 199 of 200 runs cut. The mutation is dropping the IP-wide credit.
+   */
+  it("G-26: a target refused once and then quiet for good does not pin the cut", () => {
+    const watchList = Array.from({ length: 9 }, (_value, index) => `t${index}`);
+    const result = simulate(watchList, 200, (targetId, run) =>
+      targetId !== "t0"
+        ? ran(targetId)
+        : run === 0
+          ? ran("t0", 5, { reason: IMMEDIATE_REFUSAL_REASONS[0] })
+          : ran("t0", 3),
+    );
+
+    expect(result.state.alarm["refused:t0"]).toBeUndefined();
+    expect(result.cut).toBe(CANARY_CLEAN_PROBES);
+  });
+
+  /**
+   * G-26b: THE CREDIT'S EDGES. Each row is the input one wrong version of the rule gets wrong:
+   * no exit 0 anywhere (credit from nothing), another target refused in the same run (the IP is
+   * still refused), and a cause that is not a refusal (the credit written for every cause).
+   */
+  it.each<[string, string, TargetRun[], number]>([
+    ["an exit 0 elsewhere credits a refusal", "refused:a", [ran("a", 3), ran("b")], 1],
+    ["no exit 0 anywhere does not", "refused:a", [ran("a", 3), ran("b", 3)], 0],
+    [
+      "a refusal elsewhere in the run does not",
+      "refused:a",
+      [ran("a", 3), ran("b"), ran("c", 5, { reason: IMMEDIATE_REFUSAL_REASONS[0] })],
+      0,
+    ],
+    ["it does not credit a transient cause", "transient:a", [ran("a", 2), ran("b")], 0],
+  ])("G-26b: %s", (_label, cause, runs, cleanProbes) => {
+    const result = advance({
+      state: fresh({ alarm: { [cause]: { runs: 3, cleanProbes: 0 } } }),
+      watchList: ["a", "b", "c", "d"],
+      ran: runs,
+      canary: true,
+    });
+
+    expect(result.state.alarm[cause].cleanProbes).toBe(cleanProbes);
+  });
+
+  /**
+   * G-27: ONE QUIET QUERY BESIDE HEALTHY ONES KEEPS ITS ALARM AND CUTS NOTHING; EVERY TARGET
+   * EMPTY STILL CUTS. The second half is what the alarm exists for (a wholesale page-marker
+   * change empties every target), so it is what stops the fix being "source-empty never cuts".
+   * Before the fix the first case cut 193 of 200 runs. The mutation is dropping the `quiet`
+   * filter in `selectProbe`.
+   */
+  it("G-27: one empty target beside eight healthy ones is alarmed but not cut", () => {
+    const watchList = Array.from({ length: 9 }, (_value, index) => `t${index}`);
+    const result = simulate(watchList, 200, (targetId) => ran(targetId, targetId === "t0" ? 3 : 0));
+
+    expect(result.state.alarm["source-empty:t0"]).toMatchObject({ quiet: true, cleanProbes: 0 });
+    expect(result.cut).toBe(0);
+    expect(result.requests).toBe(200 * 9);
+  });
+
+  it("G-27b: every target empty is still cut", () => {
+    const watchList = Array.from({ length: 9 }, (_value, index) => `t${index}`);
+    const result = simulate(watchList, 200, (targetId) => ran(targetId, 3));
+
+    expect(result.state.alarm["source-empty:t0"].quiet).toBeUndefined();
+    // 3 full runs to latch, then 197 runs of 48 cut + 1 expiry: 197 = 4 x 49 + 1, so 193.
+    expect(result.cut).toBe(193);
+  });
+
+  /**
+   * G-27c: `quiet` IS RE-DECIDED, BOTH WAYS. A quiet cause whose next empty run has no healthy
+   * neighbour stops being quiet, so a page-marker change that arrives after one query went
+   * quiet still engages the cut.
+   */
+  it("G-27c: quiet is set by a healthy neighbour and cleared without one", () => {
+    const watchList = ["a", "b", "c"];
+    const quiet = advance({
+      state: fresh({ consecutive: { a: { sourceEmpty: 2, transient: 0 } } }),
+      watchList,
+      ran: [ran("a", 3), ran("b"), ran("c")],
+    });
+    expect(quiet.state.alarm["source-empty:a"]).toEqual({ runs: 1, cleanProbes: 0, quiet: true });
+    expect(selectProbe(quiet.state, watchList).canary).toBe(false);
+
+    const loud = advance({ state: quiet.state, watchList, ran: [ran("a", 3), ran("b", 3), ran("c", 4)] });
+    expect(loud.state.alarm["source-empty:a"]).toEqual({ runs: 2, cleanProbes: 0 });
+    expect(selectProbe(loud.state, watchList).canary).toBe(true);
+  });
+
+  /** G-14d: `quiet` survives the file, and anything but `true` there makes the file fresh. */
+  it("G-14d: a quiet latch round-trips, and a non-true quiet is refused", () => {
+    const state: RunState = {
+      version: 1,
+      consecutive: {},
+      alarm: { "source-empty:t1": { runs: 4, cleanProbes: 0, quiet: true } },
+      probe: 0,
+      canaryRuns: 0,
+    };
+    expect(parseRunState(serializeRunState(state))).toEqual(state);
+    expect(
+      parseRunState(
+        '{"version":1,"consecutive":{},"alarm":{"source-empty:t1":{"runs":4,"cleanProbes":0,"quiet":false}},"probe":0,"canaryRuns":0}',
+      ).alarm,
+    ).toEqual({});
   });
 
   /** The shipped numbers, in the one place they are written down as values. */

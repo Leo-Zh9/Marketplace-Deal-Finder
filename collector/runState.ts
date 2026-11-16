@@ -224,8 +224,10 @@ export interface RunState {
    *
    * `runs` counts runs that ran targets since the cause latched, so the page's N grows.
    * `cleanProbes` counts CONSECUTIVE clean re-measurements OF THIS CAUSE.
+   * `quiet`, present only as `true` and only on `source-empty:` causes, means the alarm stands
+   * but engages no volume cut. Absent in every older file, which keeps the old behaviour.
    */
-  alarm: Record<string, { runs: number; cleanProbes: number }>;
+  alarm: Record<string, { runs: number; cleanProbes: number; quiet?: true }>;
   /**
    * A rotating start index over the SORTED CAUSE LIST. NOT over the watch list: the probe is not
    * sampling, it is a specific question ("is `mobo-toronto` still empty?", "do `radeon` and
@@ -313,13 +315,18 @@ const counter = (value: unknown): { sourceEmpty: number; transient: number } | n
   return { sourceEmpty: sourceEmpty as number, transient: transient as number };
 };
 
-const latch = (value: unknown): { runs: number; cleanProbes: number } | null => {
+const latch = (value: unknown): RunState["alarm"][string] | null => {
   if (!isRecord(value)) return null;
   const runs = value.runs;
   const cleanProbes = value.cleanProbes;
   if (!Number.isInteger(runs) || !Number.isInteger(cleanProbes)) return null;
   if ((runs as number) < 0 || (cleanProbes as number) < 0) return null;
-  return { runs: runs as number, cleanProbes: cleanProbes as number };
+  if (value.quiet !== undefined && value.quiet !== true) return null;
+  return {
+    runs: runs as number,
+    cleanProbes: cleanProbes as number,
+    ...(value.quiet === true ? { quiet: true as const } : {}),
+  };
 };
 
 /**
@@ -519,7 +526,10 @@ export interface ProbePlan {
  */
 export const selectProbe = (state: RunState, watchList: readonly string[]): ProbePlan => {
   const every = watchList.map((_id, index) => index);
-  const causes = Object.keys(state.alarm).sort();
+  // A `quiet` cause stays on the page but asks for no cut; see `advanceState`.
+  const causes = Object.keys(state.alarm)
+    .filter((cause) => state.alarm[cause].quiet !== true)
+    .sort();
 
   if (causes.length === 0) {
     return { indices: every, canary: false, expired: false, nextProbe: 0 };
@@ -619,7 +629,8 @@ export interface AdvanceResult {
  *   ---------------------|--------------------------------------------|---------------------------
  *   source-empty:t       | t ran AND t's exit is 0 or 6               | t's exit is not 3
  *   transient:t          | t ran AND t's exit is 0 or 6               | t's exit is not 5
- *   refused:t            | t ran AND t's exit is 0 or 6               | not (exit 5 with a refusal)
+ *   refused:t            | t ran AND (t's exit is 0 or 6, OR any      | not (exit 5 with a refusal)
+ *                        |   target exited 0 and none was refused)    |
  *   feed-overlap:a+b     | both ran, both non-empty, min >= the floor | coefficient < the fraction
  *
  * "MEASURED" IS POSITIVE EVIDENCE, NOT THE ABSENCE OF THE CAUSE'S OWN CODE. Exit 0 and exit 6
@@ -687,6 +698,9 @@ export const advanceState = (input: AdvanceInput): AdvanceResult => {
 
   const overlap = maxPairOverlap(ran);
   const feedTripped = trips(overlap);
+  /** Facebook served SOME page this run and refused none: the IP is not refused right now. */
+  const ipClean =
+    ran.some((target) => target.exitCode === EXIT_OK) && !ran.some((target) => refused(target));
 
   // EXISTING CAUSES, AGAINST THIS RUN'S EVIDENCE. Evaluated against the pre-drop snapshot, so
   // one cause clearing cannot change what another cause measures in the same run.
@@ -789,7 +803,17 @@ export const advanceState = (input: AdvanceInput): AdvanceResult => {
        * own signature, 4 the page changed shape, 5 either the cause's own signature or a POST
        * failure that says nothing about Facebook -- is NOT MEASURED: no credit, no reset.
        */
-      if (target.exitCode !== EXIT_OK && target.exitCode !== EXIT_CONTRACT) continue;
+      if (target.exitCode !== EXIT_OK && target.exitCode !== EXIT_CONTRACT) {
+        /**
+         * A REFUSAL IS OF THE IP, NOT OF ONE SEARCH, so its recovery can be measured at ANY
+         * target. Without this, `refused:t` waited for `t` itself to exit 0 or 6. A target
+         * refused once and then quiet for good (exit 3, a niche query) never did: measured, 199
+         * of 200 runs cut and the latch never cleared, since a refusal never expires. So an
+         * EXIT_OK anywhere in the run credits it, provided no target in the run was refused.
+         */
+        const ipAnswered = cause.startsWith("refused:") && ipClean;
+        if (!ipAnswered) continue;
+      }
     }
 
     value.cleanProbes += 1;
@@ -809,6 +833,27 @@ export const advanceState = (input: AdvanceInput): AdvanceResult => {
     if (refused(target)) raise(`refused:${target.targetId}`);
   }
   if (feedTripped) raise(`feed-overlap:${overlap.a}+${overlap.b}`);
+
+  /**
+   * A SOURCE-EMPTY CAUSE IS `quiet` WHEN ANOTHER TARGET IN THE SAME RUN EXITED 0, AND A QUIET
+   * CAUSE KEEPS ITS ALARM BUT DOES NOT ENGAGE THE VOLUME CUT (`selectProbe` skips it).
+   *
+   * The alarm exists for a wholesale page-marker change, and that empties EVERY target. One
+   * empty target beside healthy ones is a quiet query, which the control panel's "selected"
+   * model mode makes ordinary. Measured before this: one target at exit 3 forever and eight at
+   * exit 0 cut 193 of 200 runs, to 25 % of requests. Re-decided on every run in which the
+   * cause's own target came back empty; a run that did not measure that keeps the last answer.
+   */
+  for (const [cause, value] of Object.entries(alarm)) {
+    if (!cause.startsWith("source-empty:")) continue;
+    const [targetId] = causeTargets(cause);
+    if (byTarget.get(targetId)?.exitCode !== EXIT_SOURCE_EMPTY) continue;
+    const othersAnswered = ran.some(
+      (target) => target.targetId !== targetId && target.exitCode === EXIT_OK,
+    );
+    if (othersAnswered) value.quiet = true;
+    else delete value.quiet;
+  }
 
   // THE DROPS, AND THE COUNTER RESET THEY CARRY. Applied last so that a reset cannot suppress a
   // latch decided above -- which cannot happen anyway, because dropping needs a CLEAN
