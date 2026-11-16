@@ -333,6 +333,11 @@ const ACCESSORY_EVERYWHERE: [name: string, title: string, priceCents: number][] 
   ["AX-g2: a gpu fan for a named card", "GPU fan PWM 4pin replacement for RTX 3070", 2450],
   ["AX-g3: a gpu cooler fan with no other accessory word", "RTX 3080 FE fan", 2550],
   ["AX-g4: a case fan sold for a named card's build", "Arctic P12 PWM case fan for RTX 4090 build", 2000],
+  // THE OPEN-BOX EXEMPTION NEEDS `open` DIRECTLY BEFORE `box`. Anywhere-in-the-title would key
+  // the first as a VALID RTX 4090 at a box price, and "open to offers" is common seller copy.
+  // The second is ACCESSORY's own example: one exempt `box` does not excuse another.
+  ["AX-o1: a box, open to offers", "RTX 4090 original box - open to offers", 2650],
+  ["AX-o2: an open box that is also an original box", "RTX 4090 open box with original box", 2750],
 ];
 
 /**
