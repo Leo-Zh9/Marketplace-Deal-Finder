@@ -1,0 +1,11 @@
+{
+  // Operator scripts run under Node on the operator's machine, like the collector -- but unlike
+  // the collector they import the Worker's own modules (the normalization rule), whose type graph
+  // names D1 types. So: the collector's settings, plus the Workers types those modules mention.
+  // `skipLibCheck` (inherited) keeps the two type packages' overlapping globals from colliding.
+  "extends": "./tsconfig.collector.json",
+  "compilerOptions": {
+    "types": ["node", "@cloudflare/workers-types", "vitest/globals"]
+  },
+  "include": ["scripts/**/*.ts"]
+}
