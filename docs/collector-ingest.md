@@ -579,6 +579,12 @@ live 5080 is CA$3,000. Any threshold would be a fabricated number.
   4.33–4.93 ms, `T40c-r` p50 3.79–4.72 and p95 4.90–5.79 ms. Still under the 8 ms invariant, with
   less headroom on that path than before. After the second round of accessory words (load average
   7–11, three runs): `T40c` p95 3.95–5.64 ms, `T40c-r` p50 4.25–4.40 and p95 5.32–5.86 ms.
+  **Part 2 won the headroom back.** Every vocabulary phrase was re-tokenized on every check of
+  every listing, about a hundred times per title; `phraseTokens` now tokenizes each once per
+  isolate. Measured on the same machine, the rule went from ~3.9 to ~2.8 ms per 100 resolving
+  listings, and the file alone at load average 9–10 read `T40c` p95 2.85–3.57 ms and `T40c-r` p95
+  3.38–3.73 ms, three runs each, with the two Part 2 match rules in place. Under the whole
+  parallel suite the same tests had read 6.3–7.1 ms p95 before it.
 
 ### The residuals, named — and the corpora they are measured from
 
