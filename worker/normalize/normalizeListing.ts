@@ -264,6 +264,14 @@ export const MULTI_UNIT = new Set(["pack"]);
  *
  * NO BARE `for`: `"for sale"` is everywhere. The `X for <model>` shape is caught positionally
  * instead -- `for` immediately before a matched catalog model -- in `accessoryEvidence`.
+ *
+ * THE SECOND ROUND OF WORDS (`fan`, `fans`, `replacement`, `box`, `holder`, `stand`, `support`)
+ * came from review: `"RTX 3080 FE fan replacement"` from a case-fan search, `"RTX 4090 box only"`
+ * from a psu search and `"RTX 4090 vertical GPU holder"` from a case search all resolved VALID
+ * with a model. THE TRADE IS DELIBERATE: this list runs only on a cross-type resolution, where a
+ * false refusal costs a NEEDS_REVIEW (a lost reference) and a missed accessory writes a wrong
+ * price. `empty box` and the earlier `fan for` are NOT listed because `box` and `fan` cover them,
+ * and a phrase no mutation can kill is deleted here, not kept.
  */
 export const ACCESSORY = [
   "cable",
@@ -279,8 +287,23 @@ export const ACCESSORY = [
   "shroud",
   "thermal pad",
   "thermal pads",
-  "fan for",
+  "fan",
+  "fans",
+  "replacement",
+  "box",
+  "holder",
+  "stand",
+  "support",
 ];
+
+/**
+ * ACCESSORY WORDS THAT ARE THE PRODUCT ITSELF for one type: a case fan IS a fan. Without this a
+ * real fan found by another type's search could never move to case_fan -- and five catalog names
+ * carry the word (`Lian Li UNI FAN SL120 V2`, ...), so T12 goes red, 40 cross-type pairs short.
+ */
+const ACCESSORY_OWN_WORDS: Partial<Record<Listing["componentType"], readonly string[]>> = {
+  case_fan: ["fan", "fans"],
+};
 
 const DIGITS = /^[0-9]+$/;
 const LETTERS = /^[a-z]+$/;
@@ -533,7 +556,10 @@ export const accessoryEvidence = (
   tokens: readonly Token[],
   type: Listing["componentType"],
 ): boolean =>
-  containsAnyPhrase(values, ACCESSORY) ||
+  containsAnyPhrase(
+    values,
+    ACCESSORY.filter((phrase) => !(ACCESSORY_OWN_WORDS[type] ?? []).includes(phrase)),
+  ) ||
   matchCatalogSpans(MODEL_INDEXES[type], tokens).some(
     (span) => span.start > 0 && values[span.start - 1] === "for",
   );
