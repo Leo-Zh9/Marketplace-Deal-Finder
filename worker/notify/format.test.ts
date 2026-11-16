@@ -96,8 +96,25 @@ describe("sanitizeText", () => {
     );
     expect(sanitizeText("  a\n\n# b\r\n\t> c  ", 200)).toBe("a \\# b \\> c");
     expect(sanitizeText("[click](https://evil.example)", 200)).toBe(
-      "\\[click\\]\\(https://evil.example\\)",
+      "\\[click\\]\\(https:\u200B//evil.example\\)",
     );
+  });
+
+  /**
+   * F4b. NO `://` SURVIVES, whatever the scheme's case, brackets or neighbours. Kills: removing the
+   * scheme break.
+   */
+  it.each([
+    "http://evil.example",
+    "https://evil.example/phish",
+    "HTTPS://EVIL.EXAMPLE",
+    "<https://evil.example/x>",
+    "gluedhttps://evil.example",
+    "ftp://x and javascript://y",
+  ])("F4b: %s keeps no ://", (raw) => {
+    const out = sanitizeText(raw, 200);
+    expect(out).not.toContain("://");
+    expect(out).toContain(":\u200B//");
   });
 
   /** F5. The cut happens before escaping, so an escape is never split. */

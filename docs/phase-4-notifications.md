@@ -98,6 +98,16 @@ re-check uses word for word):
   server's own `invert`, bound into the same `json_each` predicate as `GET /api/verdicts`, in storage
   ids (`case_fan`, not `case_fans`). A type watched without a catalog model means every model of
   that type. An empty watch list means nothing.
+- **Enqueue only:** the task was judged within the last day (`t.evaluated_at >= now -
+  NOTIFY_RECENT_EVALUATION_SECONDS`, 86,400 s). This makes alerts "new deals from now on" rather
+  than a dump of every fresh DEAL when sending is first turned on. It gates on the *judgment*, not
+  on `listings.first_seen_at`. A price drop re-queues the task and the drain re-judges it, so a price
+  drop on a listing first seen weeks ago still alerts, and a row cancelled by that price change
+  still re-arms. A `first_seen_at` gate was measured to break that path (mutation R6 turns N8 red).
+  A settings change re-judges every task, so deals under a new rule do alert. The cost: a row
+  cancelled as stale or un-watched does not re-arm once its judgment is more than a day old. The
+  re-check does not apply this gate, so a row that waits longer than a day (for example, during a
+  webhook outage) is still sent (N7d).
 - No non-CANCELLED row exists for that listing. The `NOT EXISTS` runs before `LIMIT 20`, so already
   SENT deals can never fill the window and starve a new one.
 
@@ -162,14 +172,23 @@ Every fetch outcome writes `last_attempt_at`.
 - the title, cut to 200 characters
 - the link
 
-In the title and location, whitespace and newlines collapse to single spaces and
-`` \ * _ ~ | > [ ] ( ) ` # `` are backslash-escaped. **The link is built from `listing_id`**, in the
+In the title and location, whitespace and newlines collapse to single spaces, every `://` gets a
+zero-width space after its colon, and `` \ * _ ~ | > [ ] ( ) ` # `` are backslash-escaped. The
+`://` break matters because Discord autolinks a bare `https://...` however it is escaped, and
+`flags: 4` suppresses only the preview, not the link. After the break, the id-built listing link is
+the only URL in the message (N14, N14b). **The link is built from `listing_id`**, in the
 collector's `buildListingUrl` shape, and never from the stored `url`, which whoever holds the
 collector token controls.
 
 **Logging.** Each step logs exactly one counts-only line:
-`notify state=on enqueued=1 sent=1 unknown=0 cancelled=0 failed=0 rate_limited=0 rejected=0 swept=0`.
-It never includes the URL, a title or a token.
+`notify state=on enqueued=1 sent=1 unknown=0 cancelled=0 failed=0 rate_limited=0 rejected=0 swept=0 unrecorded=0`.
+It never includes the URL, a title or a token. The line includes `unrecorded=N`, the number of
+result writes that changed 0 rows. Each of those also logs one
+`notify result write changes=0 outcome=<kind>` warning (see the runbook).
+
+**The webhook URL that is sent** is rebuilt from the validated parse (origin and path), never taken
+from the raw secret. A secret ending in `?` or `#` passes validation, and sent raw it would become
+`.../x??wait=true`, which Discord answers with 204.
 
 ## Workers Free budget
 
@@ -181,8 +200,17 @@ It never includes the URL, a title or a token.
 | Steps per instance | 1,024 | +1 (`notify`) |
 | Discord POSTs per day | | 5 per run × 48 runs = 240 at most. A rejected webhook costs 1 probe per run. |
 
-The enqueue reads the listings that pass its joins once per run. At one user's corpus size that is
-small next to D1's 5M reads a day.
+**Reads.** The enqueue scans every evaluation task once per run, because no index serves its
+predicate. This has been measured twice:
+
+| Fixture | Rows read at 500 / 2,000 / 10,000 tasks | Per run |
+|---|---|---|
+| Review's | 603 / 2,309 | about 1.15× the corpus |
+| This PR's, after the evaluation gate (2 % DEALs) | 503 / 2,003 / 10,003 | about 1.0× the corpus |
+
+Using the larger coefficient: **≈ 1.15 × corpus per run, ≈ 55 × corpus per day** (48 runs). At a
+10,000-task corpus that is ≈ 0.55M reads a day, 11 % of D1 Free's 5M. Re-check this if the corpus
+grows past about 50,000 tasks.
 
 ## Runbook
 
@@ -201,6 +229,13 @@ UPDATE notifications SET status='PENDING' WHERE listing_id=?;
 
 The next run re-checks the row and sends it if it still qualifies, or cancels it if it no longer
 does.
+
+**A DELIVERY_UNKNOWN row may have been delivered.** Besides 5xx, timeouts and lost runs, an
+overlapping run can do this. If run B's sweep reaches a SENDING row while run A's fetch for it is
+still in flight, the row becomes DELIVERY_UNKNOWN. A's fenced result write then matches nothing,
+even if Discord accepted the message. This never causes a duplicate on its own. A's counts line
+shows `unrecorded=1` and the warning `notify result write changes=0 outcome=sent`. This is why the
+manual resend above always starts with checking the channel.
 
 **List what needs a look:**
 `SELECT listing_id, status, attempts, last_error, last_attempt_at FROM notifications WHERE status IN ('DELIVERY_UNKNOWN','FAILED') ORDER BY updated_at DESC;`
@@ -240,12 +275,25 @@ the dashboard change that reads `notifications.state` lands, confirm the state w
 **The agent then enables sending.** It does this only once at least 10 models have
 `model_stats.count >= 5` and at least one evidence verdict exists:
 
-1. Confirm that the user's `secret put` created a new deployment, with
+1. **Preview what the first runs would send.** This query is read-only. It is the enqueue predicate
+   with the watch-list selection left out, so the count is an upper bound. `25200` is
+   `NOTIFY_FRESH_SECONDS` and `86400` is `NOTIFY_RECENT_EVALUATION_SECONDS`. Run it in
+   `/Users/leozhang/Marketplace-Deal-Finder`:
+
+   ```sh
+   npx wrangler d1 execute marketplace-deal-finder-db --remote --command "SELECT COUNT(*) AS would_enqueue FROM listings l JOIN evaluation_tasks t ON t.source = l.source AND t.listing_id = l.listing_id JOIN search_settings ss ON ss.id = 1 WHERE l.validity = 'VALID' AND l.model_key IS NOT NULL AND t.status = 'COMPLETE' AND t.verdict = 'DEAL' AND t.evaluated_revision = ss.current_revision AND l.last_seen_at >= CAST(strftime('%s','now') AS INTEGER) - 25200 AND t.evaluated_at >= CAST(strftime('%s','now') AS INTEGER) - 86400 AND NOT EXISTS (SELECT 1 FROM notifications n WHERE n.source = l.source AND n.listing_id = l.listing_id AND n.status <> 'CANCELLED')"
+   ```
+
+   The result is one row, `would_enqueue: N`. At most 20 are enqueued and 5 sent per run, so N
+   alerts take about N / 5 runs (30 minutes each) to drain. If N is more than the user wants at
+   once, stop and ask before going on. The query was checked against a local D1. Its remote output
+   has the same shape.
+2. Confirm that the user's `secret put` created a new deployment, with
    `npx wrangler deployments list --name marketplace-deal-finder-api`. Then confirm that the next
    `monitor_runs` row and the daily cleanup still land.
-2. Run
+3. Run
    `printf on > <file> && npx wrangler secret put NOTIFICATIONS --name marketplace-deal-finder-api < <file> && rm <file>`.
    Use a file redirect, not a pipe.
-3. Verify with `npx wrangler tail marketplace-deal-finder-api --format json` across one run, looking
+4. Verify with `npx wrangler tail marketplace-deal-finder-api --format json` across one run, looking
    for the counts line with `state=on`.
-4. Fallback: `npx wrangler deploy` from a clean `origin/master` worktree.
+5. Fallback: `npx wrangler deploy` from a clean `origin/master` worktree.

@@ -57,6 +57,14 @@ export interface NotifyCounts {
   failed: number;
   unknown: number;
   cancelled: number;
+  /**
+   * Result writes that changed 0 rows: the row was no longer SENDING under this token -- an
+   * overlapping run swept it (to DELIVERY_UNKNOWN) or re-claimed it while this fetch was in
+   * flight. The fetch's outcome is then NOT recorded. It cannot cause a duplicate on its own, but a
+   * delivered message can sit as DELIVERY_UNKNOWN, which is why the runbook says to check the
+   * channel before any manual resend.
+   */
+  unrecorded: number;
 }
 
 export interface NotifyInput {
@@ -80,9 +88,10 @@ const zero = (state: NotifyCounts["state"]): NotifyCounts => ({
   failed: 0,
   unknown: 0,
   cancelled: 0,
+  unrecorded: 0,
 });
 
-const COUNT_FOR: Record<ResultKind, Exclude<keyof NotifyCounts, "state">> = {
+const COUNT_FOR: Record<ResultKind, Exclude<keyof NotifyCounts, "state" | "unrecorded">> = {
   sent: "sent",
   "rate-limited": "rateLimited",
   rejected: "rejected",
@@ -93,7 +102,8 @@ const COUNT_FOR: Record<ResultKind, Exclude<keyof NotifyCounts, "state">> = {
 export const countsLine = (counts: NotifyCounts): string =>
   `notify state=${counts.state} enqueued=${counts.enqueued} sent=${counts.sent} ` +
   `unknown=${counts.unknown} cancelled=${counts.cancelled} failed=${counts.failed} ` +
-  `rate_limited=${counts.rateLimited} rejected=${counts.rejected} swept=${counts.swept}`;
+  `rate_limited=${counts.rateLimited} rejected=${counts.rejected} swept=${counts.swept} ` +
+  `unrecorded=${counts.unrecorded}`;
 
 export const runNotify = async (db: D1Database, input: NotifyInput): Promise<NotifyCounts> => {
   const config = resolveNotifyConfig(input.environment);
@@ -139,7 +149,7 @@ export const runNotify = async (db: D1Database, input: NotifyInput): Promise<Not
     const result = classifyResponse(outcome, claimed.attempts, now);
     const sent = result.status === "SENT";
 
-    await db
+    const written = await db
       .prepare(WRITE_RESULT)
       .bind(
         result.status,
@@ -155,6 +165,11 @@ export const runNotify = async (db: D1Database, input: NotifyInput): Promise<Not
       .run();
 
     counts[COUNT_FOR[result.kind]] += 1;
+    if ((written.meta.changes ?? 0) === 0) {
+      counts.unrecorded += 1;
+      // Counts only: no URL, title or token.
+      console.warn(`notify result write changes=0 outcome=${result.kind}`);
+    }
     if (result.stop) break;
   }
 

@@ -53,6 +53,8 @@ export const isValidWebhookUrl = (raw: string, appEnv: string | undefined): bool
   } catch {
     return false;
   }
+  // `.../x?` and `.../x#` parse with an EMPTY search and hash, so they pass the check below; the
+  // URL that is sent is therefore rebuilt from the parse (`sendableUrl`), never the raw string.
   if (url.username !== "" || url.password !== "" || url.hash !== "" || url.search !== "") {
     return false;
   }
@@ -75,6 +77,16 @@ export const isValidWebhookUrl = (raw: string, appEnv: string | undefined): bool
 };
 
 /**
+ * The URL the sender uses: origin + path from the validated parse. Sending the raw string would
+ * turn `.../x?` into `.../x??wait=true`, which Discord answers 204 -- recorded as SENT although
+ * `wait` never applied.
+ */
+export const sendableUrl = (raw: string): string => {
+  const url = new URL(raw);
+  return `${url.origin}${url.pathname}`;
+};
+
+/**
  * The precedence is fixed: no URL, then a bad URL, then the switch. A bad URL with the switch on
  * is `invalid-url`, not `on` -- the operator has to see the thing that is actually wrong.
  */
@@ -83,5 +95,5 @@ export const resolveNotifyConfig = (environment: NotifyEnvironment): NotifyConfi
   if (raw === undefined || raw === "") return { state: "unconfigured" };
   if (!isValidWebhookUrl(raw, environment.APP_ENV)) return { state: "invalid-url" };
   if (environment.NOTIFICATIONS !== "on") return { state: "off" };
-  return { state: "on", url: raw };
+  return { state: "on", url: sendableUrl(raw) };
 };

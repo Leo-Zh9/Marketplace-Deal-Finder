@@ -32,12 +32,28 @@ export const listingUrl = (listingId: string): string =>
 
 const MARKDOWN = /[\\*_~|>[\]()`#]/g;
 
-/** Collapse whitespace, cut to `max` code points, then escape. Cut first so no escape is split. */
+/**
+ * Every `://` gets a zero-width space after its colon. Discord autolinks a bare `scheme://...`
+ * whatever the escaping around it, and `flags: 4` only suppresses the preview, not the link -- so
+ * a seller's `https://evil.example/phish`, `<https://...>` autolink or `HTTPS://` would otherwise be
+ * clickable. Breaking the separator itself (rather than matching schemes) leaves no spelling of a
+ * scheme, glued to text or not, that survives. The id-built listing link is appended after this
+ * runs and is the only `://` in the message (N14).
+ */
+const SCHEME_SEPARATOR = /:\/\//g;
+export const ZERO_WIDTH_SPACE = "\u200B";
+
+/**
+ * Collapse whitespace, cut to `max` code points, break URL schemes, then escape. Cut first so no
+ * escape or scheme break is split.
+ */
 export const sanitizeText = (raw: string, max: number): string => {
   const collapsed = raw.replace(/\s+/g, " ").trim();
   const points = Array.from(collapsed);
   const cut = points.length > max ? `${points.slice(0, max - 1).join("")}…` : collapsed;
-  return cut.replace(MARKDOWN, (character) => `\\${character}`);
+  return cut
+    .replace(SCHEME_SEPARATOR, `:${ZERO_WIDTH_SPACE}//`)
+    .replace(MARKDOWN, (character) => `\\${character}`);
 };
 
 export const formatCents = (cents: number): string => {

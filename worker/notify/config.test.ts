@@ -72,6 +72,16 @@ describe("resolveNotifyConfig", () => {
     expect(resolveNotifyConfig({ APP_ENV: "production", ...environment }).state).toBe(state);
   });
 
+  /**
+   * U6. THE URL THAT IS SENT IS REBUILT FROM THE PARSE. A trailing `?` or `#` passes validation
+   * (both parse as empty), so it must not reach the request. Kills: returning the raw string.
+   */
+  it.each(["?", "#", "?#"])("U6: a trailing %s is dropped from the sendable URL", (suffix) => {
+    expect(
+      resolveNotifyConfig({ APP_ENV: "production", DISCORD_WEBHOOK_URL: `${GOOD}${suffix}`, NOTIFICATIONS: "on" }),
+    ).toEqual({ state: "on", url: GOOD });
+  });
+
   it("U5: a pasted URL with a trailing newline is accepted as the trimmed URL", () => {
     expect(
       resolveNotifyConfig({ APP_ENV: "production", DISCORD_WEBHOOK_URL: `${GOOD}\n`, NOTIFICATIONS: "on" }),

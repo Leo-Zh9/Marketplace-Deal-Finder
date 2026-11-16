@@ -26,7 +26,8 @@
  * A re-armed row starts a fresh delivery -- attempts 0, no backoff, a new `created_at` -- and
  * KEEPS `last_attempt_at` and `last_error`, which are what /api/status reads.
  *
- * Bindings: ?1 now, ?2 watched-type JSON, ?3 watched-pair JSON, ?4 freshness cutoff, ?5 limit.
+ * Bindings: ?1 now, ?2 watched-type JSON, ?3 watched-pair JSON, ?4 freshness cutoff, ?5 limit,
+ * ?6 the recent-evaluation cutoff.
  */
 
 import { SELECTION_PREDICATE } from "../api/verdicts";
@@ -35,6 +36,23 @@ import type { NotifySelection } from "./selection";
 
 /** The heartbeat window plus an hour. Imported, never written as a literal. */
 export const NOTIFY_FRESH_SECONDS = HEARTBEAT_SECONDS + 3600;
+
+/**
+ * "NEW DEALS FROM NOW ON", NOT A BACKLOG. Enqueue (only -- the re-check does not test it) also
+ * requires the task to have been JUDGED within the last day. Without it, turning alerts on would
+ * send every fresh DEAL in the corpus, weeks-old listings included, 5 per run.
+ *
+ * WHY `evaluated_at` AND NOT `listings.first_seen_at`: a price change re-queues the task and the
+ * drain re-judges it, so a price DROP on a listing first seen weeks ago is a newly judged DEAL and
+ * still alerts -- and a row cancelled by that price change re-arms through this same statement.
+ * A `first_seen_at` gate blocks both: measured, it turns N8 (cancel -> re-judge -> re-arm -> send)
+ * red for a listing first seen 30 days earlier. A settings change re-judges every task, so the
+ * deals under a NEW rule do alert; that is the user asking for them.
+ *
+ * What it does give up: a row cancelled because its listing went stale or was un-watched, which
+ * becomes eligible again more than a day after its last judgment, does not re-arm.
+ */
+export const NOTIFY_RECENT_EVALUATION_SECONDS = 86_400;
 
 /** How many candidates one run may enqueue. The send loop drains at most 5 per run. */
 export const ENQUEUE_LIMIT = 20;
@@ -58,6 +76,7 @@ SELECT l.source, l.listing_id, l.model_key, 'PENDING', ?1, ?1, 0
   JOIN evaluation_tasks t ON t.source = l.source AND t.listing_id = l.listing_id
   JOIN search_settings ss ON ss.id = 1
  WHERE ${CANDIDATE_PREDICATE}
+   AND t.evaluated_at >= ?6
    AND NOT EXISTS (SELECT 1 FROM notifications n
                     WHERE n.source = l.source AND n.listing_id = l.listing_id
                       AND n.status <> 'CANCELLED')
@@ -85,6 +104,7 @@ export const enqueueCandidates = async (
       JSON.stringify(selection.pairs),
       freshnessCutoff(now),
       ENQUEUE_LIMIT,
+      now - NOTIFY_RECENT_EVALUATION_SECONDS,
     )
     .run();
   return result.meta.changes ?? 0;

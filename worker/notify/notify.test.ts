@@ -105,6 +105,7 @@ interface DealInput {
   type?: string;
   validity?: string;
   lastSeenAt?: number;
+  firstSeenAt?: number;
   title?: string;
   location?: string | null;
   url?: string;
@@ -121,7 +122,7 @@ const deal = async (id: string, input: DealInput = {}) => {
       `INSERT INTO listings (source, listing_id, market_key, component_type, model_key, variant_key,
                              title, price_cents, location_text, url, validity, content_hash,
                              first_seen_at, last_seen_at)
-       VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, ?7, ?8, ?9, ?10, 'h', ?11, ?11)`,
+       VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, ?7, ?8, ?9, ?10, 'h', ?12, ?11)`,
     )
     .bind(
       SOURCE,
@@ -135,6 +136,7 @@ const deal = async (id: string, input: DealInput = {}) => {
       input.url ?? `https://www.facebook.com/marketplace/item/${id}`,
       input.validity ?? "VALID",
       input.lastSeenAt ?? T - 600,
+      input.firstSeenAt ?? input.lastSeenAt ?? T - 600,
     )
     .run();
   await db
@@ -247,6 +249,7 @@ type Answer =
 
 interface Call {
   url: string;
+  redirect: RequestInit["redirect"];
   body: { content: string; allowed_mentions: { parse: string[] }; flags: number };
 }
 
@@ -254,7 +257,7 @@ const discord = (script: Answer[] = []) => {
   const calls: Call[] = [];
   const queue = [...script];
   const fetch = async (url: string, init: RequestInit): Promise<Response> => {
-    calls.push({ url, body: JSON.parse(String(init.body)) as Call["body"] });
+    calls.push({ url, redirect: init.redirect, body: JSON.parse(String(init.body)) as Call["body"] });
     const answer = queue.shift() ?? 200;
     if (answer === "timeout") {
       throw new DOMException("The operation timed out.", "TimeoutError");
@@ -349,12 +352,30 @@ describe("the response classes", () => {
     if (expected.status !== "SENT") expect(row.sent_at).toBeNull();
   });
 
-  /** N1b. The request itself. Kills: dropping `?wait=true` (Discord would answer 204, unacknowledged). */
-  it("N1b: posts to <url>?wait=true", async () => {
+  /**
+   * N1b. The request itself. Kills: dropping `?wait=true` (Discord would answer 204,
+   * unacknowledged), and dropping `redirect: "manual"` (a redirect would re-POST the message to a
+   * host nobody validated).
+   */
+  it("N1b: posts to <url>?wait=true and never follows a redirect", async () => {
     await world();
     await deal("111");
     const fake = discord();
     await notify(fake);
+    expect(fake.calls.map((call) => call.url)).toEqual([`${WEBHOOK}?wait=true`]);
+    expect(fake.calls.map((call) => call.redirect)).toEqual(["manual"]);
+  });
+
+  /**
+   * N1c. A webhook secret with a trailing `?` or `#` still posts to exactly `<url>?wait=true`.
+   * Kills: sending the raw secret (`.../x??wait=true`, which Discord answers 204 and the step would
+   * record as SENT).
+   */
+  it.each(["?", "#"])("N1c: a secret ending in %s posts to the clean URL", async (suffix) => {
+    await world();
+    await deal("121");
+    const fake = discord();
+    await notify(fake, T, { environment: { ...ON, DISCORD_WEBHOOK_URL: `${WEBHOOK}${suffix}` } });
     expect(fake.calls.map((call) => call.url)).toEqual([`${WEBHOOK}?wait=true`]);
   });
 });
@@ -595,7 +616,9 @@ describe("re-check", () => {
    */
   it("N8: a price change cancels, and the re-judged deal re-arms and sends once at the new price", async () => {
     await world();
-    await deal("801", { price: 45_000 });
+    // First seen a MONTH ago: a price drop on an old listing must still alert (NOTIFY_RECENT_
+    // EVALUATION_SECONDS gates on the judgment, not on first sight).
+    await deal("801", { price: 45_000, firstSeenAt: T - 30 * 86_400 });
     const fake = discord();
 
     // Run 1: enqueued, not sent yet.
@@ -950,9 +973,11 @@ describe("the message on the wire", () => {
       expect(call.body.content.length).toBeLessThanOrEqual(2000);
     }
     const [masked, everyone, heading] = fake.calls.map((call) => call.body.content.split("\n"));
-    expect(masked.at(-2)).toBe("Title: \\[click\\]\\(https://evil.example\\)");
+    expect(masked.at(-2)).toBe("Title: \\[click\\]\\(https:\u200B//evil.example\\)");
     expect(masked.at(-1)).toBe("https://www.facebook.com/marketplace/item/1401");
     expect(everyone.at(-2)).toBe("Title: @everyone free GPU");
+    // The id-built link is the ONLY `://` in any message.
+    for (const call of fake.calls) expect(call.body.content.match(/:\/\//g)).toHaveLength(1);
     expect(heading.at(-2)).toBe("Title: RTX 4070 Super \\# heading \\> quote");
     expect(heading).toHaveLength(6);
     expect(heading[3]).toContain("listed in Toronto \\# also,");
@@ -1006,6 +1031,7 @@ describe("inert states", () => {
       failed: 0,
       unknown: 0,
       cancelled: 0,
+      unrecorded: 0,
     });
     expect(status).toEqual({ state });
     expect(touched).toEqual([]);
@@ -1026,8 +1052,102 @@ describe("inert states", () => {
     expect(log).toHaveBeenCalledTimes(1);
     const line = String(log.mock.calls[0][0]);
     expect(line).toBe(
-      "notify state=on enqueued=1 sent=1 unknown=0 cancelled=0 failed=0 rate_limited=0 rejected=0 swept=0",
+      "notify state=on enqueued=1 sent=1 unknown=0 cancelled=0 failed=0 rate_limited=0 rejected=0 swept=0 unrecorded=0",
     );
     expect(log.mock.calls[0]).toHaveLength(1);
+  });
+});
+
+describe("round 2", () => {
+  /**
+   * N14b. NO BARE URL IN A TITLE OR LOCATION STAYS CLICKABLE. Discord autolinks `scheme://`
+   * whatever the Markdown escaping, so every `://` is broken with a zero-width space. Kills:
+   * removing the scheme break from `sanitizeText`.
+   */
+  it.each<[string, string, string]>([
+    ["a bare http URL in the title", "GPU http://evil.example/phish cheap", "Toronto, ON"],
+    ["a bare https URL in the title", "GPU https://evil.example/phish cheap", "Toronto, ON"],
+    ["an uppercase scheme", "GPU HTTPS://EVIL.EXAMPLE/PHISH", "Toronto, ON"],
+    ["a <...> autolink in the location", "GPU", "<https://evil.example/x>"],
+    ["a scheme glued to text", "GPUhttps://evil.example", "nearhttps://evil.example"],
+  ])("N14b: %s is not a link", async (_label, title, location) => {
+    await world();
+    await deal("1411", { title, location });
+    const fake = discord();
+
+    await notify(fake);
+
+    const content = fake.calls[0].body.content;
+    expect(content.match(/:\/\//g)).toEqual(["://"]);
+    expect(content.endsWith("\nhttps://www.facebook.com/marketplace/item/1411")).toBe(true);
+    expect(content.includes("evil.example") || content.includes("EVIL.EXAMPLE")).toBe(true);
+  });
+
+  /**
+   * N18. AN OVERLAPPING RUN SWEEPS A ROW WHOSE FETCH IS IN FLIGHT. The fetch succeeds, the fenced
+   * write matches nothing, and the step says so (`unrecorded`, one `changes=0` warning) instead of
+   * passing silently. The row stays DELIVERY_UNKNOWN -- which is why the runbook checks the channel
+   * before a manual resend. Kills: dropping the changes=0 count and warning.
+   */
+  it("N18: a result write that changes 0 rows is counted and warned, never silent", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await world();
+    await deal("1801");
+    const overlapping = {
+      prepare: (sql: string) => {
+        const real = db.prepare(sql);
+        if (sql !== WRITE_RESULT) return real;
+        return {
+          bind: (...args: unknown[]) => ({
+            run: async () => {
+              // Another run, far enough ahead that A's lease has expired, sweeps first.
+              await db
+                .prepare("UPDATE notifications SET status = 'DELIVERY_UNKNOWN', lease_token = NULL WHERE status = 'SENDING'")
+                .run();
+              return real.bind(...args).run();
+            },
+          }),
+        };
+      },
+    } as unknown as D1Database;
+
+    const counts = await notify(discord(), T, { database: overlapping });
+
+    expect(counts).toMatchObject({ sent: 1, unrecorded: 1 });
+    expect(warn.mock.calls.map((call) => call.join(" "))).toEqual([
+      "notify result write changes=0 outcome=sent",
+    ]);
+    expect(await statusOf("1801")).toBe("DELIVERY_UNKNOWN");
+  });
+
+  /**
+   * N7c. NEW DEALS FROM NOW ON. A DEAL judged more than a day ago is not enqueued, even though the
+   * listing is still being seen; one judged exactly a day ago is. Kills: dropping
+   * `t.evaluated_at >= ?6` (the backlog dump when alerts are first turned on).
+   */
+  it("N7c: a DEAL judged more than a day ago is not enqueued", async () => {
+    await world();
+    await deal("1701", { evaluatedAt: T - 86_401 });
+    await deal("1702", { evaluatedAt: T - 86_400 });
+
+    await notify(discord(), T, { maxSends: 0 });
+
+    expect((await rows()).map((row) => row.listing_id)).toEqual(["1702"]);
+  });
+
+  /**
+   * N7d. The gate is on ENQUEUE ONLY. A row enqueued in time and kept PENDING past the day (a
+   * webhook rejected for two days) still goes out when the webhook recovers. Kills: moving the
+   * gate into CANDIDATE_PREDICATE, which the re-check shares -- the row would be cancelled.
+   */
+  it("N7d: a row that waited more than a day is still sent, not cancelled", async () => {
+    await world();
+    await deal("1711", { evaluatedAt: T - 1_000, lastSeenAt: T + 2 * 86_400 - 600 });
+    await notify(discord([404]), T);
+
+    const counts = await notify(discord(), T + 2 * 86_400);
+
+    expect(counts).toMatchObject({ sent: 1, cancelled: 0 });
+    expect(await statusOf("1711")).toBe("SENT");
   });
 });
