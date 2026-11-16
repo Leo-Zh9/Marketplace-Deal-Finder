@@ -1635,6 +1635,36 @@ describe("Start/Stop monitoring", () => {
   });
 
   /**
+   * A-m9: A CLOCK STEPPED BACKWARD DOES NOT FREEZE THE PANEL. Read #1 says running. The wall clock
+   * is set an hour back, the server flips to stopped, and the next poll must still be applied.
+   * Kills: ordering readings by `Date.now()` (every later reading looks older and is dropped).
+   */
+  it("A-m9: a reading sent after a backward clock step is still applied", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      let state: "running" | "stopped" = "running";
+      stubWire({
+        watch: LIVE_WATCH,
+        settings: null,
+        statusFn: () => ({
+          ...HEALTHY_STATUS,
+          ...(state === "stopped" ? { status: "stopped", causes: [] } : {}),
+          monitoring: { state, changedAt: CHANGED_AT },
+        }),
+      });
+      render(<App getToken={noToken} />);
+      await screen.findByRole("button", { name: "Stop monitoring" });
+
+      vi.setSystemTime(Date.now() - 3_600_000);
+      state = "stopped";
+      await vi.advanceTimersByTimeAsync(61_000);
+      expect(await screen.findByRole("button", { name: "Start monitoring" })).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /**
    * A-m8: A HUNG POST TIMES OUT AND THE BUTTON COMES BACK. `AbortSignal.timeout` is replaced so the
    * test can fire the timeout itself (fake timers do not drive it); the POST's signal is the
    * status reads' 60 s budget. Kills: sending the POST with no signal (the button stays disabled

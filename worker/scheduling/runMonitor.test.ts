@@ -30,6 +30,7 @@ import {
 } from "../evaluation/evaluateBatch";
 import { EVALUATION_BATCH_SIZE } from "../evaluation/types";
 import { handleStartMonitoring, handleStopMonitoring } from "../api/monitoring";
+import { zeroCounts } from "../notify/runNotify";
 import { loadCurrentSettings } from "../search/settings";
 import { createTestDatabase, truncateAll, type TestDatabase } from "../testing/d1";
 import { COLLECTION_STEPS, type CollectionOutcome, type CollectionStep } from "./collection";
@@ -1611,5 +1612,35 @@ describe("runMonitor -- the Stop flag", () => {
       status: "OK",
       claimedCount: 2,
     });
+  });
+
+  /**
+   * R-s6. A `notify` result memoized BEFORE the step returned `{counts, usage}` -- a bare
+   * NotifyCounts replayed across the deploy -- is read as the counts it is, spends nothing, and
+   * does not degrade the run. Kills: dropping the old-shape branch (run.notify null) or the `in`
+   * guard (a throw recorded as DEGRADED).
+   */
+  it("R-s6: a memoized bare NotifyCounts notify result is read as the counts", async () => {
+    await maximumPriceSettings();
+    await seed("alpha", 2);
+    const bare = { ...zeroCounts("on"), sent: 3, enqueued: 3 };
+    const baseline = recording();
+    const reference = await runMonitor(db, baseline.stepper, { now: T }, "run-reference");
+    await truncateAll(db);
+    await maximumPriceSettings();
+    await seed("alpha", 2);
+    const inner = recording();
+    const replayed: MonitorStepper = {
+      do: (name, config, callback) =>
+        name === "notify"
+          ? (Promise.resolve(bare) as unknown as ReturnType<typeof callback>)
+          : inner.stepper.do(name, config, callback),
+    };
+
+    const run = await runMonitor(db, replayed, { now: T }, "run-replayed-notify");
+
+    expect(run.status).toBe("OK");
+    expect(run.notify).toEqual(bare);
+    expect(run.usage).toEqual(reference.usage);
   });
 });
