@@ -61,6 +61,12 @@ const LIVE_BATCH: [string, number][] = [
  */
 const CAPPED_TITLE = "a1b2c3d4e5".repeat(40).slice(0, 300);
 const UNCAPPED_TITLE = `${"abcd1234 ".repeat(31)}efgh`;
+/**
+ * THE SAME 63-TOKEN SHAPE, LED BY A CATALOG MODEL, so that declared under a type it does not
+ * evidence the type resolution fires on every listing and the rules run under the RESOLVED type.
+ * `UNCAPPED_TITLE` evidences no type at all, so it never resolves and cannot measure that path.
+ */
+const RESOLVING_TITLE = `GeForce RTX 5080 ${"abcd1234 ".repeat(30)}`;
 
 let sink = 0;
 
@@ -185,5 +191,39 @@ describe("normalization CPU", () => {
     );
     expect(capped.p95).toBeLessThan(8);
     expect(uncapped.p95).toBeLessThan(8);
+  });
+
+  /**
+   * T40c-r: THE SAME WORST LEGAL BATCH, WITH THE TYPE RESOLUTION FIRING ON ALL 100. The resolution
+   * needs every type's model match -- one walk per index, where the old evidence scan skipped the
+   * walk for a type its marker already evidenced -- and then runs every rule under the resolved
+   * type. This is the measurement of that path rather than an argument about it.
+   */
+  it("T40c-r: p95 for the worst legal batch that resolves its type is under the 8 ms budget", () => {
+    expect(RESOLVING_TITLE.length).toBeLessThanOrEqual(300);
+    expect(tokenize(RESOLVING_TITLE)).toHaveLength(MAX_TOKENS - 1);
+    // Declared cpu, stored gpu: the resolution really fired, and the rules ran to rule 11.
+    expect(
+      normalizeListing({ title: RESOLVING_TITLE, priceCents: 12_345, componentType: "cpu" }),
+    ).toMatchObject({ componentType: "gpu", modelKey: "GeForce RTX 5080", reason: "matched" });
+
+    const work = (): number => {
+      let consumed = 0;
+      for (let index = 0; index < 100; index += 1) {
+        consumed += normalizeListing({
+          title: RESOLVING_TITLE,
+          priceCents: 12_345 + index,
+          componentType: "cpu",
+        }).componentType.length;
+      }
+      return consumed;
+    };
+
+    const resolving = measure(work, 8, 40);
+    console.log(
+      `normalizeListing over the worst legal batch, resolving cpu -> gpu (100 x 63 tokens): ` +
+        `p50 ${resolving.p50.toFixed(4)} ms, p95 ${resolving.p95.toFixed(4)} ms [sink ${sink}]`,
+    );
+    expect(resolving.p95).toBeLessThan(8);
   });
 });

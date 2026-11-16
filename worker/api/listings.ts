@@ -10,7 +10,8 @@
  * `priceCents` is computed here from the text; `modelKey`, `variantKey` and `validity` are
  * DERIVED here by `normalizeListing` from the title, the price and the declared component type;
  * `observedAt` is set here; `componentType` and `market` come from the envelope and are
- * validated before use. Unknown keys are REFUSED, not dropped, at both levels, so a field this
+ * validated before use -- and the STORED `component_type` is the type `normalizeListing`
+ * resolves, which is the envelope's only when the title does not prove another. Unknown keys are REFUSED, not dropped, at both levels, so a field this
  * module does not know about cannot arrive and be ignored.
  *
  * NORMALIZATION RUNS HERE, NOT IN THE COLLECTOR, AND THAT IS THE WHOLE SECURITY ARGUMENT. A
@@ -364,10 +365,10 @@ export const handlePostListings = async (
     const priceCents = parsePriceText(row.priceText);
     if (priceCents === null) pricesUnparsed += 1;
 
-    // THE ONLY PLACE A MODEL KEY IS EVER PRODUCED. Pure in `(title, priceCents, componentType)`
-    // and identical for every client, which is what makes it testable and what keeps
-    // `contentHash` stable across isolates -- a non-deterministic rule would make every sighting
-    // CHANGED and collapse the write budget.
+    // THE ONLY PLACE A MODEL KEY -- OR THE STORED TYPE -- IS EVER PRODUCED. Pure in
+    // `(title, priceCents, componentType)` and identical for every client, which is what makes it
+    // testable and what keeps `contentHash` stable across isolates -- a non-deterministic rule
+    // would make every sighting CHANGED and collapse the write budget.
     const normalization = normalizeListing({
       title: row.title,
       priceCents,
@@ -377,7 +378,13 @@ export const handlePostListings = async (
     sightings.push({
       listing: {
         listingId: row.listingId,
-        componentType: componentType as Listing["componentType"],
+        // THE RESOLVED TYPE, NOT THE ENVELOPE'S. The envelope says which search found the listing,
+        // and one listing answers searches of several types; storing the search's type made a
+        // catalogued listing flip VALID -> INVALID -> VALID across runs, removing and restoring
+        // its price contribution every time. The envelope type survives only as the fallback
+        // inside `normalizeListing`, and it reaches `contentHash` through this field, so the hash
+        // is stable across searches exactly when the classification is.
+        componentType: normalization.componentType,
         // DERIVED, never accepted from the wire. Null whenever `validity` is not VALID, so
         // `model_key IS NOT NULL` implies `validity = 'VALID'` as a database-level invariant --
         // asserted by SQL in scripts/e2e-local.sh. `variantKey` is null for every component type
