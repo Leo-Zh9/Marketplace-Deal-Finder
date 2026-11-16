@@ -401,7 +401,7 @@ that part: a CA$15–90 observation in the model's mean, and once 5 references e
 itself a `DEAL`. There is no outlier trim, so one CA$20 box among five CA$2,000 references moves
 the mean about 16%. So a title that carries an `ACCESSORY` phrase (`cable(s)`, `adapter`,
 `bracket`, `waterblock` / `water block`, `backplate`, `riser`, `mount(ing)`, `shroud`,
-`thermal pad(s)`, `fan(s)`, `replacement`, `box`, `holder`, `stand`, `support`) or reads
+`thermal pad(s)`, `fan(s)`, `replacement`, `box`, `holder`, `stand`) or reads
 `for <catalog model>` — `for` directly before a matched model of any type, never a bare `for`,
 because `"for sale"` is everywhere — is refused `NEEDS_REVIEW` / `accessory` (rule 3b below),
 **whichever search found it**, and keeps the search's type: a refused row is not filed under
@@ -454,6 +454,29 @@ phrase** — not because a phrase reads as plausible. **The one candidate family
 fan-count descriptors (`dual` / `triple` / `twin fan`). If it ever ships it must come with pinning
 rows keeping `"RTX 3080 triple fan shroud"` and `"RTX 3080 triple fan replacement"` refused.
 
+**The first production replay (1,408 stored listings, master 907d3d8) did exactly that, three
+ways.** It found two wrong keys and one measured loss, and this is what each became:
+
+- **`support` is out of `ACCESSORY`.** It was the only accessory word in three stored titles.
+  Two were real PSUs, stored with keys, that master would have refused: Corsair's own `"RM1000x …
+  ATX 3.1 Compliant – PCIe 5.1 Support"` and its RM850x twin. The third, a Jeep tailgate `"Power
+  Lift Support"`, carries no key either way. No accessory was caught by `support` alone;
+  `"GPU support bracket RTX 4090"` (`AX-r`) is still refused by `bracket`.
+- **`buying`, `looking to buy` and `we buy` are wanted-ad words.** `"Buying RTX4090"` was keyed as
+  a VALID RTX 4090 once the resolution let a cpu search reach it. Bare `buy` is not added, because
+  `"buy now"` is sale phrasing.
+- **Motherboard chipsets are motherboard evidence** (`CHIPSETS`, an explicit list).
+  `"X570 Aorus Master + Ryzen 9 5950x"` names an uncatalogued board, so only cpu was evidenced and
+  the bundle keyed as a Ryzen 9 5950X at the board-plus-CPU price. With the chipset counted, it
+  evidences two types and is refused. `H510` is left out because it collides with the NZXT H510
+  cases, and Intel Arc's `B570` / `B580` are cards, not chipsets. The cost is that a CPU whose
+  title states its chipset compatibility is refused as `mixed-components`. That is a lost
+  reference, never a wrong one.
+
+After the fix, the replay reports 18 gained keys, and every one was hand-checked as correct.
+No key is lost and the yield is 75 listings. The `RP-*` rows in `normalizeListing.test.ts` pin
+each case.
+
 **Measured over the 141-title live corpus (216 title × search sightings), before and after:
 4 outcomes change, all on titles labelled not-a-component and all refused both before and
 after, with no key on either side.** Three move from `INVALID_REFERENCE` to `NEEDS_REVIEW` /
@@ -474,7 +497,7 @@ Not addressed here; it belongs to the later parts that gate that leg.
 
 ```
 0.  capped title      the tokenizer returned 64 tokens                      -> NEEDS_REVIEW
-1.  wanted ad         wtb, want to buy, wanted, looking for, iso, ...       -> INVALID_REFERENCE
+1.  wanted ad         wtb, want to buy, buying, we buy, looking for, ...    -> INVALID_REFERENCE
 2.  trade only        for trade, trade only, swap, trading, ...             -> INVALID_REFERENCE
 3.  broken / parts    for parts, not working, damaged, as is, ...           -> INVALID_REFERENCE
 3b. accessory         under EVERY search: an accessory phrase (cable,
