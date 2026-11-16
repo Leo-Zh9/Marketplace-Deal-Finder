@@ -646,15 +646,24 @@ has "  ...so nothing latches there either"     '"alarms":[]' "$(cat /tmp/e2e-col
 # targeted drop the cause becomes unreadable rather than cleared and NO number of spotless runs
 # can release it. Hand-seeded, because reaching a latched feed cause needs ids this gate's
 # fixtures cannot vary per target.
+#
+# A THIRD ROW, AND A SECOND RUN, OR THE CUT ROWS CANNOT FAIL. With only the pair in the watch list
+# the probe IS the whole list, so `canary` is false and both targets run whether or not the cause
+# was dropped. And `canary` comes from the PERSISTED latch, decided before anything runs, so the
+# run that drops the cause is still a 2-of-3 probe; the lift shows on the run after it.
+sql "INSERT INTO watch_targets (target_id, component_type, query) VALUES ('e2e-three', 'gpu', 'radeon');" >/dev/null
 cat > "$COLLECTOR_STATE" <<'STATE'
 {"version":1,"consecutive":{"dup-gpu":{"sourceEmpty":0,"transient":0}},
  "alarm":{"feed-overlap:dup-cpu+dup-gpu":{"runs":9,"cleanProbes":0}},"probe":0,"canaryRuns":3}
 STATE
 collect
-is "a latched pair that is now one search runs both" 2 "$(grep -c '"kind":"target"' /tmp/e2e-collector.out)"
+is "a latched pair that is now one search is probed" 2 "$(grep -c '"kind":"target"' /tmp/e2e-collector.out)"
+has "  ...under the volume cut"                '"canary":true' "$(cat /tmp/e2e-collector.out)"
 has "  ...and the unanswerable cause is DROPPED" '"alarms":[]' "$(cat /tmp/e2e-collector.out)"
-has "  ...lifting the volume cut with it"      '"canary":false' "$(cat /tmp/e2e-collector.out)"
 is "  ...and the state file holds no alarm"    '{}' "$(python3 -c "import json;print(json.dumps(json.load(open('$COLLECTOR_STATE'))['alarm']))")"
+collect
+is "  ...so the next run runs all three"       3 "$(grep -c '"kind":"target"' /tmp/e2e-collector.out)"
+has "  ...with the volume cut lifted"          '"canary":false' "$(cat /tmp/e2e-collector.out)"
 rm -f "$COLLECTOR_STATE"
 
 echo "== exit 4 is not a clean probe: a latch survives a page that changed shape =="
