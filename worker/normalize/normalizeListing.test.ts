@@ -18,7 +18,9 @@
  */
 
 import type { Listing } from "../storage/types";
-import { tokenValues, tokenize } from "./catalogIndex";
+import { phraseTokens, tokenValues, tokenize } from "./catalogIndex";
+import { parsePriceText } from "../api/priceText";
+import { LIVE_CORPUS } from "./testing/liveCorpus";
 import {
   ACCESSORY,
   BROKEN,
@@ -1158,6 +1160,40 @@ describe("normalizeListing -- properties of the vocabularies", () => {
         "ACCESSORY:fans < MARKERS.case_fan:case fans",
       ].sort(),
     );
+  });
+
+  /**
+   * T49: THE SHARED PHRASE CACHE IS NEVER MUTATED. `phraseTokens` hands every caller the SAME
+   * array for a phrase, for the life of the isolate, and it is deliberately not frozen (a frozen
+   * array measured 2.8x slower to read; see catalogIndex.ts). So a caller that mutated one would
+   * poison every later request. This runs real traffic first -- every live-corpus title under
+   * every search that returned it, and the T21f frames under a cross-type and a same-type search
+   * -- then checks each cached phrase against a fresh tokenization. No runtime cost.
+   */
+  it("T49: after real traffic, every cached phrase still equals its fresh tokenization", () => {
+    for (const entry of LIVE_CORPUS) {
+      for (const componentType of entry.searchedAs) {
+        normalizeListing({ title: entry.title, priceCents: parsePriceText(entry.priceText), componentType });
+      }
+    }
+    for (const phrase of ACCESSORY) {
+      for (const componentType of ["cpu", "gpu"] as const) {
+        normalizeListing({ title: `GeForce RTX 5080 ${phrase}`, priceCents: 39100, componentType });
+      }
+    }
+    const phrases = [
+      ...Object.values(MARKERS).flat(),
+      ...WANTED,
+      ...TRADE,
+      ...BROKEN,
+      ...SYSTEM_PHRASES,
+      ...MULTIPLE,
+      ...ACCESSORY,
+    ];
+    expect(phrases.map((phrase) => [phrase, [...phraseTokens(phrase)]])).toEqual(
+      phrases.map((phrase) => [phrase, tokenValues(tokenize(phrase))]),
+    );
+    expect(phrases.length).toBeGreaterThan(100);
   });
 
   /** T37: the spec's 3B acceptance gate -- every component type is exercised, not just gpu. */
