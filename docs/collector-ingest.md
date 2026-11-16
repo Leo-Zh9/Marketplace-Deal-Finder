@@ -60,7 +60,7 @@ until it aged off. An empty string is still refused: the parser emits `null`, ne
 |---|---|
 | `listingId`, `title`, `url` | the wire, validated, required |
 | `locationText` | the wire, validated, **nullable** |
-| `componentType` | the envelope, checked against an exhaustive set with `Object.hasOwn` |
+| `componentType` | the envelope, checked against an exhaustive set with `Object.hasOwn` — and that is **which search found the listing**, not what is stored: the stored `component_type` is the type **the server** resolves from the title, falling back to the envelope's (see [the type comes from the title](#the-type-comes-from-the-title-when-the-title-proves-it)) |
 | `priceCents` | **the server**, from `priceText` (see the grammar below), which is **nullable** |
 | `modelKey`, `variantKey` | **the server**, derived from the title against `src/data/catalog.ts` (`variantKey` is `null` for every component type in this slice) |
 | `validity` | **the server**, from the same rule |
@@ -125,7 +125,7 @@ price:
 | key | means |
 |---|---|
 | `recorded` / `restored` | the listing entered the benchmark; `restored` means its observation had been deleted and was recreated |
-| `removed` | it used to contribute and no longer does — a re-sighting whose model key, market or price changed, or whose validity stopped being `VALID` |
+| `removed` | it used to contribute and no longer does — a re-sighting whose model key, market or price changed, or whose validity stopped being `VALID`. **No longer** a catalogued listing re-sighted by a search of another type: that used to be the dominant source of this key (see below) |
 | `none` | `UNCHANGED`: nothing about it moved |
 | `skipped-invalid` | the rule refused it: wrong component, whole system, trade-only, for parts, a wanted ad, an unknown quantity, an ambiguous `CA$0`, or a title at the token cap |
 | `skipped-no-model` | the rule accepted it as the right component and could not name it — a real component the catalog does not list |
@@ -166,7 +166,10 @@ componentType)` and all three are columns, so
 SELECT title, price_cents, component_type FROM listings WHERE validity <> 'INVALID_REFERENCE';
 ```
 
-replayed through that function offline yields the per-reason breakdown exactly. That is a read
+replayed through that function offline yields the per-reason breakdown exactly. **The stored
+`component_type` is the resolved one, and replaying it is exact rather than approximate**: the
+resolution depends on the title alone when it fires and returns its input when it does not, so
+`normalizeListing` over a stored row's own type returns that row's own classification. That is a read
 plus a script, not a production code change, and it is the instrument whoever answers the catalog
 question should use.
 
@@ -296,6 +299,54 @@ and only removes a spurious `DEAL`.
 
 Two or more distinct models in one title is a refusal, not a choice.
 
+### The type comes from the title when the title proves it
+
+`listings` is keyed `(source, listing_id)` and holds **one** `component_type`, and Facebook
+returns the same listing to searches of different types. Classified under the search's type, a
+catalogued listing flipped on every run: `VALID` with its model under its own search,
+`INVALID_REFERENCE` / `wrong-component` under the other. Each flip removed its price
+contribution, the next restored it, and both re-queued evaluation. **Measured in the October
+production log: 167 `removed` and 170 `restored` events against only 38 `recorded`.** By
+construction (`recordSightings` contributes only `VALID` + model + positive price, and removes
+only when a stored contribution stops being desired), every one of those was a model-matched
+cross-type flip.
+
+**The rule, applied before rules 1–11:** if **exactly one** type is evidenced (by a marker or a
+catalog model) **and that type has a catalog model match**, the listing is classified — and
+stored — under that type. Otherwise it is classified under the envelope's type, exactly as
+before. The rules below then run under the resolved type; `normalizeListing` returns it, and the
+ingest route stores it and hashes it into `content_hash`. Both clauses are load-bearing and each
+has a test that goes red without it: the model clause stops a single marker word retyping a
+listing (`TR-m*`), and *exactly one* stops a two-type bundle landing under whichever type is
+listed first (`TR-2`, which asserts the type and the reason, because the mutant is `INVALID`
+too). There is deliberately **no** "the declared type is not evidenced" clause: when the single
+evidenced type is the declared one, resolving to it changes nothing, so the clause is an
+equivalent mutant.
+
+**What reads the stored type, checked:** the dashboard's server-side component filter
+(`worker/api/verdicts.ts` `WHERE_SELECTION`) now shows a card found by a cpu search under gpu,
+which is the point; the `(component_type, model_key)` pair stays consistent with the catalog,
+because a model key is only ever produced from the resolved type's own index; evaluation does
+not read the column; and the watch list is a different table. **No migration**: existing rows
+converge on their next sighting, as a `CHANGED` re-write.
+
+**The residual, stated honestly.** A cross-type title evidenced by a **marker only** still flips
+between `VALID` with a null key and `INVALID_REFERENCE` across searches — measured over the
+132-id live sample (217 sightings from nine searches), **4 ids**: `"MSI B850 Tomahawk Max Wifi
+Motherboard Only"`, `"Ram DDR4 16gb 2x8gb 3000MHz"`, `"5-Bay Hard Drive Station"` and a Microsoft
+Surface Pro whose only marker is `SSD`. They carry no key, so **no aggregate ever moves**, but
+their stored validity — and the verdict computed from it — is whichever search saw them last, and
+each flip re-queues evaluation. **The same sample contains no model-matched cross-type id at all**
+(the production log's flips came from other listings on other days), so the sample measures the
+residual, not the fix; `L16` and the two-type block of `scripts/e2e-local.sh` measure the fix.
+
+**And one consequence for `MAXIMUM_PRICE`.** A catalogued listing found only by a search of
+another type used to be `INVALID_REFERENCE` → `NOT_DEAL`. It is now `VALID` with its model on
+first sight, and `decide` runs the maximum-price leg before the evidence gate — so under
+`MAXIMUM_PRICE` that first sighting can be a `DEAL / within-maximum` with no benchmark behind it,
+the same mechanism as row 4 of [the evaluation table](#the-evaluation-consequence--read-this-before-changing-the-settings-mode).
+Not addressed here; it belongs to the later parts that gate that leg.
+
 ### The twelve rules, in order — first match wins
 
 ```
@@ -319,8 +370,8 @@ Two or more distinct models in one title is a refusal, not a choice.
 11. matched           exactly one catalog model                 -> VALID, that model
 ```
 
-Rule 4 is neutralised by a marker of the **declared** type, so `"Lian Li Lancool 216 PC Case"`
-under a `case` search is a case and not a PC. Rule 7's `pack` is **not**: a fan pack really is a
+Rule 4 is neutralised by a marker of the **declared** type — the resolved one, above — so
+`"Lian Li Lancool 216 PC Case"` under a `case` search is a case and not a PC. Rule 7's `pack` is **not**: a fan pack really is a
 pack, on the one component type where Arctic, Noctua and Corsair all sell in 3- and 5-packs.
 
 **Rule 4's whole-unit tokens include `laptop`, `notebook` and `desktop`.** `desktop` was
@@ -398,7 +449,11 @@ live 5080 is CA$3,000. Any threshold would be a fabricated number.
 ### What is proven, and what is not
 
 - **336/336** catalog names, declared as their own component type, resolve to themselves.
-- **0 of 2,688** cross-type pairs produce a `VALID` result carrying a model key.
+- **All 2,688** cross-type pairs (every catalog name declared as each of the eight other types)
+  are refused or moved to the model's **own** type and keyed by one of that type's models; none
+  is ever `VALID` with a key under a foreign type. Measured: all 2,688 resolve, because a bare
+  catalog name evidences only its own type. The count is pinned, so a rule that resolves less
+  goes red.
 - **Every one of the nine per-type counts** is pinned, not just the total: a name typed into the
   wrong component block keeps the total at 336 and is invisible to everything else.
 - **10** sub-phrase overlaps exist across the eighteen vocabularies, all of them known and
@@ -412,7 +467,11 @@ live 5080 is CA$3,000. Any threshold would be a fabricated number.
   and costs 0.21 ms. **Read the spread, not the midpoint: 3.2–3.9 ms is dev-machine variance
   across two machines and two title shapes, not a precision this measurement supports.** The
   repo's own invariant is p95 < 8 ms and the test asserts against that, never against these
-  figures.
+  figures. **The type resolution adds no scan**: it reads the nine per-type model matches the
+  evidence scan already computed, and the declared type's index is now walked once there rather
+  than twice. `T40c-r` runs the same worst legal batch declared under a type it does not
+  evidence, so the resolution fires on all 100 — see the PR that introduced it for the figures
+  measured beside `T40c` on one loaded machine.
 
 ### The residuals, named — and the corpora they are measured from
 

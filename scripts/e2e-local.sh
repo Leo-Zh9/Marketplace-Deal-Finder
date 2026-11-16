@@ -187,11 +187,13 @@ ingest_tables
 # together in a way that reads like a data bug:
 #
 #   1. BOTH targets parse the SAME committed fixture -- COLLECTOR_HTML_FILE is process-level, not
-#      per-target -- so the `cpu` pass REWRITES the same six (source, listing_id) rows with
-#      component_type='cpu'. Every derived model_key changes with it: normalization resolves a
-#      title against the CPU trie instead of the GPU one, so 'GeForce RTX 5080' stops resolving,
-#      model_stats loses its only row, and the 5080 content assertion, the recorded/skipped
-#      counts and the whole-PC refusal all move.
+#      per-target -- so the `cpu` pass re-posts the same (source, listing_id) rows under
+#      componentType='cpu'. The listings whose title ties them to ONE catalogued type keep it:
+#      the 5080 and the trade-only ad stay `gpu`, so 'GeForce RTX 5080' still resolves and
+#      model_stats keeps its row. The other two are REWRITTEN with component_type='cpu': the
+#      whole PC evidences three types and falls back to the search's, and the GTX 980 Ti is
+#      evidenced by a gpu MARKER only, so it flips VALID -> INVALID `wrong-component` -- the
+#      residual docs/collector-ingest.md names -- and that listing is the removal control's below.
 #   2. market_key would ALSO change, from 43.5123,-79.8765|18km to 43.6532,-79.3832|25km, which
 #      is the key the seeded control row below is written against -- so the control could not be
 #      seeded at all.
@@ -416,6 +418,29 @@ is "  ...and deleted the control observation"  0 "$(val "SELECT COUNT(*) FROM pr
 # SCOPED, and the other half of the same claim: the removal took the control and NOTHING ELSE.
 # A rule that deleted every observation would pass the line above and fail this one.
 is "  ...leaving the 5080's own observation"   1 "$(val 'SELECT COUNT(*) FROM price_observations')"
+
+# ONE LISTING, TWO SEARCHES. Facebook returns the same listing to searches of different types and
+# `listings` holds one component_type per (source, listing_id). Stored under the SEARCH's type, the
+# second post rewrote a catalogued card as `motherboard`, refused it `wrong-component` and REMOVED
+# its contribution; the next gpu run restored it. MEASURED in production: 167 removed and 170
+# restored events against 38 recorded. The title is a live one; the id is synthetic.
+# THE FIX FOR A RED ROW HERE IS IN normalizeListing / the ingest route, NEVER IN THESE ROWS.
+TT_ID=e2e-two-type-3080
+TT_ROW='{"listingId":"'$TT_ID'","title":"Zotac Gaming RTX 3080 Trinity OC 10Gb","priceText":"CA$690","locationText":"Toronto, Ontario","url":"https://www.facebook.com/marketplace/item/'$TT_ID'"}'
+tt() { $CURL -s -o /tmp/e2e.body -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+         -H "X-Collector-Token: $COLLECTOR_TOKEN" --max-time 15 "$ING" \
+         -d '{"source":"facebook-marketplace","componentType":"'"$1"'","market":{"latitude":43.5123,"longitude":-79.8765,"radiusKm":18},"listings":['"$TT_ROW"']}'; }
+is "a catalogued card posted under gpu"        200 "$(tt gpu)"
+has "  ...is NEW"                              '"NEW":1' "$(body)"
+has "  ...and records its contribution"        '"recorded":1' "$(body)"
+is "the same listing posted under motherboard" 200 "$(tt motherboard)"
+has "  ...is UNCHANGED, not rewritten"         '"UNCHANGED":1' "$(body)"
+has "  ...with no contribution change"         '"none":1' "$(body)"
+has "  ...and nothing removed"                 '"removed":0' "$(body)"
+is "  ...and the row stays gpu, keyed, VALID"  'gpu|GeForce RTX 3080|VALID' \
+   "$(val "SELECT component_type || '|' || model_key || '|' || validity FROM listings WHERE listing_id='$TT_ID'")"
+is "  ...and its aggregate is intact"          'GeForce RTX 3080|1|69000' \
+   "$(val "SELECT model_key || '|' || count || '|' || total_price_cents FROM model_stats WHERE model_key='GeForce RTX 3080'")"
 
 echo "== multi-target: a partial failure drops nothing =="
 # THE THREE QUERIES ARE DISTINCT, AND THAT IS A CORRECTION RATHER THAN A DETAIL. All three rows

@@ -860,6 +860,41 @@ describe("POST /api/listings", () => {
   });
 
   /**
+   * L16: ONE LISTING, TWO SEARCHES, ONE STORED ROW THAT DOES NOT MOVE. Facebook returns the same
+   * listing to a gpu search and a motherboard search; `listings` holds one `component_type` per
+   * `(source, listing_id)`. Stored under the search's type, the second post rewrote the row as
+   * `motherboard`, refused it as `wrong-component` and REMOVED its contribution -- and the next
+   * gpu run restored it. MEASURED in production: 167 removed and 170 restored events against 38
+   * recorded. The title is a live one; the id is not.
+   */
+  it("L16: a catalogued GPU posted under gpu and then motherboard stays gpu and UNCHANGED", async () => {
+    const card = listing("L-907", { title: "Zotac Gaming RTX 3080 Trinity OC 10Gb", priceText: "CA$690" });
+
+    const first = (await (await post(envelope([card], { componentType: "gpu" }))).json()) as Record<
+      string,
+      unknown
+    >;
+    expect(first.outcomes).toMatchObject({ NEW: 1, CHANGED: 0, UNCHANGED: 0, FAILED: 0 });
+    expect(first.contributions).toEqual({ ...EMPTY_CONTRIBUTIONS, recorded: 1 });
+
+    const second = (await (
+      await post(envelope([card], { componentType: "motherboard" }))
+    ).json()) as Record<string, unknown>;
+    expect(second.outcomes).toMatchObject({ NEW: 0, CHANGED: 0, UNCHANGED: 1, FAILED: 0 });
+    expect(second.contributions).toEqual({ ...EMPTY_CONTRIBUTIONS, none: 1 });
+
+    expect(
+      await rows("SELECT component_type, model_key, validity FROM listings WHERE listing_id = 'L-907'"),
+    ).toEqual([{ component_type: "gpu", model_key: "GeForce RTX 3080", validity: "VALID" }]);
+    expect(await rows("SELECT model_key, price_cents FROM price_observations")).toEqual([
+      { model_key: "GeForce RTX 3080", price_cents: 69000 },
+    ]);
+    expect(await rows("SELECT model_key, count, total_price_cents FROM model_stats")).toEqual([
+      { model_key: "GeForce RTX 3080", count: 1, total_price_cents: 69000 },
+    ]);
+  });
+
+  /**
    * L15: `SightingResult.error` carries D1's message. A caller holding only a bearer secret
    * must not learn the schema from a failure.
    */
