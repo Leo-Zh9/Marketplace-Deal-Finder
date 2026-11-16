@@ -317,6 +317,9 @@ describe("protected Worker API", () => {
       ageMinutes: 0,
       collector: null,
       authentication: method,
+      // Phase 4, additive. No webhook in this environment, so the notifications table is never
+      // read (worker/notify/status.ts).
+      notifications: { state: "unconfigured" },
     });
   });
 
@@ -383,6 +386,7 @@ describe("protected Worker API", () => {
       ageMinutes: 0,
       collector: null,
       authentication: "local-development",
+      notifications: { state: "unconfigured" },
     });
   });
 });
@@ -2133,6 +2137,7 @@ describe("the collector health route's credential boundary", () => {
         alarms: ["feed-overlap:gpu-radeon+gpu-rtx"],
       },
       authentication: "firebase-google",
+      notifications: { state: "unconfigured" },
     });
   });
 });

@@ -36,7 +36,12 @@ COLLECTOR_TOKEN=${COLLECTOR_TOKEN:-}
 # `main.ts`, where the path is chosen.
 COLLECTOR_STATE=/tmp/e2e-collector-state.json
 
-cleanup() { [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null; }
+STUB_PID=
+# The Discord stub (Phase 4 section) is killed on every exit path too.
+cleanup() {
+  [ -n "$STUB_PID" ] && kill "$STUB_PID" 2>/dev/null
+  [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
+}
 trap cleanup EXIT
 
 ok()   { PASS=$((PASS+1)); printf '  \033[32mPASS\033[0m  %s\n' "$1"; }
@@ -1074,6 +1079,165 @@ is "  ...and its listings reached D1"         4 "$(val "SELECT COUNT(*) FROM lis
 # coordinates, and a form that wrote a market the collector did not use would be invisible here
 # without this row.
 is "  ...in the market the form wrote"        '43.6532,-79.3832|25km' "$(val 'SELECT DISTINCT market_key FROM listings')"
+
+echo "== Discord notifications: inert by default, then on against a local stub =="
+# PHASE 4. A fake Discord (scripts/e2e-discord-stub.mjs) on 127.0.0.1:$STUB_PORT records every
+# request and answers from a script file this gate rewrites between fires. NOTHING HERE CAN REACH
+# THE REAL DISCORD: the only webhook URL ever configured is the stub's, and the Worker accepts a
+# plain-http 127.0.0.1 URL only because wrangler.local.jsonc sets APP_ENV=local.
+#
+# PHASE B RESTARTS THE WORKER with `--var NOTIFICATIONS:on --var DISCORD_WEBHOOK_URL:...`, so the
+# whole section needs --serve: without it the gate does not own the worker and cannot restart it.
+STUB_PORT=8798
+STUB_SCRIPT=/tmp/e2e-discord-script.json
+STUB_LOG=/tmp/e2e-discord-log.jsonl
+STUB_URL="http://127.0.0.1:$STUB_PORT/api/webhooks/1/e2e"
+# `grep -c` prints 0 for a file with no match, so only a missing file needs the fallback.
+posts() { if [ -f "$STUB_LOG" ]; then grep -c '"method":"POST"' "$STUB_LOG"; else echo 0; fi; }
+answer() { printf '%s' "$1" > "$STUB_SCRIPT"; }
+# The fire carries its own `time`, so each run's frozen `now` is the wall clock at the fire.
+fire_monitor() {
+  local before; before=$(val 'SELECT COUNT(*) FROM monitor_runs')
+  $CURL -s -o /dev/null "$BASE/cdn-cgi/handler/scheduled?cron=%2A%2F30%20%2A%20%2A%20%2A%20%2A&time=$(now_ms)" --max-time 20
+  until_val 'SELECT COUNT(*) FROM monitor_runs' "$((before + 1))" 60 || echo "  (monitor run did not finish)"
+}
+notif() { val "SELECT status FROM notifications WHERE listing_id='$1'"; }
+# A model-keyed DEAL straight into D1, judged at the CURRENT revision and seen just now. Used for
+# the rows after the first; the first one is produced by the real ingest route and the real drain.
+seed_deal() { # seed_deal <id> [model_key-sql]
+  local model=${2:-"'GeForce RTX 4070 Super'"}
+  sql "INSERT INTO listings (source, listing_id, market_key, component_type, model_key, variant_key, title,
+                             price_cents, location_text, url, validity, content_hash, first_seen_at, last_seen_at)
+       VALUES ('facebook-marketplace', '$1', '43.6532,-79.3832|25km', 'gpu', $model, '', 'seeded $1',
+               25000, 'Toronto, ON', 'https://www.facebook.com/marketplace/item/$1', 'VALID', 'h',
+               CAST(strftime('%s','now') AS INTEGER), CAST(strftime('%s','now') AS INTEGER));
+       INSERT INTO evaluation_tasks (source, listing_id, status, created_at, evaluated_revision, verdict,
+                                     evaluated_at, lease_expires_at, lease_token)
+       VALUES ('facebook-marketplace', '$1', 'COMPLETE', 1,
+               (SELECT current_revision FROM search_settings WHERE id = 1), 'DEAL',
+               CAST(strftime('%s','now') AS INTEGER), 0, '');" >/dev/null
+}
+last_post() { python3 -c "
+import json,sys
+lines=[json.loads(l) for l in open('$STUB_LOG') if l.strip()]
+posts=[l for l in lines if l['method']=='POST']
+print(json.dumps(posts[-1]))
+"; }
+
+if [ -z "$SERVER_PID" ]; then
+  echo "  SKIP  the notification phases need --serve (they restart the worker)"
+else
+  STUB_PID=
+  is "the stub's port is free"                  "" "$(lsof -iTCP:$STUB_PORT -sTCP:LISTEN -t 2>/dev/null)"
+  rm -f "$STUB_LOG"; answer '[]'
+  node scripts/e2e-discord-stub.mjs "$STUB_SCRIPT" "$STUB_LOG" "$STUB_PORT" >/tmp/e2e-discord-stub.out 2>&1 &
+  STUB_PID=$!
+  for _ in $(seq 1 20); do $CURL -sf -o /dev/null "http://127.0.0.1:$STUB_PORT/health" --max-time 1 && break; sleep 0.25; done
+
+  ingest_tables
+  sql "DELETE FROM notifications; DELETE FROM monitor_runs; DELETE FROM monitor_lock;
+       DELETE FROM watch_targets;
+       INSERT INTO watch_targets (target_id, component_type, query) VALUES ('e2e-gpu', 'gpu', 'graphics card');
+       UPDATE watch_market SET location='toronto', latitude=43.6532, longitude=-79.3832, radius_km=25 WHERE id=1;" >/dev/null
+  # Both settings tables are cleared, as the settings section does: the NO_SETTINGS control above
+  # deleted only the pointer, and a first save with old revisions left behind collides on revision 0.
+  sql "DELETE FROM search_settings; DELETE FROM search_revisions;" >/dev/null
+  is "a DISCOUNT 20% rule is saved"             200 "$(put '{"mode":"DISCOUNT","minimumDiscountPercent":20,"maximumPriceCents":null}')"
+
+  # SIX LISTINGS OF ONE MODEL THROUGH THE REAL INGEST ROUTE: five at CA$600 and one at CA$300.
+  # Each candidate is judged against the other five, so CA$300 is a DEAL (<= 80% of 600) and every
+  # CA$600 is NOT_DEAL (above 80% of 540). The drain decides that, not this script.
+  NT_ROWS=$(python3 -c "
+import json
+rows=[{'listingId':'70000000000000%d'%i,'title':'MSI GeForce RTX 4070 Super Ventus 2X 12GB','priceText':'CA\$600',
+       'locationText':'Toronto, ON','url':'https://www.facebook.com/marketplace/item/70000000000000%d'%i} for i in range(1,6)]
+rows.append({'listingId':'7000000000000006','title':'ASUS GeForce RTX 4070 Super Dual 12GB','priceText':'CA\$300',
+             'locationText':'Toronto, ON','url':'https://www.facebook.com/marketplace/item/7000000000000006'})
+print(json.dumps({'source':'facebook-marketplace','componentType':'gpu',
+                  'market':{'latitude':43.6532,'longitude':-79.3832,'radiusKm':25},'listings':rows}))")
+  is "six same-model listings are ingested"     200 "$($CURL -s -o /tmp/e2e.body -w '%{http_code}' -X POST -H 'Content-Type: application/json' -H "X-Collector-Token: $COLLECTOR_TOKEN" -d "$NT_ROWS" "$ING" --max-time 15)"
+  is "  ...all six keyed to the 4070 Super"     6 "$(val "SELECT COUNT(*) FROM listings WHERE model_key='GeForce RTX 4070 Super' AND validity='VALID'")"
+  # THE STORED url IS MADE HOSTILE ON PURPOSE: the alert must build its link from the id.
+  sql "UPDATE listings SET url='https://evil.example/phish' WHERE listing_id='7000000000000006'" >/dev/null
+
+  echo "  -- phase A: no notification variables --"
+  fire_monitor
+  is "  the drain judged exactly one DEAL"      7000000000000006 "$(val "SELECT group_concat(listing_id) FROM evaluation_tasks WHERE verdict='DEAL'")"
+  is "  ...and five NOT_DEAL"                   5 "$(val "SELECT COUNT(*) FROM evaluation_tasks WHERE verdict='NOT_DEAL'")"
+  is "  ...and the stub received NO request"    0 "$(posts)"
+  is "  ...and no notification row exists"      0 "$(val 'SELECT COUNT(*) FROM notifications')"
+  is "  /api/status answers 200"                200 "$(code -H "Origin: $ORIGIN" "$BASE/api/status")"
+  has "  ...reading unconfigured"               '"notifications":{"state":"unconfigured"}' "$(body)"
+
+  echo "  -- phase B: NOTIFICATIONS=on, webhook = the stub --"
+  kill "$SERVER_PID" 2>/dev/null
+  for _ in $(seq 1 40); do [ -z "$(lsof -iTCP:8787 -sTCP:LISTEN -t 2>/dev/null)" ] && break; sleep 0.5; done
+  npx --no-install wrangler dev --config wrangler.local.jsonc --port 8787 \
+    --var "COLLECTOR_TOKEN:$E2E_COLLECTOR_TOKEN" --var "NOTIFICATIONS:on" \
+    --var "DISCORD_WEBHOOK_URL:$STUB_URL" >/tmp/e2e-worker-notify.log 2>&1 &
+  SERVER_PID=$!
+  for _ in $(seq 1 40); do $CURL -sf -o /dev/null "$BASE/api/status" --max-time 2 && break; sleep 1; done
+  is "  the restarted worker reads on"          200 "$(code -H "Origin: $ORIGIN" "$BASE/api/status")"
+  has "  ...state on"                           '"state":"on"' "$(body)"
+
+  answer '["200"]'
+  fire_monitor
+  is "  the DEAL produced exactly one POST"     1 "$(posts)"
+  NT_POST=$(last_post)
+  is "  ...to the webhook path with wait=true"  '/api/webhooks/1/e2e?wait=true' "$(python3 -c "import json,sys;print(json.loads(sys.argv[1])['path'])" "$NT_POST")"
+  is "  ...carrying flags 4"                    4 "$(python3 -c "import json,sys;print(json.loads(sys.argv[1])['body']['flags'])" "$NT_POST")"
+  is "  ...and allowed_mentions parse []"       '{"parse": []}' "$(python3 -c "import json,sys;print(json.dumps(json.loads(sys.argv[1])['body']['allowed_mentions']))" "$NT_POST")"
+  has "  ...and the link built from the id"     'https://www.facebook.com/marketplace/item/7000000000000006' "$NT_POST"
+  is "  ...never the stored url"                0 "$(printf '%s' "$NT_POST" | grep -c 'evil.example')"
+  has "  ...at the judged price"                'for CA$300.00' "$NT_POST"
+  is "  ...and the row is SENT at that price"   'SENT|30000' "$(val "SELECT status || '|' || sent_price_cents FROM notifications WHERE listing_id='7000000000000006'")"
+  is "  /api/status counts it"                  200 "$(code -H "Origin: $ORIGIN" "$BASE/api/status")"
+  has "  ...as one sent in 24h"                 '"sent24h":1' "$(body)"
+
+  fire_monitor
+  is "  a second fire sends no second POST"     1 "$(posts)"
+
+  seed_deal 7100000000000001 NULL
+  fire_monitor
+  is "  a null-model DEAL sends nothing"        1 "$(posts)"
+  is "  ...and is never enqueued"               0 "$(val "SELECT COUNT(*) FROM notifications WHERE listing_id='7100000000000001'")"
+
+  seed_deal 7200000000000001
+  answer '["500"]'
+  fire_monitor
+  is "  a 500 is posted once"                   2 "$(posts)"
+  is "  ...and lands DELIVERY_UNKNOWN"          DELIVERY_UNKNOWN "$(notif 7200000000000001)"
+  fire_monitor
+  is "  ...and is NOT resent on the next fire"  2 "$(posts)"
+
+  seed_deal 7300000000000001
+  answer '["429:1"]'
+  fire_monitor
+  is "  a 429 is posted once"                   3 "$(posts)"
+  is "  ...and stays PENDING with a wait"       'PENDING|1' "$(val "SELECT status || '|' || (next_attempt_at IS NOT NULL) FROM notifications WHERE listing_id='7300000000000001'")"
+  sleep 2
+  fire_monitor
+  is "  ...and is SENT once the wait is over"   SENT "$(notif 7300000000000001)"
+  is "  ...with exactly one more POST"          4 "$(posts)"
+
+  seed_deal 7400000000000001
+  seed_deal 7400000000000002
+  answer '["404","404"]'
+  fire_monitor
+  is "  a 404 is one POST"                      5 "$(posts)"
+  is "  ...and /api/status reads it"            200 "$(code -H "Origin: $ORIGIN" "$BASE/api/status")"
+  has "  ...as webhook-rejected"                '"state":"webhook-rejected"' "$(body)"
+  fire_monitor
+  is "  the next fire probes EXACTLY once"      6 "$(posts)"
+  is "  ...counting no attempt"                 0 "$(val "SELECT MAX(attempts) FROM notifications WHERE listing_id LIKE '74%'")"
+  fire_monitor
+  is "  a healthy webhook sends both"           8 "$(posts)"
+  is "  ...and status reads on again"           200 "$(code -H "Origin: $ORIGIN" "$BASE/api/status")"
+  has "  ...state on"                           '"state":"on"' "$(body)"
+
+  kill "$STUB_PID" 2>/dev/null; STUB_PID=
+  sql "DELETE FROM notifications; DELETE FROM search_settings;" >/dev/null
+fi
 
 ingest_tables
 

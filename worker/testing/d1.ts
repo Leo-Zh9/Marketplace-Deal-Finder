@@ -11,6 +11,7 @@ import searchSql from "../../migrations/0003_search_settings.sql?raw";
 import monitorSql from "../../migrations/0004_monitor.sql?raw";
 import watchTargetsSql from "../../migrations/0005_watch_targets.sql?raw";
 import collectorHealthSql from "../../migrations/0006_collector_health.sql?raw";
+import notificationsSql from "../../migrations/0007_notifications.sql?raw";
 
 /**
  * Strip `--` line comments, split on `;`, trim, drop empties. The schema contains no
@@ -44,7 +45,8 @@ export interface TestDatabase {
  * a missing table; without 0004, every 3E-b monitoring test would fail on a missing
  * monitor_lock; without 0005, every watch-list test would fail on a missing watch_targets;
  * without 0006, every collector-health test would fail on a missing collector_health and S-n1
- * would report ten tables instead of eleven.
+ * would report ten tables instead of eleven; without 0007, every notification test would fail on
+ * a missing notifications table.
  */
 export const applyMigrations = async (db: D1Database): Promise<void> => {
   for (const sql of [
@@ -54,6 +56,7 @@ export const applyMigrations = async (db: D1Database): Promise<void> => {
     monitorSql,
     watchTargetsSql,
     collectorHealthSql,
+    notificationsSql,
   ]) {
     await db.batch(splitSqlStatements(sql).map((statement) => db.prepare(statement)));
   }
@@ -122,6 +125,8 @@ export const truncateAll = async (db: D1Database): Promise<void> => {
     // correctness is asserted by schema.test.ts S-n5, against a database this function never
     // touches.
     db.prepare("DELETE FROM collector_health"),
+    // Phase 4. No seed, no foreign key: an ordinary delete.
+    db.prepare("DELETE FROM notifications"),
     db.prepare(
       `INSERT INTO monitor_lock (id, run_id, acquired_at, expires_at) VALUES (1, '', 0, 0)
        ON CONFLICT(id) DO UPDATE SET run_id = '', acquired_at = 0, expires_at = 0`,

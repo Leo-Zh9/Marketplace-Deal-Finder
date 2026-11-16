@@ -14,6 +14,10 @@ import { runMonitor, type MonitorParams, type MonitorRun } from "./runMonitor";
 
 export interface MonitorEnvironment {
   DB: D1Database;
+  /** Secrets, both optional; see worker/notify/config.ts. Never declared in wrangler.jsonc vars. */
+  DISCORD_WEBHOOK_URL?: string;
+  NOTIFICATIONS?: string;
+  APP_ENV: string;
 }
 
 export class MonitorWorkflow extends WorkflowEntrypoint<MonitorEnvironment, MonitorParams> {
@@ -27,6 +31,10 @@ export class MonitorWorkflow extends WorkflowEntrypoint<MonitorEnvironment, Moni
     // is stable across a step retry and an instance replay -- which is exactly what makes the
     // lock re-entrant for its own run -- and a hand-written `wrangler workflows trigger` gets
     // its own fresh instance id rather than a chance to choose one.
-    return runMonitor(this.env.DB, step, event.payload, event.instanceId);
+    return runMonitor(this.env.DB, step, event.payload, event.instanceId, {}, {
+      DISCORD_WEBHOOK_URL: this.env.DISCORD_WEBHOOK_URL,
+      NOTIFICATIONS: this.env.NOTIFICATIONS,
+      APP_ENV: this.env.APP_ENV,
+    });
   }
 }
