@@ -202,7 +202,20 @@ search) and **no non-component keyed** — and a pinned floor: on master `404677
 standalone components, **13** catalogued, **9 of 13** keyed under every search. Part 2 raised it
 to **11 of 13** with two match rules (below) and names the two remaining misses in the test. A
 rule change that should raise yield moves that floor on purpose; one that lowers it, or keys
-anything wrongly, goes red.
+anything wrongly, goes red. PR 2.4 moved it by catalog rather than by rule: **12 of 14**, because
+`Ryzen 7 3800X` entered the catalog and its one corpus title moved from uncatalogued to catalogued.
+
+**How a model earns a catalog entry: replay frequency, at least 3 distinct `listing_id`s.** Every
+row in section (d) of the replay is hand-labelled to a candidate SKU at the catalog's own
+granularity, or to "generic / not a catalogable model". A candidate is added only when **3 or more
+distinct `listing_id`s** name it; reposts are not merged (PLAN §3), and the bar is the only thing
+that moves the "two generations back" boundary. Generic spec-only RAM and storage (`"Ram DDR4
+16gb"`, `"WD 1TB NVMe"`) is not catalogued: it names no SKU. On the 1,475-row production export
+of 2026-11-16 the 458 rows of (d) cleared the bar for **one** model (`Ryzen 7 3800X`, 3 ids; yield
+79 → 82). Eight more candidates had 2 ids each and were not added. Of the 458 rows, 43% are not PC
+parts at all (mostly the `power supply` search), 15% are whole machines or devices, 7% are
+generic spec-only RAM/SSD/HDD, and the remaining PC parts are spread across ~90 SKUs that each
+appear once.
 
 ### Status codes
 
@@ -291,7 +304,7 @@ owns what a listing *is*. Both are pure functions of `(title, priceCents, compon
 Lower-case, split on every non-alphanumeric character, then split each run at its letter/digit
 boundaries — so `"rtx5080"`, `"RTX 5080"` and `"RTX-5080"` tokenize alike. There is deliberately
 **no `normalize("NFKD")`**: measured, `"RTX™".toLowerCase().normalize("NFKD")` is `"rtxTM"`,
-because U+2122 decomposes to an upper-case `TM`, and 0 of the 336 catalog names contain a
+because U+2122 decomposes to an upper-case `TM`, and 0 of the 337 catalog names contain a
 non-ASCII character anyway.
 
 The tokenizer stops at **64 tokens**. A title that reaches that bound *may* have been truncated,
@@ -304,8 +317,8 @@ the 15 live titles is 18, so nothing real is near the bound.
 ### The match: a prefix trie per component type, and three guards
 
 Each component type gets a trie built once at module load from its catalog names, plus every
-suffix obtained by dropping a leading `geforce`/`nvidia`/`radeon`/`amd`/`intel`/`core` — 336
-models, 423 entry points (the names plus 87 vendor-stripped cores: geforce 43, radeon 20,
+suffix obtained by dropping a leading `geforce`/`nvidia`/`radeon`/`amd`/`intel`/`core` — 337
+models, 424 entry points (the names plus 87 vendor-stripped cores: geforce 43, radeon 20,
 intel 5, core 19). Series words (`rtx`, `rx`, `gtx`, `arc`) are **not** droppable: a bare `5080`
 in the trie would match Dell's OptiPlex 5080. The cost is that `"Selling my 4070 Super"` is a
 miss, and a miss is safe.
@@ -598,14 +611,14 @@ live 5080 is CA$3,000. Any threshold would be a fabricated number.
 
 ### What is proven, and what is not
 
-- **336/336** catalog names, declared as their own component type, resolve to themselves.
-- **All 2,688** cross-type pairs (every catalog name declared as each of the eight other types)
+- **337/337** catalog names, declared as their own component type, resolve to themselves.
+- **All 2,696** cross-type pairs (every catalog name declared as each of the eight other types)
   are refused or moved to the model's **own** type and keyed by one of that type's models; none
-  is ever `VALID` with a key under a foreign type. Measured: all 2,688 resolve, because a bare
+  is ever `VALID` with a key under a foreign type. Measured: all 2,696 resolve, because a bare
   catalog name evidences only its own type. The count is pinned, so a rule that resolves less
   goes red.
 - **Every one of the nine per-type counts** is pinned, not just the total: a name typed into the
-  wrong component block keeps the total at 336 and is invisible to everything else.
+  wrong component block keeps the total at 337 and is invisible to everything else.
 - **10** sub-phrase overlaps exist across the eighteen vocabularies, all of them known and
   pinned; an eleventh fails the suite.
 - CPU, measured in Node on a development machine rather than in workerd — the same caveat
@@ -744,7 +757,7 @@ discovered in an aggregate.
 > own rule resolves to a catalog model together with a positive price.
 >
 > What the server still decides: `model_key` is not a wire field and cannot be chosen directly —
-> it is one of the 336 names in `src/data/catalog.ts` or `NULL`, and only a title the rule
+> it is one of the 337 names in `src/data/catalog.ts` or `NULL`, and only a title the rule
 > resolves to that model produces it. `variant_key` is written as `''` by `recordSightings`'
 > `normalizeVariantKey`. `validity` comes from the same rule, so a listing the rule refuses
 > cannot be marked `VALID`, and `model_key IS NOT NULL` implies `validity = 'VALID'`.
@@ -1305,7 +1318,7 @@ still comes out of a zero or a low price on no benchmark evidence.
 **Leave the evaluation mode on `DISCOUNT` or `BOTH`, not `MAXIMUM_PRICE`.** The instruction
 stands, and rows 3 and 4 are why — but its original reason no longer holds and is replaced
 rather than repeated. It used to be that the catalog was current-generation only while most real
-supply is older; the catalog now carries 336 names two generations back, so that premise is
+supply is older; the catalog now carries 337 names two generations back, so that premise is
 gone. What survives is the part that was never about coverage: an uncatalogued card under the
 maximum still reads as a deal on no evidence at all, and no catalog can be complete — GTX 900,
 RX 500 and Intel 10th gen are deliberately out, and a seller can always name something older or

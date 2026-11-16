@@ -10,7 +10,7 @@
  * RE-DERIVED: the per-guard figures below were measured over 5,808 generated titles against THE
  * 176-NAME CATALOG AS OF PR #14 (176 names x (1 + 16 suffixes x 2 concatenation forms)) --
  * removing one guard and keeping the rest changed W 84 results, G1 5, B2 518, G2 1,580. The
- * catalog now holds 336 names, so the title count is 11,088 and those four numbers no longer
+ * catalog now holds 337 names, so the title count is 11,121 and those four numbers no longer
  * describe this repo. A faithful reconstruction of the generator gave W 44, G1 0, B2 171,
  * G2 2,284 against the same 176 names, so the construction that produced them is not recoverable
  * and the post-change figures were NOT invented to replace them.
@@ -108,8 +108,29 @@ describe("catalog index -- the match and its guards", () => {
     // by T15 in normalizeListing.test.ts either, which is what this line used to say. Once
     // `Radeon RX 6800 XT` was catalogued that mutation stopped killing anything end-to-end.
     ["T7b: the trademark sign is noise (kills the hit de-duplication, not the case-folding)", "gpu", "AMD Radeon™ RX 7800 XT graphics card", "Radeon RX 7800 XT"],
+    // T50: RYZEN 7 3800X, added on replay frequency (3 distinct production listing ids). The three
+    // positive rows are those live titles verbatim; the rest are its near-miss siblings.
+    ["T50a: a live 3800X title keys", "cpu", "AMD Ryzen 7 3800X", "Ryzen 7 3800X"],
+    ["T50b: a live 3800X title keys, upper case", "cpu", "AMD RYZEN 7 3800X", "Ryzen 7 3800X"],
+    ["T50c: a live 3800X title keys, with a trailing marker", "cpu", "AMD Ryzen 7 3800X CPU", "Ryzen 7 3800X"],
+    ["T50d: the 3800XT is a later SKU, not the 3800X", "cpu", "AMD Ryzen 7 3800XT processor", null],
+    ["T50e: a spaced 3800 XT is not the 3800X either", "cpu", "AMD Ryzen 7 3800 XT processor", null],
+    ["T50f: a bare 3800 is not the 3800X", "cpu", "AMD Ryzen 7 3800 processor", null],
+    ["T50g: the 3700X stays the 3700X", "cpu", "AMD Ryzen 7 3700X processor", "Ryzen 7 3700X"],
   ])("%s", (_name, componentType, title, expected) => {
     expect(match(componentType, title)).toBe(expected);
+  });
+
+  /**
+   * T50h. WHERE THE ADDED NAME SITS. The ModelSelector lists a type's models in catalog order, and
+   * PLAN.md asks for release date, newest first. The 3800X shipped on 2019-07-07 with the 3900X
+   * and 3700X, so it sits between them, in tier order. This pins the one entry this change added;
+   * nothing pins the order of the whole list.
+   */
+  it("T50h: Ryzen 7 3800X sits between its release-date siblings", () => {
+    const cpu = catalogModels("cpu");
+    const at = cpu.indexOf("Ryzen 7 3800X");
+    expect(cpu.slice(at - 1, at + 2)).toEqual(["Ryzen 9 3900X", "Ryzen 7 3800X", "Ryzen 7 3700X"]);
   });
 
   /**
@@ -133,7 +154,7 @@ describe("catalog index -- the match and its guards", () => {
  * Intel Arc listing that omits the word "Intel".
  *
  * Named limitation: these pin removals and changes, NOT additions. A new entry in either set is
- * caught only where it breaks T11's 336 self-resolutions, T13's overlap audit, or -- for a
+ * caught only where it breaks T11's 337 self-resolutions, T13's overlap audit, or -- for a
  * catalog name rather than a vocabulary entry -- T47 and T48 below.
  */
 describe("catalog index -- every vocabulary element, one at a time", () => {
@@ -285,7 +306,7 @@ describe("catalog index -- every vocabulary element, one at a time", () => {
 
 describe("catalog index -- exhaustive properties", () => {
   /**
-   * T11. The ANCHOR of the whole suite: a normalizer that always returns null fails 336 times
+   * T11. The ANCHOR of the whole suite: a normalizer that always returns null fails 337 times
    * here. The counts are asserted FIRST so an empty or failed catalog import cannot pass this
    * vacuously.
    *
@@ -301,7 +322,7 @@ describe("catalog index -- exhaustive properties", () => {
    * With nine numbers a MOVE shows as two counts changing and the diff NAMES BOTH TYPES, a name
    * added to the wrong block shows as the total plus one count, and a deletion shows as the
    * total. The consequence of a misfile is a LOST reference rather than a wrong price -- the
-   * real listing stops matching and the foreign side is refused by rule 5 -- but with 336 names
+   * real listing stops matching and the foreign side is refused by rule 5 -- but with 337 names
    * hand-sorted into nine arrays, which array a line landed in is the single most likely error
    * in this file.
    *
@@ -309,17 +330,17 @@ describe("catalog index -- exhaustive properties", () => {
    * src/data/catalog.ts; `catalogModels` maps through CATALOG_COMPONENT_ID. See the named trap
    * on that record.
    */
-  it("T11: all 336 catalog names, declared as their own type, resolve to themselves", () => {
+  it("T11: all 337 catalog names, declared as their own type, resolve to themselves", () => {
     const names = WORKER_TYPES.flatMap((componentType) =>
       catalogModels(componentType).map((model) => [componentType, model] as const),
     );
-    expect(names).toHaveLength(336);
+    expect(names).toHaveLength(337);
     expect(
       Object.fromEntries(
         WORKER_TYPES.map((componentType) => [componentType, catalogModels(componentType).length]),
       ),
     ).toEqual({
-      cpu: 45,
+      cpu: 46,
       cpu_cooler: 29,
       motherboard: 36,
       ram: 26,
@@ -348,7 +369,7 @@ describe("catalog index -- exhaustive properties", () => {
    * and this is the test that says so. It is NOT loosened by the type resolution; it is the same
    * refusal with one door named.
    *
-   * THE COUNT IS PINNED, AND IT IS ALL OF THEM. MEASURED: all 2,688 pairs resolve, because a bare
+   * THE COUNT IS PINNED, AND IT IS ALL OF THEM. MEASURED: all 2,696 pairs resolve, because a bare
    * catalog name evidences exactly one type -- its own -- and matches a model there. Before the
    * resolution every one of them was `wrong-component`, which is the VALID -> INVALID flip a
    * listing went through each time a search of another type returned it. A rule that resolves
@@ -358,7 +379,7 @@ describe("catalog index -- exhaustive properties", () => {
    * carries a model, so dropping the model clause changes nothing in this test; the marker-only
    * rows in normalizeListing.test.ts (TR-m*) are what kill that mutant.
    */
-  it("T12: every one of the 2,688 cross-type pairs is refused or moved to the model's own type", () => {
+  it("T12: every one of the 2,696 cross-type pairs is refused or moved to the model's own type", () => {
     const pairs = WORKER_TYPES.flatMap((componentType) =>
       catalogModels(componentType).flatMap((model) =>
         WORKER_TYPES.filter((other) => other !== componentType).map(
@@ -366,7 +387,7 @@ describe("catalog index -- exhaustive properties", () => {
         ),
       ),
     );
-    expect(pairs).toHaveLength(2_688);
+    expect(pairs).toHaveLength(2_696);
 
     const leaks: string[] = [];
     let resolved = 0;
@@ -380,7 +401,7 @@ describe("catalog index -- exhaustive properties", () => {
       }
     }
     expect(leaks).toEqual([]);
-    expect(resolved).toBe(2_688);
+    expect(resolved).toBe(2_696);
   });
 
   /**
@@ -401,10 +422,10 @@ describe("catalog index -- exhaustive properties", () => {
    * FROM that list, because the exclusion disappears with the element.
    *
    * IT WALKS EVERY TRIE ENTRY POINT, NOT JUST THE FULL NAMES. `buildModelIndex` inserts each
-   * name AND every suffix obtained by dropping leading OPTIONAL_LEADING tokens -- 423 cores for
-   * 336 names. A prefix relation that exists only between two STRIPPED cores pools exactly as
+   * name AND every suffix obtained by dropping leading OPTIONAL_LEADING tokens -- 424 cores for
+   * 337 names. A prefix relation that exists only between two STRIPPED cores pools exactly as
    * badly as one between two full names, and the full-name-only form could not see it.
-   * MEASURED: over all 423 cores the answer is the same 27 rows it was over the 336 names, so
+   * MEASURED: over all 424 cores the answer is the same 27 rows it was over the 337 names, so
    * this ships as a no-op today and closes the gap the first time a stripped core becomes a
    * prefix of another name. Duplicate labels (a pair visible at both the full and the stripped
    * depth, as `Core i5-12400 < Core i5-12400F` is) are collapsed.

@@ -170,10 +170,10 @@ const SELECT_VERDICTS_BODY = `SELECT l.source, l.listing_id, l.component_type, l
  *
  * `json_each`, NOT BOUND PARAMETERS, and that is not a style choice: D1 caps a statement at 100
  * parameters (MEASURED -- `?101` answers `D1_ERROR: variable number must be between ?1 and ?100`)
- * and a shipped-default `cpu + gpu` selection is 113 model names. The parameter form is BROKEN,
+ * and a shipped-default `cpu + gpu` selection is 114 model names. The parameter form is BROKEN,
  * not merely ugly.
  *
- * `'/'` IS SAFE AS THE PAIR SEPARATOR: MEASURED, 0 of 336 catalog model names contain one.
+ * `'/'` IS SAFE AS THE PAIR SEPARATOR: MEASURED, 0 of 337 catalog model names contain one.
  * `COALESCE(model_key, '')` yields `gpu/` for an uncatalogued listing, which preserves the
  * requirement that a model-narrowed selection excludes rows whose model was never resolved --
  * and is exactly why `pairs=["gpu/"]` is refused at the edge rather than bound here: MEASURED, it
@@ -379,7 +379,7 @@ export const parseVerdictsQuery = (
 
   const storagePairs: string[] = [];
   for (const pair of pairs) {
-    // THE FIRST '/' ONLY: a model name cannot contain one (MEASURED over all 336), so the split is
+    // THE FIRST '/' ONLY: a model name cannot contain one (MEASURED over all 337), so the split is
     // unambiguous, and a second '/' therefore lands in the model half where the catalog lookup
     // refuses it.
     const mark = pair.indexOf("/");
