@@ -277,8 +277,18 @@ const ACCESSORY_CROSS_TYPE: Case[] = [
   ["AX5: a riser mount from a case search", "Vertical GPU mount riser fits RTX 4090", 4700, "case", "NEEDS_REVIEW", null, "accessory"],
   ["AX6: thermal pads from a cpu search", "Thermal pads for RTX 3080", 1700, "cpu", "NEEDS_REVIEW", null, "accessory"],
   ["AX7: a backplate from a cpu search", "RTX 3080 backplate", 3100, "cpu", "NEEDS_REVIEW", null, "accessory"],
+  // Review round 2: six more, each outside the first list.
+  ["AX8: a cooler fan from a case-fan search", "RTX 3080 FE fan replacement", 2700, "case_fan", "NEEDS_REVIEW", null, "accessory"],
+  ["AX9: replacement fans from a case-fan search", "RTX 3070 replacement fans", 2600, "case_fan", "NEEDS_REVIEW", null, "accessory"],
+  ["AX10: an empty box from a case search", "RTX 4090 Founders Edition empty box", 1600, "case", "NEEDS_REVIEW", null, "accessory"],
+  ["AX11: a box from a psu search", "RTX 4090 box only", 1400, "psu", "NEEDS_REVIEW", null, "accessory"],
+  ["AX12: a cpu box from a cooler search", "Ryzen 7 5800X3D box", 1200, "cpu_cooler", "NEEDS_REVIEW", null, "accessory"],
+  ["AX13: a gpu holder from a case search", "RTX 4090 vertical GPU holder", 2800, "case", "NEEDS_REVIEW", null, "accessory"],
   // THE CONTROL FOR THE SCOPE: same-type copy naming an accessory word is NOT refused. Applying
   // the refusal under every type goes red here.
+  // THE CONTROL FOR THE OWN-WORD EXEMPTION: a real case fan from a gpu search still moves to
+  // case_fan, although `fan` is an accessory word everywhere else.
+  ["AX-f: a catalogued case fan from a gpu search", "Lian Li UNI FAN SL120 V2", 2400, "gpu", "VALID", "Lian Li UNI FAN SL120 V2", "matched", "case_fan"],
   ["AX-c: a psu that comes with its cables, from a psu search", "Corsair RM850x Shift power supply with all cables", 18100, "psu", "VALID", "Corsair RM850x Shift", "matched"],
 ];
 
@@ -483,7 +493,8 @@ describe("normalizeListing -- every vocabulary element, one at a time", () => {
   it.each([
     ["cable"], ["cables"], ["adapter"], ["bracket"], ["waterblock"], ["water block"],
     ["backplate"], ["riser"], ["mount"], ["mounting"], ["shroud"], ["thermal pad"],
-    ["thermal pads"], ["fan for"],
+    ["thermal pads"], ["fan"], ["fans"], ["replacement"], ["box"], ["holder"], ["stand"],
+    ["support"],
   ])("T21f: %s keeps a cross-type listing out of the resolution", (phrase) => {
     expect(
       normalizeListing({ title: `GeForce RTX 5080 ${phrase}`, priceCents: 39100, componentType: "cpu" }),
@@ -492,7 +503,7 @@ describe("normalizeListing -- every vocabulary element, one at a time", () => {
 
   it("T21f: `for` directly before the model reads as an accessory", () => {
     expect(
-      normalizeListing({ title: "Support for GeForce RTX 5080", priceCents: 39200, componentType: "cpu" }),
+      normalizeListing({ title: "Cover for GeForce RTX 5080", priceCents: 39200, componentType: "cpu" }),
     ).toEqual({ componentType: "cpu", modelKey: null, variantKey: null, validity: "NEEDS_REVIEW", reason: "accessory" });
   });
 
@@ -969,7 +980,7 @@ describe("normalizeListing -- properties of the vocabularies", () => {
    * here until it is removed, neutralised, or -- as with `pack` -- deliberately allowed to win.
    * The four SYSTEM_PHRASES rows are harmless: both paths give `whole-system`.
    */
-  it("T13: exactly fifteen sub-phrase overlaps exist across the seventeen vocabularies", () => {
+  it("T13: exactly eighteen sub-phrase overlaps exist across the seventeen vocabularies", () => {
     const vocabularies: [string, readonly string[]][] = [
       ...(Object.entries(MARKERS) as [string, readonly string[]][]).map(
         ([type, phrases]) => [`MARKERS.${type}`, phrases] as [string, readonly string[]],
@@ -1030,6 +1041,12 @@ describe("normalizeListing -- properties of the vocabularies", () => {
         "WHOLE_UNIT:pc < SYSTEM_PHRASES:desktop pc",
         "WHOLE_UNIT:pc < SYSTEM_PHRASES:mini pc",
         "WHOLE_UNIT:tower < MARKERS.case:tower case",
+        // HARMLESS BY CONSTRUCTION: ACCESSORY is consulted only on a cross-type resolution, and
+        // `fan`/`fans` are exempt when that resolution is to case_fan (ACCESSORY_OWN_WORDS) --
+        // the only type these markers evidence. AX-f is the row that goes red without it.
+        "ACCESSORY:fan < MARKERS.case_fan:case fan",
+        "ACCESSORY:fan < MARKERS.case_fan:fan pack",
+        "ACCESSORY:fans < MARKERS.case_fan:case fans",
       ].sort(),
     );
   });
