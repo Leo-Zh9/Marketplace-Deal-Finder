@@ -1,6 +1,6 @@
 /**
  * The token layer and the per-component-type model index: everything that turns a title into one
- * of the 336 names in `src/data/catalog.ts`. The classification rules live next door in
+ * of the 337 names in `src/data/catalog.ts`. The classification rules live next door in
  * `./normalizeListing.ts`; nothing in this file knows what `validity` is.
  *
  * WHY A TOKEN TRIE AND NOT SUBSTRING MATCHING. Lower-cased and stripped of punctuation,
@@ -18,7 +18,7 @@ import type { Listing } from "../storage/types";
 
 /**
  * The tokenizer's hard bound. MEASURED: the longest catalog model is 11 tokens and the longest
- * of the 15 live titles is 18, so 64 is ~3.5x headroom over anything real; 0 of 336 catalog
+ * of the 15 live titles is 18, so 64 is ~3.5x headroom over anything real; 0 of 337 catalog
  * names reach it -- the longest is still 11 tokens, which T33 asserts.
  *
  * `tokenize` TRUNCATES at this bound -- it does not throw and it does not refuse. A caller that
@@ -54,7 +54,7 @@ export interface Token {
  * `component-unconfirmed`, which is what this sentence used to claim. A guard whose only test
  * asserts an END-TO-END outcome can be disarmed by a pure DATA change, with no code touched and
  * no test going red; T15t asserts the TOKEN STREAM, which is the layer the guard lives at.
- * MEASURED: 0 of the 336 catalog names contain a non-ASCII character, so the catalog side loses
+ * MEASURED: 0 of the 337 catalog names contain a non-ASCII character, so the catalog side loses
  * nothing either way.
  */
 export const tokenize = (text: string): Token[] => {
@@ -174,7 +174,7 @@ export const phraseTokens = (phrase: string): readonly string[] => {
  * what still has to be established is whether `combo` has a descriptive use that would refuse a
  * genuine single-item listing on any of the nine types.
  *
- * `nvidia` AND `amd` ARE MEASURED INERT, AND THEY ARE KEPT ON PURPOSE. MEASURED: 0 of the 336
+ * `nvidia` AND `amd` ARE MEASURED INERT, AND THEY ARE KEPT ON PURPOSE. MEASURED: 0 of the 337
  * catalog names begin with either word -- every name this set can reach today is `GeForce ...`
  * (43), `Radeon ...` (20), `Intel Arc ...` (5) or `Core ...` (19) -- so neither can produce an
  * entry point, and no test can kill either one. DO NOT DELETE THEM FOR TIDINESS. This set
@@ -239,8 +239,8 @@ const OPTIONAL_LEADING = new Set(["geforce", "nvidia", "radeon", "amd", "intel",
  * T11 AND T12 PROVE SOMETHING NARROWER, AND CITING THEM HERE WOULD BE FALSE COMFORT. MEASURED:
  * deleting ALL THREE admissibility guards from `walkFrom` leaves T11 at 0 failures and T12 at 0
  * leaks while `"MSI RTX 5070 Ti Super gaming card"` starts resolving to `GeForce RTX 5070 Ti`.
- * What they do prove is that no catalog name is SHADOWED by another (T11: all 336 self-resolve)
- * and that none is CROSS-LISTED under a foreign type (T12: 2,688 pairs, 0 leaks). Neither can
+ * What they do prove is that no catalog name is SHADOWED by another (T11: all 337 self-resolve)
+ * and that none is CROSS-LISTED under a foreign type (T12: 2,696 pairs, 0 leaks). Neither can
  * see a guard or a vocabulary element disappear.
  */
 const SUFFIX_WORDS = new Set([
@@ -272,7 +272,7 @@ const SUFFIX_WORDS = new Set([
  * ADDS entry points: the full name is still inserted first and still matches.
  *
  * WHY THESE THREE AND NO OTHERS. Each names a tier of a board or PSU whose model number is unique
- * without it, so dropping it cannot merge two products. MEASURED over the 336 names: the 13 that
+ * without it, so dropping it cannot merge two products. MEASURED over the 337 names: the 13 that
  * carry one (`mag` 9, `mpg` 3, `meg` 1) produce 13 new entry points, 0 of them equal to any other
  * name or entry point, and the T47 prefix-pair set is unchanged (the one pair they touch,
  * `MSI MAG B550 Tomahawk < ... MAX WiFi`, is already a reviewed row).
@@ -344,12 +344,12 @@ const kitSpecLength = (tokens: readonly Token[], position: number): number => {
 
 /**
  * Insert each model's full token sequence plus every suffix obtained by dropping leading
- * OPTIONAL_LEADING tokens. MEASURED: 336 models produce 423 cores -- the names themselves plus
+ * OPTIONAL_LEADING tokens. MEASURED: 337 models produce 424 cores -- the names themselves plus
  * 87 vendor-stripped entry points (geforce 43, radeon 20, intel 5, core 19) -- and 0 of them
  * begin with a pure-digit token.
  *
  * First insert wins on a collision. MEASURED: no catalog name is shadowed -- T11 resolves all
- * 336 to themselves.
+ * 337 to themselves.
  */
 export const buildModelIndex = (models: readonly string[]): ModelIndex => {
   const root: ModelIndex = { children: new Map(), model: null };
@@ -444,7 +444,7 @@ const walkFrom = (
  * Every DISTINCT catalog model the title names, in the order their matches start.
  *
  * A start-of-run guard and a span-containment filter were both written, MEASURED and DELETED
- * rather than shipped untestable: 0 of the 423 cores begin with a digit token, and the greedy
+ * rather than shipped untestable: 0 of the 424 cores begin with a digit token, and the greedy
  * walk never yields two nested spans holding DIFFERENT models. Do not re-add either without a
  * test that can go red.
  */

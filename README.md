@@ -11,7 +11,7 @@ Undercut watches listings for the components you care about and matches each one
 ## What it does
 
 - **Watch list.** From the control panel you choose component types, models, a location and a search radius. The collector runs one search per target.
-- **Model matching.** Listing titles are normalized against a catalog of **336 models across nine component types**, two generations back. A title that can't be matched with confidence is marked invalid rather than guessed.
+- **Model matching.** Listing titles are normalized against a catalog of **337 models across nine component types**, two generations back. A title that can't be matched with confidence is marked invalid rather than guessed.
 - **Reference prices.** Every stored listing feeds a running price aggregate per model, so "normal price" comes from the market Undercut has actually seen.
 - **Verdicts.** Scheduled evaluation compares each new listing with its model's reference price, and the dashboard shows the resulting deals.
 - **Private by default.** Sign-in is Firebase Google auth restricted to an allowlist. The collector uses its own credential, which can reach only two routes.

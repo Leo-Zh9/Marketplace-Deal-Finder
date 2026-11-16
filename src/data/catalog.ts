@@ -62,6 +62,7 @@ export const componentCatalog: ComponentDefinition[] = [
       "Ryzen 5 5500",
       "Ryzen 9 3950X",
       "Ryzen 9 3900X",
+      "Ryzen 7 3800X",
       "Ryzen 7 3700X",
       "Ryzen 5 3600X",
       "Ryzen 5 3600",

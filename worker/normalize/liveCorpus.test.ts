@@ -122,9 +122,11 @@ describe("live corpus -- the floor (recall), pinned on master 404677e and raised
   /**
    * 9 of 13 ON MASTER 404677e. PART 2 RAISES IT ONE RULE AT A TIME, each move deliberate:
    * +1 the inner `MAG` sub-brand (`MSI B850 Tomahawk ...`), +1 the two-module kit-spec skip
-   * (`G.SKILL Ripjaws V 16GB (2x8GB) ...`).
+   * (`G.SKILL Ripjaws V 16GB (2x8GB) ...`). PR 2.4 adds one by CATALOG, not by rule: `Ryzen 7
+   * 3800X` entered the catalog on replay frequency, so `AMD RYZEN 7 3800X` moved from
+   * uncatalogued to catalogued and is keyed under its one search.
    */
-  it("counts: 36 standalone components, 13 of them catalogued, 11 of 13 keyed under every search", () => {
+  it("counts: 36 standalone components, 14 of them catalogued, 12 of 14 keyed under every search", () => {
     expect({
       titles: LIVE_CORPUS.length,
       standaloneComponents: components.length,
@@ -135,9 +137,9 @@ describe("live corpus -- the floor (recall), pinned on master 404677e and raised
     }).toEqual({
       titles: 141,
       standaloneComponents: 36,
-      catalogued: 13,
-      recalledUnderEverySearch: 11,
-      keyedUnderSomeSearch: 11,
+      catalogued: 14,
+      recalledUnderEverySearch: 12,
+      keyedUnderSomeSearch: 12,
     });
   });
 

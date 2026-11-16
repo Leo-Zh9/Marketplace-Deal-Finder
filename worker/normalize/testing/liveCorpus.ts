@@ -63,7 +63,7 @@ export const LIVE_CORPUS: readonly LiveCorpusEntry[] = [
   { title: "MSI B850 Tomahawk Max Wifi Motherboard Only", priceText: "CA$260", searchedAs: ["cpu", "gpu", "motherboard", "psu", "storage"], label: component("motherboard", "MSI MAG B850 Tomahawk MAX WiFi") },
   { title: "Ram DDR4 16gb 2x8gb 3000MHz", priceText: "CA$120", searchedAs: ["cpu", "gpu", "motherboard", "ram"], label: uncatalogued("ram") },
   { title: "Intel i7-8700k", priceText: "CA$125", searchedAs: ["cpu"], label: uncatalogued("cpu") },
-  { title: "AMD RYZEN 7 3800X", priceText: "CA$120", searchedAs: ["cpu"], label: uncatalogued("cpu") },
+  { title: "AMD RYZEN 7 3800X", priceText: "CA$120", searchedAs: ["cpu"], label: component("cpu", "Ryzen 7 3800X") },
   { title: "Gaming Computer / PC", priceText: "CA$600", searchedAs: ["cpu", "gpu", "motherboard", "ram"], label: notComponent("a whole machine") },
   { title: "Bulk Lot of Key-Shaped USB Flash Drives 30 pieces", priceText: "CA$5", searchedAs: ["cpu", "gpu"], label: notComponent("more than one item") },
   { title: "1td hard drive", priceText: "CA$30", searchedAs: ["cpu", "gpu"], label: uncatalogued("storage") },
