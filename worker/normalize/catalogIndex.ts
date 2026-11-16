@@ -273,8 +273,6 @@ export interface ModelIndex {
   model: string | null;
 }
 
-const DIGITS = /^[0-9]+$/;
-
 /**
  * A RAM KIT SPEC sitting between a catalog name's capacity and the rest of it:
  * `"G.SKILL Ripjaws V 16GB (2x8GB) DDR4-3600 RAM"` is the live title, and the catalog name is
