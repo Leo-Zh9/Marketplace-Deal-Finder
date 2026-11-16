@@ -242,7 +242,7 @@ const SUFFIX_WORDS = new Set([
 ]);
 
 /**
- * MSI's sub-brand words, droppable from INSIDE a catalog name (never from its first token).
+ * MSI's sub-brand words, droppable from INSIDE a catalog name.
  * `"MSI B850 Tomahawk Max Wifi Motherboard Only"` is the live title; the catalog name is
  * `MSI MAG B850 Tomahawk MAX WiFi`, and sellers leave `MAG` out. Like OPTIONAL_LEADING this only
  * ADDS entry points: the full name is still inserted first and still matches.
@@ -252,6 +252,11 @@ const SUFFIX_WORDS = new Set([
  * carry one (`mag` 9, `mpg` 3, `meg` 1) produce 13 new entry points, 0 of them equal to any other
  * name or entry point, and the T47 prefix-pair set is unchanged (the one pair they touch,
  * `MSI MAG B550 Tomahawk < ... MAX WiFi`, is already a reviewed row).
+ *
+ * NO "NOT THE FIRST TOKEN" GUARD, and that is measured rather than forgotten: 0 catalog names
+ * begin with one of these words (all 13 follow `MSI`), so such a guard is an equivalent mutant
+ * and this file deletes guards no mutation can kill. A future name that LEADS with one is caught
+ * by T14b's count map, which counts only inner positions and would stop matching the total.
  *
  * NOT ADMITTED, AND THAT IS DELIBERATE: ASUS `ROG Strix` and `TUF`, Gigabyte `Aorus`, MSI `PRO`.
  * `PRO` is a separate MSI product line, not a tier word over the same board, and `Aorus` /
@@ -294,7 +299,7 @@ export const buildModelIndex = (models: readonly string[]): ModelIndex => {
 
   for (const model of models) {
     const full = tokenValues(tokenize(model));
-    const withoutSubBrand = full.filter((value, index) => index === 0 || !INNER_SUB_BRAND.has(value));
+    const withoutSubBrand = full.filter((value) => !INNER_SUB_BRAND.has(value));
     const variants = withoutSubBrand.length < full.length ? [full, withoutSubBrand] : [full];
     for (const sequence of variants) {
       insert(sequence, model);

@@ -172,15 +172,21 @@ describe("catalog index -- every vocabulary element, one at a time", () => {
    * out, whose omission must stay a miss.
    */
   it("T14b: MSI's inner sub-brand words are droppable, and no other line's are", () => {
+    // Counted at EVERY position and at inner positions separately: production drops the word
+    // wherever it sits, and that is safe only while no catalog name LEADS with one.
+    const anywhere: Record<string, number> = { mag: 0, mpg: 0, meg: 0 };
     const inner: Record<string, number> = { mag: 0, mpg: 0, meg: 0 };
     for (const componentType of WORKER_TYPES) {
       for (const model of catalogModels(componentType)) {
         tokenize(model).forEach((token, index) => {
-          if (index > 0 && token.value in inner) inner[token.value] += 1;
+          if (!(token.value in anywhere)) return;
+          anywhere[token.value] += 1;
+          if (index > 0) inner[token.value] += 1;
         });
       }
     }
     expect(inner).toEqual({ mag: 9, mpg: 3, meg: 1 });
+    expect(anywhere).toEqual(inner);
 
     expect(match("motherboard", "MSI B850 Tomahawk Max Wifi")).toBe("MSI MAG B850 Tomahawk MAX WiFi");
     expect(match("motherboard", "MSI X870E Carbon WiFi")).toBe("MSI MPG X870E Carbon WiFi");
@@ -192,7 +198,7 @@ describe("catalog index -- every vocabulary element, one at a time", () => {
     expect(match("motherboard", "ASUS B850-F Gaming WiFi")).toBeNull();
     expect(match("motherboard", "ASUS Gaming B760-Plus WiFi")).toBeNull();
     expect(match("motherboard", "Gigabyte B850 Elite WiFi7")).toBeNull();
-    // Only an INNER word drops: a sub-brand at the start is not a sub-brand of anything.
+    // The brand word is not optional: dropping `MAG` leaves `MSI B850 ...`, not `B850 ...`.
     expect(match("motherboard", "B850 Tomahawk MAX WiFi")).toBeNull();
   });
 
