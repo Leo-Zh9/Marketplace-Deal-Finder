@@ -336,7 +336,12 @@ between `VALID` with a null key and `INVALID_REFERENCE` across searches — meas
 Motherboard Only"`, `"Ram DDR4 16gb 2x8gb 3000MHz"`, `"5-Bay Hard Drive Station"` and a Microsoft
 Surface Pro whose only marker is `SSD`. They carry no key, so **no aggregate ever moves**, but
 their stored validity — and the verdict computed from it — is whichever search saw them last, and
-each flip re-queues evaluation. **The same sample contains no model-matched cross-type id at all**
+each flip re-queues evaluation. **A wider, quieter version of the same thing:** 30 of the 132 ids
+have a stored row that depends on which search saw them last — the 4 above plus 26 whole machines,
+bundles and unconfirmed titles that are refused under every search but evidence no single
+catalogued type, so they fall back to the search's type and `component_type` (and so
+`content_hash`) alternates. Each such sighting is a `CHANGED` re-write and an evaluation re-queue
+with the same refusal; none carries a key. **The same sample contains no model-matched cross-type id at all**
 (the production log's flips came from other listings on other days), so the sample measures the
 residual, not the fix; `L16` and the two-type block of `scripts/e2e-local.sh` measure the fix.
 
@@ -467,11 +472,14 @@ live 5080 is CA$3,000. Any threshold would be a fabricated number.
   and costs 0.21 ms. **Read the spread, not the midpoint: 3.2–3.9 ms is dev-machine variance
   across two machines and two title shapes, not a precision this measurement supports.** The
   repo's own invariant is p95 < 8 ms and the test asserts against that, never against these
-  figures. **The type resolution adds no scan**: it reads the nine per-type model matches the
-  evidence scan already computed, and the declared type's index is now walked once there rather
+  figures. **The type resolution costs one change in the scan, in both directions:** it needs
+  every type's model match, so a type evidenced by a marker now has its index walked too (the old
+  evidence scan short-circuited there), while the declared type's index is walked once rather
   than twice. `T40c-r` runs the same worst legal batch declared under a type it does not
-  evidence, so the resolution fires on all 100 — see the PR that introduced it for the figures
-  measured beside `T40c` on one loaded machine.
+  evidence, so the resolution fires on all 100. Measured on one machine at load average 7–9,
+  three runs of the file alone each: `T40c` p95 4.16–4.42 ms before the change and 4.37–4.96 ms
+  after (p50 3.42–3.55 → 3.69–3.88), `T40c-r` p95 4.20–4.27 ms. Read that as "no material
+  change, inside the noise of a loaded dev machine", not as a precise delta.
 
 ### The residuals, named — and the corpora they are measured from
 

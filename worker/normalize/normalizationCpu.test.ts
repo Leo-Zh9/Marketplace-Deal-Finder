@@ -195,8 +195,9 @@ describe("normalization CPU", () => {
 
   /**
    * T40c-r: THE SAME WORST LEGAL BATCH, WITH THE TYPE RESOLUTION FIRING ON ALL 100. The resolution
-   * reads the nine per-type model matches the evidence scan already computes, so it should add
-   * nothing; this is the measurement that says so rather than the argument.
+   * needs every type's model match -- one walk per index, where the old evidence scan skipped the
+   * walk for a type its marker already evidenced -- and then runs every rule under the resolved
+   * type. This is the measurement of that path rather than an argument about it.
    */
   it("T40c-r: p95 for the worst legal batch that resolves its type is under the 8 ms budget", () => {
     expect(RESOLVING_TITLE.length).toBeLessThanOrEqual(300);
