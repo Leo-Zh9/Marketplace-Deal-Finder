@@ -248,9 +248,12 @@ describe("runMonitor", () => {
       "drain-1",
       "drain-2",
       "drain-3",
+      // Phase 4. Inert here (no webhook in the environment), so it makes no D1 query -- but the
+      // step exists on every run that reaches the drain without losing the lock.
+      "notify",
       "finalize",
     ]);
-    expect(run.stepsUsed).toBe(8);
+    expect(run.stepsUsed).toBe(9);
     expect(run.status).toBe("OK");
     // ONE retry, not runCleanup's two: each retry re-claims up to a step's worth of further
     // tasks and strands them until the next fire.
@@ -279,7 +282,7 @@ describe("runMonitor", () => {
       claimedCount: run.claimedCount,
       evaluationCount: run.evaluationCount,
       discardedCount: run.discardedCount,
-      // The drain stopped inside drain-0; drain-1 was never started.
+      // The drain stopped inside drain-0; drain-1 was never started. Then notify, then finalize.
       stepsUsed: run.stepsUsed,
       sources: run.sources,
       undrainedSources: run.undrainedSources,
@@ -289,7 +292,7 @@ describe("runMonitor", () => {
       claimedCount: 40,
       evaluationCount: 40,
       discardedCount: 0,
-      stepsUsed: 5,
+      stepsUsed: 6,
       sources: ["alpha"],
       undrainedSources: [],
     });
@@ -329,7 +332,7 @@ describe("runMonitor", () => {
       evaluation_error_count: 0,
       discarded_count: 0,
       batches: 5,
-      steps_used: 5,
+      steps_used: 6,
       step_failures: 0,
       errors: "[]",
     });
@@ -450,7 +453,7 @@ describe("runMonitor", () => {
     expect(await lockRow()).toEqual({ run_id: "", acquired_at: T, expires_at: 0 });
     expect(await runRows()).toEqual([
       { run_id: "run-loser", status: "SKIPPED_LOCKED", batches: 0, steps_used: 2 },
-      { run_id: "run-winner", status: "OK", batches: 2, steps_used: 5 },
+      { run_id: "run-winner", status: "OK", batches: 2, steps_used: 6 },
     ]);
     expect(await taskStatuses()).toEqual([{ status: "COMPLETE", n: 11 }]);
   });
@@ -524,7 +527,8 @@ describe("runMonitor", () => {
       stepFailures: run.stepFailures,
       batches: run.batches,
       stepsUsed: run.stepsUsed,
-    }).toEqual({ status: "DEGRADED", stepFailures: 1, batches: 7, stepsUsed: 6 });
+    // A DEGRADED drain still runs the notify step, so 7 steps.
+    }).toEqual({ status: "DEGRADED", stepFailures: 1, batches: 7, stepsUsed: 7 });
     expect(run.errors).toHaveLength(1);
     expect(run.errors[0]).toMatch(/^drain-1: .*step exploded/);
     expect((await runRows()).map((row) => row.status)).toEqual(["DEGRADED"]);
@@ -605,8 +609,8 @@ describe("runMonitor", () => {
     expect(run.sources).toHaveLength(8);
     expect(run.sourcesTruncated).toBe(false);
     expect(run.batches).toBe(6);
-    // acquire-lock, load-settings, discover-sources, drain-0, drain-1, finalize.
-    expect(run.stepsUsed).toBe(6);
+    // acquire-lock, load-settings, discover-sources, drain-0, drain-1, notify, finalize.
+    expect(run.stepsUsed).toBe(7);
     // NAMED, not counted: an operator can act on two names and cannot act on "2".
     expect(run.undrainedSources).toEqual(["golf", "hotel"]);
     // ...and the starvation is real, not merely reported: those two sources still hold every
@@ -985,6 +989,7 @@ describe("runMonitor", () => {
       "collect-alpha-provider",
       "collect-bravo-provider",
       "discover-sources",
+      "notify",
       "finalize",
     ]);
     expect(contexts).toEqual([
@@ -1123,7 +1128,7 @@ describe("runMonitor", () => {
 
     expect(replay.status).toBe("OK");
     expect(await runRows()).toEqual([
-      { run_id: "run-replayed", status: "OK", batches: 0, steps_used: 4 },
+      { run_id: "run-replayed", status: "OK", batches: 0, steps_used: 5 },
     ]);
     expect(await lockRow()).toEqual({ run_id: "", acquired_at: T, expires_at: 0 });
     // The replay saw its own row, which is the only honest answer to "what came before me".
@@ -1270,7 +1275,8 @@ describe("runMonitor", () => {
     expect(leaseWhileHeld).toBe(T + MONITOR_LOCK_SECONDS);
     // drainSteps and batchesPerDrainStep: the shipped budget ran, not one batch in one step.
     expect(run.batches).toBe(DRAIN_STEPS * BATCHES_PER_DRAIN_STEP);
-    expect(run.stepsUsed).toBe(4 + DRAIN_STEPS);
+    // acquire-lock, load-settings, discover-sources, the drains, notify, finalize.
+    expect(run.stepsUsed).toBe(5 + DRAIN_STEPS);
     // batchSize: each batch took its source's three tasks, not one.
     expect(run.claimedCount).toBe(run.batches * 3);
     // maxSources: discovery was not capped at one source.
@@ -1326,5 +1332,93 @@ describe("runMonitor", () => {
     // A starved tail leaves claimedCount short of sources x 3 even if `undrainedSources` were
     // computed wrongly.
     expect(run.claimedCount).toBe(run.sources.length * 3);
+  });
+});
+
+/**
+ * PHASE 4: THE NOTIFY STEP INSIDE A REAL RUN. worker/notify/notify.test.ts covers the step's
+ * behaviour; these two pin its place in the orchestration.
+ */
+describe("runMonitor -- the notify step", () => {
+  const ON = {
+    DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/42/run-monitor",
+    NOTIFICATIONS: "on",
+    APP_ENV: "production",
+  };
+
+  const watchEverything = async () => {
+    await db
+      .prepare(
+        "INSERT INTO watch_targets (target_id, component_type, query) VALUES ('gpu-all', 'gpu', 'graphics card')",
+      )
+      .run();
+  };
+
+  /**
+   * R-n1. A deal judged by THIS run's drain is alerted by THIS run's notify step. Kills: the
+   * notify step not running (its guard narrowed so it is skipped), and not passing the environment
+   * through (the step reads `unconfigured`).
+   */
+  it("R-n1: the drain's DEALs are posted by the notify step that follows it", async () => {
+    await maximumPriceSettings();
+    await watchEverything();
+    await seed("alpha", 2);
+    const posts: string[] = [];
+    const recorder = recording();
+
+    const run = await runMonitor(
+      db,
+      recorder.stepper,
+      { now: T },
+      "run-notify",
+      {
+        notifyFetch: async (url) => {
+          posts.push(url);
+          return new Response('{"id":"1"}', { status: 200 });
+        },
+      },
+      ON,
+    );
+
+    expect(recorder.names).toEqual([
+      "acquire-lock",
+      "load-settings",
+      "discover-sources",
+      "drain-0",
+      "notify",
+      "finalize",
+    ]);
+    expect(run.status).toBe("OK");
+    expect(run.notify).toMatchObject({ state: "on", enqueued: 2, sent: 2 });
+    expect(posts).toEqual([
+      "https://discord.com/api/webhooks/42/run-monitor?wait=true",
+      "https://discord.com/api/webhooks/42/run-monitor?wait=true",
+    ]);
+  });
+
+  /**
+   * R-n2. A notify step that exhausts its retries degrades the run and STILL finalizes and
+   * releases -- the same contract as a failed drain step (R6). Kills: letting the notify error
+   * propagate (the run throws, no monitor_runs row, the lock held for its full lease).
+   *
+   * failAt 4 counts BODY executions: 0 acquire-lock, 1 load-settings, 2 discover-sources,
+   * 3 drain-0 (which exhausts the two tasks), 4 notify.
+   */
+  it("R-n2: a failed notify step degrades the run, records why, and still releases the lock", async () => {
+    await maximumPriceSettings();
+    await seed("alpha", 2);
+
+    const run = await runMonitor(db, recording({ failAt: 4 }).stepper, { now: T }, "run-notify-fail", {}, ON);
+
+    expect({ status: run.status, stepFailures: run.stepFailures, notify: run.notify }).toEqual({
+      status: "DEGRADED",
+      stepFailures: 1,
+      notify: null,
+    });
+    expect(run.errors).toEqual(["notify: Error: step exploded"]);
+    expect((await runRows()).map((row) => row.status)).toEqual(["DEGRADED"]);
+    expect(await lockRow()).toEqual({ run_id: "", acquired_at: T, expires_at: 0 });
+    // The drain's work is untouched by the notify failure.
+    expect(await taskStatuses()).toEqual([{ status: "COMPLETE", n: 2 }]);
   });
 });

@@ -11,6 +11,8 @@ import { handleGetSettings, handlePutSettings } from "./api/settings";
 import { handleGetVerdicts } from "./api/verdicts";
 import { handleGetWatch, handlePutWatch } from "./api/watch";
 import { handleGetWatchTargets } from "./api/watchTargets";
+import type { NotifyEnvironment } from "./notify/config";
+import { readNotificationsStatus } from "./notify/status";
 import { handleScheduled, type ScheduledEnvironment } from "./scheduling/scheduled";
 
 /**
@@ -22,7 +24,10 @@ import { handleScheduled, type ScheduledEnvironment } from "./scheduling/schedul
  * `MONITOR_WORKFLOW` stay OUT: the scheduled path names its own `ScheduledEnvironment`, and
  * the runtime hands both the same object.
  */
-export type Environment = WorkerEnvironment & { DB?: D1Database } & CollectorEnvironment;
+export type Environment = WorkerEnvironment &
+  { DB?: D1Database } &
+  CollectorEnvironment &
+  Pick<NotifyEnvironment, "DISCORD_WEBHOOK_URL" | "NOTIFICATIONS">;
 
 /**
  * wrangler binds a Workflow to a class exported FROM THE MAIN ENTRY, so this re-export is
@@ -403,12 +408,20 @@ export const handleRequest = async (
    * H-8 is the guard.
    */
   if (request.method === "GET" && url.pathname === "/api/status") {
-    const health = await readCollectorHealth(
-      environment.DB,
-      dependencies?.now() ?? Math.floor(Date.now() / 1000),
-    );
+    const statusNow = dependencies?.now() ?? Math.floor(Date.now() / 1000);
+    const health = await readCollectorHealth(environment.DB, statusNow);
+    // ADDITIVE. In the inert notification states this reads nothing from D1 (worker/notify/status.ts).
+    const notifications = await readNotificationsStatus(environment.DB, environment, statusNow);
 
-    return json({ ...health, authentication: authentication.identity.authenticationMethod }, 200, cors);
+    return json(
+      {
+        ...health,
+        authentication: authentication.identity.authenticationMethod,
+        notifications,
+      },
+      200,
+      cors,
+    );
   }
 
   if (

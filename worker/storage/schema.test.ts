@@ -6,6 +6,7 @@ import evaluationSql from "../../migrations/0002_evaluation_tasks.sql?raw";
 import monitorSql from "../../migrations/0004_monitor.sql?raw";
 import watchSql from "../../migrations/0005_watch_targets.sql?raw";
 import healthSql from "../../migrations/0006_collector_health.sql?raw";
+import notificationsSql from "../../migrations/0007_notifications.sql?raw";
 import { COMPONENT_TYPES } from "../api/listings";
 
 /**
@@ -70,7 +71,8 @@ describe("0001_initial_storage.sql", () => {
   // worker/testing/d1.ts leaves ten tables here and every row of
   // worker/api/collectorHealth.test.ts failing with `no such table: collector_health` -- so the
   // two failures together say which edit was missed.
-  it("creates exactly the eleven tables 0001 through 0006 define", async () => {
+  // 0007 adds exactly the one notifications table (S-p1 below pins its shape).
+  it("creates exactly the twelve tables 0001 through 0007 define", async () => {
     // The filter is required: after the migration sqlite_master also holds D1's internal
     // _cf_METADATA and four sqlite_autoindex_* entries for the composite primary keys.
     const { results } = await database.db
@@ -86,6 +88,7 @@ describe("0001_initial_storage.sql", () => {
       "model_stats",
       "monitor_lock",
       "monitor_runs",
+      "notifications",
       "price_observations",
       "search_revisions",
       "search_settings",
@@ -122,6 +125,9 @@ describe("0001_initial_storage.sql", () => {
       "evaluation_tasks_attempt",
       "evaluation_tasks_queue",
       "evaluation_tasks_revision",
+      // 0007: the send loop's claim lookup, (status, next_attempt_at). The composite primary key
+      // makes an autoindex, invisible here by the `sql IS NOT NULL` rule.
+      "notifications_due",
       "price_observations_last_seen_at",
     ]);
   });
@@ -808,4 +814,122 @@ describe("0006_collector_health.sql", () => {
       await database.db.prepare("UPDATE collector_health SET alarms = '[]' WHERE id = 1").run();
     },
   );
+});
+
+/**
+ * Phase 4's additive migration. The same file-is-the-source-of-truth discipline: these assert the
+ * SCHEMA, not just behaviour, because a helper that supplies every column would hide a lost
+ * NOT NULL, CHECK or key.
+ */
+describe("0007_notifications.sql", () => {
+  /**
+   * S-p1. The columns, in order, with their nullability and defaults. Kills: dropping NOT NULL on
+   * `model_key` / `status` / `attempts` (a NULL status matches no state and the row is lost), and
+   * removing `DEFAULT 0` from `attempts`.
+   */
+  it("S-p1: carries exactly its fourteen columns, with the planned nullability", async () => {
+    const { results } = await database.db
+      .prepare("SELECT name, `notnull`, dflt_value, pk FROM pragma_table_info('notifications')")
+      .all<{ name: string; notnull: number; dflt_value: string | null; pk: number }>();
+
+    expect(results).toEqual([
+      { name: "source", notnull: 1, dflt_value: null, pk: 1 },
+      { name: "listing_id", notnull: 1, dflt_value: null, pk: 2 },
+      { name: "model_key", notnull: 1, dflt_value: null, pk: 0 },
+      { name: "status", notnull: 1, dflt_value: null, pk: 0 },
+      { name: "created_at", notnull: 1, dflt_value: null, pk: 0 },
+      { name: "updated_at", notnull: 1, dflt_value: null, pk: 0 },
+      { name: "attempts", notnull: 1, dflt_value: "0", pk: 0 },
+      { name: "next_attempt_at", notnull: 0, dflt_value: null, pk: 0 },
+      { name: "lease_token", notnull: 0, dflt_value: null, pk: 0 },
+      { name: "lease_expires_at", notnull: 0, dflt_value: null, pk: 0 },
+      { name: "last_attempt_at", notnull: 0, dflt_value: null, pk: 0 },
+      { name: "sent_price_cents", notnull: 0, dflt_value: null, pk: 0 },
+      { name: "sent_at", notnull: 0, dflt_value: null, pk: 0 },
+      { name: "last_error", notnull: 0, dflt_value: null, pk: 0 },
+    ]);
+  });
+
+  /** S-p2. THE CHECKS, EXHAUSTIVELY -- a presence pin, like S2b, S7b and S-n3. */
+  it("S-p2: declares exactly these three CHECK constraints, and no others", () => {
+    expect(extractChecks(splitSqlStatements(notificationsSql).join("\n"))).toEqual([
+      "status IN ('PENDING', 'SENDING', 'SENT', 'DELIVERY_UNKNOWN', 'FAILED', 'CANCELLED')",
+      "attempts >= 0",
+      "last_error IS NULL OR length(last_error) <= 200",
+    ]);
+  });
+
+  /**
+   * S-p3. THE TABLE HAS A ROWID. claimOne.ts and every fenced write address a row by `rowid`; on a
+   * WITHOUT ROWID table `SELECT rowid` is "no such column" and the whole send loop throws. Kills:
+   * adding `WITHOUT ROWID` to the CREATE TABLE.
+   */
+  it("S-p3: is a rowid table, not WITHOUT ROWID", async () => {
+    const list = await database.db
+      .prepare("SELECT wr FROM pragma_table_list WHERE name = 'notifications'")
+      .first<{ wr: number }>();
+    expect(list?.wr).toBe(0);
+    // And the claim's own use of it works against the applied table.
+    await expect(
+      database.db.prepare("SELECT rowid FROM notifications LIMIT 1").all(),
+    ).resolves.toBeDefined();
+  });
+
+  /**
+   * S-p4. THE CHECKS, BEHAVIOURALLY. Kills: deleting any one of the three CHECKs (S-p2 is only a
+   * presence pin) -- each of these inserts then succeeds.
+   */
+  it("S-p4: an unknown status, a negative attempt count and an oversized error are refused", async () => {
+    const insert = (status: string, attempts: number, lastError: string | null) =>
+      database.db
+        .prepare(
+          `INSERT INTO notifications (source, listing_id, model_key, status, created_at, updated_at,
+                                      attempts, last_error)
+           VALUES ('s-p4', ?1, 'm', ?2, 1, 1, ?3, ?4)`,
+        )
+        .bind(`id-${status}-${attempts}-${lastError?.length ?? 0}`, status, attempts, lastError)
+        .run();
+
+    await expect(insert("QUEUED", 0, null)).rejects.toThrow(/CHECK constraint failed/);
+    await expect(insert("PENDING", -1, null)).rejects.toThrow(/CHECK constraint failed/);
+    await expect(insert("PENDING", 0, "x".repeat(201))).rejects.toThrow(/CHECK constraint failed/);
+    // The control: the same insert at the boundary is accepted, so the refusals above are the
+    // CHECKs and not some other failure.
+    await insert("PENDING", 0, "x".repeat(200));
+    const left = await database.db
+      .prepare("SELECT COUNT(*) AS n FROM notifications WHERE source = 's-p4'")
+      .first<{ n: number }>();
+    expect(left?.n).toBe(1);
+    await database.db.prepare("DELETE FROM notifications WHERE source = 's-p4'").run();
+  });
+
+  /**
+   * S-p5. ONE ROW PER LISTING. Kills: dropping or narrowing the composite primary key -- a second
+   * row for the same listing is how a listing would be alerted twice.
+   */
+  it("S-p5: a second row for the same (source, listing_id) is refused", async () => {
+    const insert = () =>
+      database.db
+        .prepare(
+          `INSERT INTO notifications (source, listing_id, model_key, status, created_at, updated_at)
+           VALUES ('s-p5', 'same', 'm', 'SENT', 1, 1)`,
+        )
+        .run();
+    await insert();
+    await expect(insert()).rejects.toThrow(/UNIQUE constraint failed/);
+    await database.db.prepare("DELETE FROM notifications WHERE source = 's-p5'").run();
+  });
+
+  /** S-p6. The FILE: one CREATE TABLE, one CREATE INDEX, nothing destructive. */
+  it("S-p6: is one CREATE TABLE and one CREATE INDEX, and nothing destructive", () => {
+    const statements = splitSqlStatements(notificationsSql);
+
+    expect(statements).toHaveLength(2);
+    expect(statements[0]).toMatch(/^CREATE TABLE notifications /);
+    expect(statements[0]).not.toMatch(/WITHOUT\s+ROWID/i);
+    expect(statements[1]).toMatch(/^CREATE INDEX notifications_due ON notifications \(status, next_attempt_at\)$/);
+    for (const statement of statements) {
+      expect(statement).not.toMatch(/\b(DROP|ALTER|UPDATE|DELETE)\b/);
+    }
+  });
 });

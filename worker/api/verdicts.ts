@@ -183,9 +183,16 @@ const SELECT_VERDICTS_BODY = `SELECT l.source, l.listing_id, l.component_type, l
  * `case_fan`/`case_fans` translation; the wire carries catalog vocabulary and the handler
  * translates. Binding the catalog spelling makes case fans never appear.
  */
-const WHERE_SELECTION = ` WHERE l.component_type IN (SELECT value FROM json_each(?2))
-    OR (l.component_type || '/' || COALESCE(l.model_key, '')) IN (SELECT value FROM json_each(?3))`
-;
+export const SELECTION_PREDICATE = `l.component_type IN (SELECT value FROM json_each(?2))
+    OR (l.component_type || '/' || COALESCE(l.model_key, '')) IN (SELECT value FROM json_each(?3))`;
+
+/**
+ * EXPORTED FOR ONE OTHER CALLER: worker/notify/enqueue.ts binds the SAME predicate (same `?2` /
+ * `?3`, same storage ids) so an alert is never sent for a listing the dashboard would not show.
+ * The predicate is unparenthesised here so this statement stays byte-identical to the one that
+ * shipped; the notify statements wrap it in parentheses because they AND it with other terms.
+ */
+const WHERE_SELECTION = ` WHERE ${SELECTION_PREDICATE}`;
 
 const ORDER_AND_BOUND = ` ORDER BY CASE WHEN t.verdict IS NULL      THEN 2
                WHEN t.verdict = 'DEAL'     THEN 0

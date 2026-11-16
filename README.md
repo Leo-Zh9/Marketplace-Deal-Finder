@@ -201,6 +201,7 @@ one included — as deals.
 | `docs/phase-3e-monitoring.md` | the monitoring run, the lock, telemetry, the runbook |
 | `docs/phase-5a-settings-api.md` | the settings API contract |
 | `docs/collector-ingest.md` | the collector, the ingest route and its credential |
+| `docs/phase-4-notifications.md` | Discord deal alerts: the state machine, the failure table, the enable procedure |
 
 ---
 

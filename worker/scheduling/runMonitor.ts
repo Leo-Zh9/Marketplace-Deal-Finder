@@ -21,6 +21,9 @@
 
 import { evaluateBatch } from "../evaluation/evaluateBatch";
 import { EVALUATION_BATCH_SIZE, type EvaluationSettings } from "../evaluation/types";
+import type { NotifyEnvironment } from "../notify/config";
+import type { NotifyFetch } from "../notify/deliver";
+import { runNotify, type NotifyCounts } from "../notify/runNotify";
 import { loadCurrentSettings } from "../search/settings";
 import type { D1Usage } from "../storage/types";
 import { COLLECTION_STEPS, type CollectionStep } from "./collection";
@@ -61,6 +64,9 @@ export interface MonitorOptions {
   maxSources?: number;
   retentionRuns?: number;
   collectionSteps?: readonly CollectionStep[];
+  /** The notify step's HTTP client. Production uses the global `fetch`. */
+  notifyFetch?: NotifyFetch;
+  notifyTimeoutMs?: number;
 }
 
 export type MonitorStatus = "OK" | "SKIPPED_LOCKED" | "NO_SETTINGS" | "LOCK_LOST" | "DEGRADED";
@@ -270,7 +276,16 @@ export interface MonitorRun {
   stepFailures: number;
   usage: D1Usage;
   errors: string[];
+  /**
+   * The notify step's counts, or null when the step did not run (an early return, LOCK_LOST, or
+   * a notify failure). Instance output only: monitor_runs has no column for it, and the one
+   * counts line the step logs is the durable trace (`wrangler tail`).
+   */
+  notify: NotifyCounts | null;
 }
+
+/** `fetch` called through a closure: an unbound reference to the global throws in workerd. */
+const globalFetch: NotifyFetch = (input, init) => fetch(input, init);
 
 /**
  * How far ahead of the real clock a `now` may be before it is refused. A day covers clock skew
@@ -296,6 +311,7 @@ export const runMonitor = async (
   params: MonitorParams,
   runId: string,
   options: MonitorOptions = {},
+  notifyEnvironment: NotifyEnvironment = {},
 ): Promise<MonitorRun> => {
   // POSITIONAL, not a payload field and not an option: `runId` is `event.instanceId`, which is
   // stable across replays and step retries and is not forgeable from a hand-written payload.
@@ -367,6 +383,7 @@ export const runMonitor = async (
     stepFailures: 0,
     usage: { rowsRead: 0, rowsWritten: 0 },
     errors: [],
+    notify: null,
   };
 
   const escalate = (next: MonitorStatus): void => {
@@ -646,6 +663,32 @@ export const runMonitor = async (
     run.undrainedSources = run.sources.filter((source) => !drained.has(source));
   }
 
-  // 6-7. FINALIZE AND RELEASE, in one db.batch.
+  // 6. NOTIFY. After the drain, so a deal judged in this run can alert in this run. Skipped when
+  //    the lock was lost: the run that holds it will notify. A DEGRADED drain still notifies --
+  //    deals judged earlier deserve delivery -- and a notify failure degrades the run without
+  //    touching anything the drain did.
+  //
+  //    Retry-safe without the lock: see worker/notify/runNotify.ts. Every row is claimed before
+  //    its fetch and `params.now` is frozen, so the step's one retry cannot claim or sweep a row
+  //    the first execution left SENDING. In the inert states the body makes no D1 query at all.
+  if (run.status !== "LOCK_LOST") {
+    try {
+      run.notify = await runStep("notify", async () =>
+        runNotify(db, {
+          environment: notifyEnvironment,
+          now: params.now,
+          fetch: options.notifyFetch ?? globalFetch,
+          leaseTokenPrefix: `${runId}:notify`,
+          timeoutMs: options.notifyTimeoutMs,
+        }),
+      );
+    } catch (error) {
+      run.stepFailures += 1;
+      recordError(`notify: ${String(error)}`);
+      escalate("DEGRADED");
+    }
+  }
+
+  // 7-8. FINALIZE AND RELEASE, in one db.batch.
   return finalize();
 };
