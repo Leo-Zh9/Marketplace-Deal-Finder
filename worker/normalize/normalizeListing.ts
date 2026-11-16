@@ -347,10 +347,26 @@ const ACCESSORY_OWN_WORDS: Partial<Record<Listing["componentType"], readonly str
  */
 const OPEN_BOX: readonly [string, string] = ["open", "box"];
 
-const accessoryPhraseIn = (values: readonly string[], phrase: string): boolean =>
-  phraseSpans(values, phraseTokens(phrase)).some(
-    ([from]) => !(phrase === OPEN_BOX[1] && values[from - 1] === OPEN_BOX[0]),
-  );
+/**
+ * ACCESSORY, indexed by each phrase's FIRST token, so rule 3b -- which now runs on every listing,
+ * not only a resolving one -- is one allocation-free pass over the title rather than a span scan
+ * per phrase. Built once per isolate from `phraseTokens`, so a phrase means exactly what
+ * `containsPhrase` would make of it.
+ */
+const ACCESSORY_BY_FIRST_TOKEN = new Map<string, { phrase: string; tokens: readonly string[] }[]>();
+for (const phrase of ACCESSORY) {
+  const tokens = phraseTokens(phrase);
+  const entries = ACCESSORY_BY_FIRST_TOKEN.get(tokens[0]) ?? [];
+  entries.push({ phrase, tokens });
+  ACCESSORY_BY_FIRST_TOKEN.set(tokens[0], entries);
+}
+
+const tokensAt = (values: readonly string[], from: number, tokens: readonly string[]): boolean => {
+  for (let offset = 1; offset < tokens.length; offset += 1) {
+    if (values[from + offset] !== tokens[offset]) return false;
+  }
+  return true;
+};
 
 const DIGITS = /^[0-9]+$/;
 const LETTERS = /^[a-z]+$/;
@@ -604,12 +620,19 @@ export const accessoryEvidence = (
   evidenced: readonly Listing["componentType"][],
   spansByType: Readonly<Record<Listing["componentType"], readonly ModelSpan[]>>,
 ): boolean => {
-  const exempt = new Set(evidenced.flatMap((type) => ACCESSORY_OWN_WORDS[type] ?? []));
-  return (
-    ACCESSORY.some((phrase) => !exempt.has(phrase) && accessoryPhraseIn(values, phrase)) ||
-    COMPONENT_TYPES.some((type) =>
-      spansByType[type].some((span) => span.start > 0 && values[span.start - 1] === "for"),
-    )
+  for (let index = 0; index < values.length; index += 1) {
+    const entries = ACCESSORY_BY_FIRST_TOKEN.get(values[index]);
+    if (entries === undefined) continue;
+    for (const { phrase, tokens } of entries) {
+      if (!tokensAt(values, index, tokens)) continue;
+      if (phrase === OPEN_BOX[1] && values[index - 1] === OPEN_BOX[0]) continue;
+      if (evidenced.some((type) => ACCESSORY_OWN_WORDS[type]?.includes(phrase))) continue;
+      return true;
+    }
+  }
+  if (!values.includes("for")) return false;
+  return COMPONENT_TYPES.some((type) =>
+    spansByType[type].some((span) => span.start > 0 && values[span.start - 1] === "for"),
   );
 };
 
