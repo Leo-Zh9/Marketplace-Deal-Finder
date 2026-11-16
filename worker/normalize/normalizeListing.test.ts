@@ -9,7 +9,9 @@
  *
  * FIXTURE CORRELATION. No two parameters that reach the code under test share a value: every
  * title below is distinct EXCEPT TR-r1 and TR-r5, which are T15r's and T36g's live titles under
- * another type's search because the same listing reaching two searches is their subject; every `priceCents` is distinct EXCEPT the
+ * another type's search because the same listing reaching two searches is their subject, and the
+ * ACCESSORY_EVERYWHERE / ACCESSORY_EXEMPT_EVERYWHERE rows, each run under all nine searches for
+ * the same reason; every `priceCents` is distinct EXCEPT the
  * three cases where `0` is the subject, no price is 0, 1 or 100 other than those, and the
  * declared type spans all nine. So no assertion here can pass because the rule is hardwired to
  * one component type or because a price happened to equal a constant.
@@ -190,9 +192,20 @@ const CASES: Case[] = [
  * the corpus they were measured from is the thing that keeps them honest.
  */
 const ACCEPTED_EXPOSURE: Case[] = [
-  // THE SAME-TYPE ACCESSORY HOLE, PRE-EXISTING AND KEPT: the accessory refusal is cross-type only
-  // (see ACCESSORY), so a bracket found by a gpu search still pools into the card it fits.
-  ["AX-r: an accessory found by its own part's search still matches", "GPU support bracket RTX 4090", 4100, "gpu", "VALID", "GeForce RTX 4090", "matched"],
+  // THE ACCEPTED LOSSES OF RULE 3B UNDER EVERY SEARCH, by phrase: real parts whose title carries
+  // an accessory word, each found by its OWN search and refused there. Lost references, never
+  // wrong ones. No own-words for psu, cooler or case: each would reopen a wrong key (`"Noctua
+  // NH-D15 fan"` is a replacement fan, `"Corsair RM850x cable kit"` is cables). An exemption needs
+  // the production replay to measure real parts lost to that exact phrase; see ACCESSORY.
+  ["AX-c: a psu that comes with its cables, from a psu search", "Corsair RM850x Shift power supply with all cables", 18100, "psu", "NEEDS_REVIEW", null, "accessory"],
+  ["AL1: a cooler sold with its fans, from a cooler search", "Noctua NH-D15 with 2 fans", 13300, "cpu_cooler", "NEEDS_REVIEW", null, "accessory"],
+  ["AL2: a card sold with its backplate, from a gpu search", "GeForce RTX 3080 with backplate", 61300, "gpu", "NEEDS_REVIEW", null, "accessory"],
+  ["AL3: a card sold new in box, from a gpu search", "GeForce RTX 4090 new in box", 241300, "gpu", "NEEDS_REVIEW", null, "accessory"],
+  // THE ONE PRE-NAMED EXEMPTION CANDIDATE, fan-count descriptors. If it ever ships, it must come
+  // with rows keeping `"RTX 3080 triple fan shroud"` and `"RTX 3080 triple fan replacement"`
+  // refused -- see docs/collector-ingest.md.
+  ["AL4: a triple-fan card, from a gpu search", "GeForce RTX 3080 triple fan", 61700, "gpu", "NEEDS_REVIEW", null, "accessory"],
+  ["AL5: a dual-fan card, from a gpu search", "GeForce RTX 3070 dual fan", 41300, "gpu", "NEEDS_REVIEW", null, "accessory"],
   ["T36a: a year-suffixed revision pools into the base model", "Corsair RM850x 2021 power supply", 17900, "psu", "VALID", "Corsair RM850x", "matched"],
   ["T36b: a laptop with every detector stripped reads as a GPU", "MINT custom x17 R2 Flagship Ecosystem - RTX 5080 (16GB)", 350000, "gpu", "VALID", "GeForce RTX 5080", "matched"],
   // F2's remainder, pinned rather than left to be discovered. Both are the INFLATING direction.
@@ -276,34 +289,65 @@ const TYPE_RESOLUTION: Case[] = [
 ];
 
 /**
- * AN ACCESSORY IS NOT MOVED. Each title is what an accessory search returns: it names the part it
- * fits, so it evidences exactly one type with a catalog model, and the type resolution alone
- * would store it as a VALID reference for that part -- a CA$15-90 observation in the model's
- * mean, and once 5 references exist the accessory itself a DEAL. Refused `accessory` under the
- * search's type instead. The TR-r rows above are the controls: real parts found by a foreign
- * search still move.
+ * AN ACCESSORY IS REFUSED UNDER EVERY SEARCH. Each title is what an accessory search returns: it
+ * names the part it fits, so the type resolution alone would store it as a VALID reference for
+ * that part -- a CA$15-90 observation in the model's mean, and once 5 references exist the
+ * accessory itself a DEAL. Each row is asserted under ALL NINE searches, and each must come back
+ * `NEEDS_REVIEW` / `accessory` / no key, stored under the search's type. That one assertion is
+ * also the proof of no search-dependence: the same title gets the same verdict wherever it was
+ * found, which is what closes the PR #21 flip.
+ *
+ * The literal type list is this file's rule for vocabularies: a list derived from the production
+ * table cannot see a type go missing from it.
  */
-const ACCESSORY_CROSS_TYPE: Case[] = [
-  ["AX1: a power cable from a psu search", "12VHPWR cable for RTX 4090", 3300, "psu", "NEEDS_REVIEW", null, "accessory"],
-  ["AX2: a waterblock from a cooler search", "EK waterblock for RTX 3080", 2900, "cpu_cooler", "NEEDS_REVIEW", null, "accessory"],
-  ["AX3: a mounting bracket from a cooler search", "AM4 mounting bracket for Ryzen 5 5600X", 1900, "cpu_cooler", "NEEDS_REVIEW", null, "accessory"],
-  ["AX4: a replacement fan from a case-fan search", "Replacement fan for RTX 3070", 2300, "case_fan", "NEEDS_REVIEW", null, "accessory"],
-  ["AX5: a riser mount from a case search", "Vertical GPU mount riser fits RTX 4090", 4700, "case", "NEEDS_REVIEW", null, "accessory"],
-  ["AX6: thermal pads from a cpu search", "Thermal pads for RTX 3080", 1700, "cpu", "NEEDS_REVIEW", null, "accessory"],
-  ["AX7: a backplate from a cpu search", "RTX 3080 backplate", 3100, "cpu", "NEEDS_REVIEW", null, "accessory"],
-  // Review round 2: six more, each outside the first list.
-  ["AX8: a cooler fan from a case-fan search", "RTX 3080 FE fan replacement", 2700, "case_fan", "NEEDS_REVIEW", null, "accessory"],
-  ["AX9: replacement fans from a case-fan search", "RTX 3070 replacement fans", 2600, "case_fan", "NEEDS_REVIEW", null, "accessory"],
-  ["AX10: an empty box from a case search", "RTX 4090 Founders Edition empty box", 1600, "case", "NEEDS_REVIEW", null, "accessory"],
-  ["AX11: a box from a psu search", "RTX 4090 box only", 1400, "psu", "NEEDS_REVIEW", null, "accessory"],
-  ["AX12: a cpu box from a cooler search", "Ryzen 7 5800X3D box", 1200, "cpu_cooler", "NEEDS_REVIEW", null, "accessory"],
-  ["AX13: a gpu holder from a case search", "RTX 4090 vertical GPU holder", 2800, "case", "NEEDS_REVIEW", null, "accessory"],
-  // THE CONTROL FOR THE SCOPE: same-type copy naming an accessory word is NOT refused. Applying
-  // the refusal under every type goes red here.
-  // THE CONTROL FOR THE OWN-WORD EXEMPTION: a real case fan from a gpu search still moves to
-  // case_fan, although `fan` is an accessory word everywhere else.
-  ["AX-f: a catalogued case fan from a gpu search", "Lian Li UNI FAN SL120 V2", 2400, "gpu", "VALID", "Lian Li UNI FAN SL120 V2", "matched", "case_fan"],
-  ["AX-c: a psu that comes with its cables, from a psu search", "Corsair RM850x Shift power supply with all cables", 18100, "psu", "VALID", "Corsair RM850x Shift", "matched"],
+const NINE_SEARCHES: Listing["componentType"][] = [
+  "cpu", "cpu_cooler", "motherboard", "ram", "storage", "gpu", "psu", "case", "case_fan",
+];
+
+const ACCESSORY_EVERYWHERE: [name: string, title: string, priceCents: number][] = [
+  ["AX1: a power cable", "12VHPWR cable for RTX 4090", 3300],
+  ["AX2: a waterblock", "EK waterblock for RTX 3080", 2900],
+  ["AX3: a mounting bracket", "AM4 mounting bracket for Ryzen 5 5600X", 1900],
+  ["AX4: a replacement fan", "Replacement fan for RTX 3070", 2300],
+  ["AX5: a riser mount", "Vertical GPU mount riser fits RTX 4090", 4700],
+  ["AX6: thermal pads", "Thermal pads for RTX 3080", 1700],
+  ["AX7: a backplate", "RTX 3080 backplate", 3100],
+  ["AX8: a cooler fan", "RTX 3080 FE fan replacement", 2700],
+  ["AX9: replacement fans", "RTX 3070 replacement fans", 2600],
+  ["AX10: an empty box", "RTX 4090 Founders Edition empty box", 1600],
+  ["AX11: a box", "RTX 4090 box only", 1400],
+  ["AX12: a cpu box", "Ryzen 7 5800X3D box", 1200],
+  ["AX13: a gpu holder", "RTX 4090 vertical GPU holder", 2800],
+  // THE SAME-TYPE HOLE, CLOSED: under PR #21 this was a VALID RTX 4090 from a gpu search.
+  ["AX-r: a bracket that names its card", "GPU support bracket RTX 4090", 4100],
+  // NO INCLUSION-CLAUSE GRAMMAR: an EK Quantum Vector IS a waterblock, though it names none.
+  // An exemption for what follows `with` / `w/` would key it as an RTX 3080.
+  ["AX-w1: a waterblock, `w/` its backplate", "EK Quantum Vector RTX 3080 w/ backplate", 9300],
+  ["AX-w2: a waterblock, `with` its backplate", "EK Quantum Vector RTX 3080 with backplate", 9400],
+  // `box` IS NEVER EXEMPT: an original box is an empty-box sale.
+  ["AX-b: an original box", "RTX 4090 original box", 2100],
+  // THE FAN EXEMPTION IS KEYED ON THE TITLE: none of these evidences case_fan except the last,
+  // which also evidences gpu and is still an accessory. Keyed on the search, the case_fan rows
+  // of the third would come back a VALID RTX 3080.
+  ["AX-g1: a gpu replacement fan", "RTX 3080 replacement fan 92mm", 2200],
+  ["AX-g2: a gpu fan for a named card", "GPU fan PWM 4pin replacement for RTX 3070", 2450],
+  ["AX-g3: a gpu cooler fan with no other accessory word", "RTX 3080 FE fan", 2550],
+  ["AX-g4: a case fan sold for a named card's build", "Arctic P12 PWM case fan for RTX 4090 build", 2000],
+];
+
+/**
+ * THE TWO EXEMPTIONS, AND ONLY THESE, under all nine searches. A catalogued case fan carries the
+ * word `fan` in its own name, and the title evidences case_fan (not the search), so it resolves
+ * to case_fan from every search. `open box` is a sale condition, not a box.
+ */
+const ACCESSORY_EXEMPT_EVERYWHERE: [name: string, title: string, priceCents: number, type: Listing["componentType"], modelKey: string][] = [
+  ["AX-f: a catalogued case fan", "Lian Li UNI FAN SL120 V2", 2400, "case_fan", "Lian Li UNI FAN SL120 V2"],
+  ["AX-o: an open-box card", "GeForce RTX 5080 open box", 129300, "gpu", "GeForce RTX 5080"],
+];
+
+const ACCESSORY_LIVE: Case[] = [
+  // The one live open-box title, under the one search that returned it.
+  ["AX-o live: an uncatalogued board sold open box", "ASUS PRIME Z270-A ATX Motherboard \u2013 New, Never Used, Open Box", 12500, "motherboard", "VALID", null, "model-unmatched"],
 ];
 
 const assertCase = ([, title, priceCents, componentType, validity, modelKey, reason, resolved]: Case): void => {
@@ -333,8 +377,48 @@ describe("normalizeListing -- the classification rules", () => {
     assertCase(testCase);
   });
 
-  it.each(ACCESSORY_CROSS_TYPE)("%s", (...testCase) => {
+  it.each(ACCESSORY_LIVE)("%s", (...testCase) => {
     assertCase(testCase);
+  });
+
+  it.each(ACCESSORY_EVERYWHERE.flatMap(([name, title, priceCents]) =>
+    NINE_SEARCHES.map((searched) => [`${name} [${searched}]`, title, priceCents, searched] as const),
+  ))("%s is refused", (_name, title, priceCents, searched) => {
+    expect(normalizeListing({ title, priceCents, componentType: searched })).toEqual({
+      componentType: searched,
+      modelKey: null,
+      variantKey: null,
+      validity: "NEEDS_REVIEW",
+      reason: "accessory",
+    });
+  });
+
+  it.each(ACCESSORY_EXEMPT_EVERYWHERE.flatMap(([name, title, priceCents, type, modelKey]) =>
+    NINE_SEARCHES.map((searched) => [`${name} [${searched}]`, title, priceCents, searched, type, modelKey] as const),
+  ))("%s is a match", (_name, title, priceCents, searched, type, modelKey) => {
+    expect(normalizeListing({ title, priceCents, componentType: searched })).toEqual({
+      componentType: type,
+      modelKey,
+      variantKey: null,
+      validity: "VALID",
+      reason: "matched",
+    });
+  });
+
+  /**
+   * AX-s: NO SEARCH-DEPENDENCE, stated as the property rather than as nine rows. A real card with
+   * an accessory word was VALID under its own search and `accessory` under a foreign one, and
+   * every re-sighting flipped its price contribution. Now validity, reason and key are one value.
+   */
+  it("AX-s: one accessory title gets one verdict under all nine searches", () => {
+    expect(NINE_SEARCHES).toHaveLength(9);
+    const verdicts = new Set(
+      NINE_SEARCHES.map((componentType) => {
+        const result = normalizeListing({ title: "RTX 3080 with backplate", priceCents: 61900, componentType });
+        return `${result.validity} ${result.reason} ${result.modelKey}`;
+      }),
+    );
+    expect([...verdicts]).toEqual(["NEEDS_REVIEW accessory null"]);
   });
 });
 
@@ -502,25 +586,30 @@ describe("normalizeListing -- every vocabulary element, one at a time", () => {
   });
 
   /**
-   * T21f: ACCESSORY, element by element, in the frame where the type resolution would otherwise
-   * fire: a catalog GPU under a cpu search. Literal copy, per this block's rule.
+   * T21f: ACCESSORY, element by element, in both frames: a catalog GPU under a cpu search (where
+   * the type resolution would otherwise move it) and under its OWN gpu search (the same-type hole
+   * PR #21 left open). Literal copy, per this block's rule.
    */
   it.each([
     ["cable"], ["cables"], ["adapter"], ["bracket"], ["waterblock"], ["water block"],
     ["backplate"], ["riser"], ["mount"], ["mounting"], ["shroud"], ["thermal pad"],
     ["thermal pads"], ["fan"], ["fans"], ["replacement"], ["box"], ["holder"], ["stand"],
     ["support"],
-  ])("T21f: %s keeps a cross-type listing out of the resolution", (phrase) => {
+  ].flatMap(([phrase]) => (["cpu", "gpu"] as const).map((searched) => [phrase, searched] as const)))(
+    "T21f: %s is an accessory under a %s search",
+    (phrase, searched) => {
+      expect(
+        normalizeListing({ title: `GeForce RTX 5080 ${phrase}`, priceCents: 39100, componentType: searched }),
+      ).toEqual({ componentType: searched, modelKey: null, variantKey: null, validity: "NEEDS_REVIEW", reason: "accessory" });
+    },
+  );
+
+  it.each([["cpu"], ["gpu"]] as const)("T21f: `for` directly before the model reads as an accessory under a %s search", (searched) => {
     expect(
-      normalizeListing({ title: `GeForce RTX 5080 ${phrase}`, priceCents: 39100, componentType: "cpu" }),
-    ).toEqual({ componentType: "cpu", modelKey: null, variantKey: null, validity: "NEEDS_REVIEW", reason: "accessory" });
+      normalizeListing({ title: "Cover for GeForce RTX 5080", priceCents: 39200, componentType: searched }),
+    ).toEqual({ componentType: searched, modelKey: null, variantKey: null, validity: "NEEDS_REVIEW", reason: "accessory" });
   });
 
-  it("T21f: `for` directly before the model reads as an accessory", () => {
-    expect(
-      normalizeListing({ title: "Cover for GeForce RTX 5080", priceCents: 39200, componentType: "cpu" }),
-    ).toEqual({ componentType: "cpu", modelKey: null, variantKey: null, validity: "NEEDS_REVIEW", reason: "accessory" });
-  });
 
   it("T21f control: a bare `for` elsewhere does not -- the card still moves to gpu", () => {
     expect(
@@ -696,13 +785,12 @@ const FREE_PHRASINGS: [string, "usable" | "refused"][] = [
   ["GeForce RTX 5080, free to a good home", "refused"],
   // THE NAMED COST: a real free item with anything between `free` and the item.
   ["Free to a good home GeForce RTX 5080", "refused"],
-  // THE FREE-ACCESSORY FAMILY, BOUNDED RATHER THAN CODED AROUND. When the free thing is an
-  // accessory whose own word is a marker of the declared type, the predicate reads it as the
-  // item. Both are VALID with a model key at CA$0 -- no benchmark impact, because
-  // `recordSightings` requires `priceCents > 0`; the cost is a spurious DEAL under MAXIMUM_PRICE,
-  // which is the square the evaluation table already documents and accepts. Rows, not a fix.
-  ["Free graphics card box with GeForce RTX 5080", "usable"],
-  ["Free gpu support bracket with GeForce RTX 5080", "usable"],
+  // THE FREE-ACCESSORY FAMILY, CLOSED BY RULE 3B UNDER EVERY SEARCH. Rule 8 reads the free thing
+  // as the item when its own word is a marker of the declared type; both were VALID with a model
+  // key at CA$0 (a spurious DEAL under MAXIMUM_PRICE) while the accessory refusal was cross-type
+  // only. `box` and `support` / `bracket` now refuse them before rule 8 runs.
+  ["Free graphics card box with GeForce RTX 5080", "refused"],
+  ["Free gpu support bracket with GeForce RTX 5080", "refused"],
 ];
 
 /**
@@ -926,8 +1014,8 @@ describe("normalizeListing -- the measured cost and the measured residual", () =
       const actual = result.validity === "VALID" && result.modelKey !== null ? "usable" : "refused";
       expect(actual, title).toBe(expected);
     }
-    // Not satisfiable by refusing everything: ten rows must still come back with a model key.
-    expect(FREE_PHRASINGS.filter(([, e]) => e === "usable")).toHaveLength(10);
+    // Not satisfiable by refusing everything: eight rows must still come back with a model key.
+    expect(FREE_PHRASINGS.filter(([, e]) => e === "usable")).toHaveLength(8);
   });
 
   /**
@@ -1056,9 +1144,10 @@ describe("normalizeListing -- properties of the vocabularies", () => {
         "WHOLE_UNIT:pc < SYSTEM_PHRASES:desktop pc",
         "WHOLE_UNIT:pc < SYSTEM_PHRASES:mini pc",
         "WHOLE_UNIT:tower < MARKERS.case:tower case",
-        // HARMLESS BY CONSTRUCTION: ACCESSORY is consulted only on a cross-type resolution, and
-        // `fan`/`fans` are exempt when that resolution is to case_fan (ACCESSORY_OWN_WORDS) --
-        // the only type these markers evidence. AX-f is the row that goes red without it.
+        // HARMLESS BY CONSTRUCTION: `fan`/`fans` are exempt whenever the title evidences case_fan
+        // (ACCESSORY_OWN_WORDS), and each of these markers evidences case_fan by itself, so a
+        // title containing one never counts its fan word as an accessory. AX-f is the row that
+        // goes red without the exemption.
         "ACCESSORY:fan < MARKERS.case_fan:case fan",
         "ACCESSORY:fan < MARKERS.case_fan:fan pack",
         "ACCESSORY:fans < MARKERS.case_fan:case fans",

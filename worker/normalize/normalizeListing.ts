@@ -20,12 +20,12 @@ import {
   MAX_TOKENS,
   MODEL_INDEXES,
   containsPhrase,
-  matchCatalogModels,
   matchCatalogSpans,
   phraseSpans,
   phraseTokens,
   tokenValues,
   tokenize,
+  type ModelSpan,
   type Token,
 } from "./catalogIndex";
 
@@ -268,34 +268,37 @@ export const MULTIPLE = [
 export const MULTI_UNIT = new Set(["pack"]);
 
 /**
- * THINGS SOLD FOR A COMPONENT RATHER THAN AS ONE, consulted ONLY when the type resolution would
- * move a listing away from the search's type -- see `accessoryEvidence`.
+ * THINGS SOLD FOR A COMPONENT RATHER THAN AS ONE. A title carrying one of these, or `for`
+ * directly before a catalog model, is refused `accessory` under EVERY search -- see
+ * `accessoryEvidence`.
  *
  * WHY IT EXISTS. An accessory search returns accessories that NAME the part they fit:
  * `"12VHPWR cable for RTX 4090"` under a psu search evidences one type (gpu) with a catalog
- * model, so the resolution would store a CA$40 cable as a VALID GeForce RTX 4090 reference --
- * pulling that model's mean down until the cable itself read as a DEAL. MEASURED on review:
- * a cable, a waterblock, a mounting bracket, a replacement fan, a riser mount, thermal pads and a
- * backplate, each from the matching accessory search, all resolved VALID with a model.
+ * model, so the type resolution would store a CA$40 cable as a VALID GeForce RTX 4090 reference
+ * -- pulling that model's mean down until the cable itself read as a DEAL. There is no outlier
+ * trim: one CA$20 box among five CA$2,000 references moves the mean about 16%.
  *
- * SCOPED TO THE CROSS-TYPE CASE ON PURPOSE. Applied under every type it would refuse ordinary
- * same-type copy -- a PSU "with all cables", a card "with support bracket". THE SAME-TYPE HOLE IS
- * PRE-EXISTING AND STAYS, NAMED: `"GPU support bracket RTX 4090"` under a gpu search is still a
- * VALID RTX 4090 (pinned in ACCEPTED_EXPOSURE), for the corpus work that follows. AND THE SCOPE
- * LEAVES A FLIP: a REAL part with an accessory word (`"RTX 3080 with backplate"`) is VALID under
- * its own search and `accessory` under a foreign one -- a strict subset of what flipped before,
- * never a wrong price. docs/collector-ingest.md names both and the Part 2 fix for both.
+ * WHY EVERY SEARCH, NOT ONLY A CROSS-TYPE RESOLUTION (PR #21 scoped it there). The scope left
+ * two defects. THE SAME-TYPE HOLE: `"GPU support bracket RTX 4090"` from a gpu search was a VALID
+ * RTX 4090. THE FLIP: a real part with an accessory word (`"RTX 3080 with backplate"`) was VALID
+ * under its own search and `accessory` under a foreign one, so each re-sighting removed, then
+ * restored, its price contribution. As a property of the title alone, validity cannot depend on
+ * which search found the listing, so the flip is gone by construction rather than by a test.
+ *
+ * THE COST, NAMED AND ACCEPTED: real parts whose title carries one of these words are now refused
+ * under every search -- `"Corsair RM850x Shift power supply with all cables"`, `"Noctua NH-D15
+ * with 2 fans"`, GPUs sold `"with backplate"`, `"new in box"`, `"triple fan"` / `"dual fan"`.
+ * Lost references, never wrong ones; pinned in ACCEPTED_EXPOSURE. An exemption is added only
+ * when the production replay measures real parts lost to that exact phrase -- and NEVER for
+ * `box`, `backplate`, `waterblock` or `cable`, whose same-title readings are an empty-box sale
+ * (`"RTX 4090 original box"`) and a waterblock (`"EK Quantum Vector RTX 3080 w/ backplate"`).
+ * There is no `with` / `w/` / `includes` grammar for the same reason.
  *
  * NO BARE `for`: `"for sale"` is everywhere. The `X for <model>` shape is caught positionally
- * instead -- `for` immediately before a matched catalog model -- in `accessoryEvidence`.
+ * instead -- `for` immediately before a matched catalog model of any type.
  *
- * THE SECOND ROUND OF WORDS (`fan`, `fans`, `replacement`, `box`, `holder`, `stand`, `support`)
- * came from review: `"RTX 3080 FE fan replacement"` from a case-fan search, `"RTX 4090 box only"`
- * from a psu search and `"RTX 4090 vertical GPU holder"` from a case search all resolved VALID
- * with a model. THE TRADE IS DELIBERATE: this list runs only on a cross-type resolution, where a
- * false refusal costs a NEEDS_REVIEW (a lost reference) and a missed accessory writes a wrong
- * price. `empty box` and the earlier `fan for` are NOT listed because `box` and `fan` cover them,
- * and a phrase no mutation can kill is deleted here, not kept.
+ * `empty box` and `fan for` are NOT listed because `box` and `fan` cover them, and a phrase no
+ * mutation can kill is deleted here, not kept.
  */
 export const ACCESSORY = [
   "cable",
@@ -321,13 +324,33 @@ export const ACCESSORY = [
 ];
 
 /**
- * ACCESSORY WORDS THAT ARE THE PRODUCT ITSELF for one type: a case fan IS a fan. Without this a
- * real fan found by another type's search could never move to case_fan -- and five catalog names
- * carry the word (`Lian Li UNI FAN SL120 V2`, ...), so T12 goes red, 40 cross-type pairs short.
+ * ACCESSORY WORDS THAT ARE THE PRODUCT ITSELF for one type: a case fan IS a fan. Five catalog
+ * names carry the word (`Lian Li UNI FAN SL120 V2`, ...), so without this T11 goes red.
+ *
+ * THE EXEMPTION IS KEYED ON THE TITLE, NOT ON THE SEARCH: it applies when the title itself
+ * evidences case_fan (a marker or a catalog model). Keyed on the search it would both refuse the
+ * Lian Li fan from a gpu search and admit `"RTX 3080 FE fan"` -- a cooler fan that evidences only
+ * gpu -- as a VALID RTX 3080 from a case_fan search. When the title evidences case_fan AND
+ * another type, rule 5 refuses it anyway, so the exemption can only ever let a pure fan through.
+ *
+ * NONE FOR COOLERS, CASES OR PSUs, deliberately: each reopens a wrong key -- `"Noctua NH-D15 fan"`
+ * is a replacement fan, `"Corsair RM850x cable kit"` is cables.
  */
 const ACCESSORY_OWN_WORDS: Partial<Record<Listing["componentType"], readonly string[]>> = {
   case_fan: ["fan", "fans"],
 };
+
+/**
+ * `open box` IS A SALE CONDITION, NOT A BOX: `"ASUS PRIME Z270-A ATX Motherboard - New, Never
+ * Used, Open Box"` is the live case. The only phrase-level exemption; `box` anywhere else still
+ * counts, so `"RTX 4090 open box with original box"` is refused.
+ */
+const OPEN_BOX: readonly [string, string] = ["open", "box"];
+
+const accessoryPhraseIn = (values: readonly string[], phrase: string): boolean =>
+  phraseSpans(values, phraseTokens(phrase)).some(
+    ([from]) => !(phrase === OPEN_BOX[1] && values[from - 1] === OPEN_BOX[0]),
+  );
 
 const DIGITS = /^[0-9]+$/;
 const LETTERS = /^[a-z]+$/;
@@ -571,22 +594,24 @@ export const freeItemEvidence = (
 };
 
 /**
- * True when the title reads as something sold FOR a `type` part: an ACCESSORY phrase, or `for`
- * directly before a matched catalog model of that type (`"... for RTX 4090"`,
- * `"... for Ryzen 5 5600X"`). Called only for a resolution that would change the type.
+ * True when the title reads as something sold FOR a part: an ACCESSORY phrase not exempted by a
+ * type the title itself evidences, or `for` directly before a matched catalog model of any type
+ * (`"... for RTX 4090"`, `"... for Ryzen 5 5600X"`). A property of the title alone -- the search's
+ * type is not an input, which is what makes the result the same under every search.
  */
 export const accessoryEvidence = (
   values: readonly string[],
-  tokens: readonly Token[],
-  type: Listing["componentType"],
-): boolean =>
-  containsAnyPhrase(
-    values,
-    ACCESSORY.filter((phrase) => !(ACCESSORY_OWN_WORDS[type] ?? []).includes(phrase)),
-  ) ||
-  matchCatalogSpans(MODEL_INDEXES[type], tokens).some(
-    (span) => span.start > 0 && values[span.start - 1] === "for",
+  evidenced: readonly Listing["componentType"][],
+  spansByType: Readonly<Record<Listing["componentType"], readonly ModelSpan[]>>,
+): boolean => {
+  const exempt = new Set(evidenced.flatMap((type) => ACCESSORY_OWN_WORDS[type] ?? []));
+  return (
+    ACCESSORY.some((phrase) => !exempt.has(phrase) && accessoryPhraseIn(values, phrase)) ||
+    COMPONENT_TYPES.some((type) =>
+      spansByType[type].some((span) => span.start > 0 && values[span.start - 1] === "for"),
+    )
   );
+};
 
 export const systemEvidence = (
   values: readonly string[],
@@ -642,11 +667,14 @@ export const normalizeListing = (input: {
   }
 
   const values = tokenValues(tokens);
-  // One walk per index, shared by the evidence scan, the resolution and rules 6/9-11. (Rule 4's
-  // marker coverage and rule 8 still walk the resolved type's spans themselves, as before.)
+  // One walk per index, shared by the evidence scan, rule 3b's `for <model>`, the resolution and
+  // rules 6/9-11. (Rule 4's marker coverage and rule 8 still walk the resolved type's spans
+  // themselves, as before.) `models` is `matchCatalogModels`, derived from the same spans.
+  const spansByType = {} as Record<Listing["componentType"], ModelSpan[]>;
   const modelsByType = {} as Record<Listing["componentType"], string[]>;
   for (const type of COMPONENT_TYPES) {
-    modelsByType[type] = matchCatalogModels(MODEL_INDEXES[type], tokens);
+    spansByType[type] = matchCatalogSpans(MODEL_INDEXES[type], tokens);
+    modelsByType[type] = [...new Set(spansByType[type].map((span) => span.model))];
   }
   const evidenced = COMPONENT_TYPES.filter(
     (type) => containsAnyPhrase(values, MARKERS[type]) || modelsByType[type].length > 0,
@@ -678,18 +706,19 @@ export const normalizeListing = (input: {
   // VALID-no-key and INVALID across searches. It never touches an aggregate (no key), but its
   // verdict goes stale. See docs/collector-ingest.md.
   //
-  // AN ACCESSORY IS NOT MOVED. A title that proves one type but reads as something sold FOR that
-  // type (`"12VHPWR cable for RTX 4090"` from a psu search) keeps the search's type and is refused
-  // as `accessory` after rules 1-3. Without this the resolution turned accessories from accessory
-  // searches into VALID references for the part they fit. See ACCESSORY for why it is cross-type
-  // only.
+  // AN ACCESSORY IS NOT MOVED. A title that reads as something sold FOR a part
+  // (`"12VHPWR cable for RTX 4090"`) keeps the search's type and is refused as `accessory` after
+  // rules 1-3, under EVERY search -- see ACCESSORY. It is decided from the title alone, so the
+  // verdict is the same whichever search found the listing. Its stored type is the search's, not
+  // the type of the part it fits: a refused row is not filed under a benchmark it does not join.
   //
   // FROM HERE ON `declared` IS THE RESOLVED TYPE; every rule below that says "declared" means it.
+  const accessory = accessoryEvidence(values, evidenced, spansByType);
   const [only] = evidenced;
-  const proven: Listing["componentType"] =
-    evidenced.length === 1 && modelsByType[only].length > 0 ? only : input.componentType;
-  const accessory = proven !== input.componentType && accessoryEvidence(values, tokens, proven);
-  const declared = accessory ? input.componentType : proven;
+  const declared: Listing["componentType"] =
+    !accessory && evidenced.length === 1 && modelsByType[only].length > 0
+      ? only
+      : input.componentType;
   const models = modelsByType[declared];
   const foreign = evidenced.filter((type) => type !== declared);
   const refuseAs = (validity: ObservationValidity, reason: NormalizationReason): Normalization =>
@@ -700,8 +729,8 @@ export const normalizeListing = (input: {
   if (containsAnyPhrase(values, TRADE)) return refuseAs("INVALID_REFERENCE", "trade-only");
   if (containsAnyPhrase(values, BROKEN)) return refuseAs("INVALID_REFERENCE", "not-working");
 
-  // 3b: an accessory for a part of ANOTHER type than the search's. NEEDS_REVIEW, not
-  // INVALID_REFERENCE: the title says what it fits, not that it is the wrong thing.
+  // 3b: an accessory, under every search. NEEDS_REVIEW, not INVALID_REFERENCE: the title says
+  // what it fits, not that it is the wrong thing.
   if (accessory) return refuseAs("NEEDS_REVIEW", "accessory");
 
   // 4: THE DANGEROUS CASE. A CA$2,000 machine whose title names a real GPU must never enter that
