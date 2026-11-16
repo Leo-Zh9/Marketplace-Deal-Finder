@@ -122,4 +122,32 @@ export interface CollectionStatus {
     targets: number;
     alarms: string[];
   } | null;
+  /**
+   * DISCORD ALERTS, from `worker/notify/status.ts`. ABSENT on an API Worker older than the
+   * notifications backend, and the page then renders no alert line at all. `unreadable` is NOT a
+   * wire state: the client substitutes it for a field that is present but malformed, so a bad
+   * field costs the alert line and never the panel. See `marketplaceClient.getStatus`.
+   */
+  notifications?: NotificationsStatus | { state: "unreadable" };
 }
+
+/** The counts `/api/status` carries for `on` and `webhook-rejected` only. */
+export interface NotificationCounts {
+  /** PENDING plus SENDING (in flight). */
+  pending: number;
+  /** SENT in the last 24 hours -- a rolling window, not a calendar day. */
+  sent24h: number;
+  deliveryUnknown: number;
+  failed: number;
+  /** Epoch seconds, or null when nothing was ever sent. */
+  lastSentAt: number | null;
+}
+
+/**
+ * `notifications` exactly as the Worker sends it. `{state: "on"}` with no counts is real: it is
+ * what the Worker answers when the notifications table could not be read.
+ */
+export type NotificationsStatus =
+  | { state: "unconfigured" | "invalid-url" | "off" }
+  | { state: "on" }
+  | ({ state: "on" | "webhook-rejected" } & NotificationCounts);

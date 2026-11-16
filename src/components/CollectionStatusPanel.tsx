@@ -1,4 +1,4 @@
-import type { CollectionStatus } from "../types";
+import type { CollectionStatus, NotificationCounts } from "../types";
 
 /**
  * THE COLLECTOR'S STATUS, ON THE PAGE. THE USER'S CHOSEN NOTIFICATION CHANNEL IS "JUST THE WEB
@@ -121,6 +121,46 @@ const agePhrase = (ageMinutes: number): string => {
   return `${Math.round(ageMinutes / 60)} hours ago`;
 };
 
+/**
+ * THE COUNTS, for `on` and `webhook-rejected` only. `sent24h` is a ROLLING 24-hour window
+ * (worker/notify/status.ts), so the sentence says "in the last 24 hours", never "today".
+ * `pending` and `failed` appear only when non-zero: without them a sender that has stalled
+ * (rows piling up PENDING) or is being refused (FAILED) reads exactly like a quiet day.
+ */
+const countsPhrase = (counts: NotificationCounts): string => {
+  let phrase = `${counts.sent24h} sent in the last 24 hours, ${counts.deliveryUnknown} delivery unknown`;
+  if (counts.pending > 0) phrase += `, ${counts.pending} pending`;
+  if (counts.failed > 0) phrase += `, ${counts.failed} failed`;
+  return phrase;
+};
+
+/**
+ * THE DISCORD ALERT LINE, ONE SENTENCE PER STATE. The counts are built INSIDE the two branches
+ * that show them, never before the switch: review D found that a count built up front threw for
+ * an inert state carrying an unprintable value, and the TypeError unmounted the app. The client
+ * rebuilds the field as well (`marketplaceClient.ts`); this is the second half.
+ */
+const alertLine = (notifications: NonNullable<CollectionStatus["notifications"]>): string => {
+  switch (notifications.state) {
+    case "unconfigured":
+      return "Discord alerts: not configured";
+    case "invalid-url":
+      return "Discord alerts: webhook URL invalid";
+    case "off":
+      return "Discord alerts: off (webhook ready)";
+    case "on":
+      return "sent24h" in notifications
+        ? `Discord alerts: on, ${countsPhrase(notifications)}`
+        : "Discord alerts: on (counts unavailable)";
+    case "webhook-rejected":
+      return "sent24h" in notifications
+        ? `Discord alerts: webhook rejected, replace the secret. ${countsPhrase(notifications)}`
+        : "Discord alerts: webhook rejected, replace the secret";
+    case "unreadable":
+      return "Discord alerts: status unreadable";
+  }
+};
+
 export interface CollectionStatusPanelProps {
   /** `null` means the read itself failed or has not finished. */
   status: CollectionStatus | null;
@@ -187,6 +227,14 @@ export function CollectionStatusPanel({ status, pending }: CollectionStatusPanel
               run while this is unresolved. It will go back on its own once the cause measures
               clean.
             </p>
+          )}
+
+          {/*
+            * ABSENT MEANS AN API WORKER OLDER THAN THE NOTIFICATIONS BACKEND, AND IT RENDERS
+            * NOTHING. Saying "not configured" there would be a claim the Worker never made.
+            */}
+          {status.notifications !== undefined && (
+            <p className="collection-alerts">{alertLine(status.notifications)}</p>
           )}
         </>
       )}
