@@ -385,12 +385,17 @@ const walkFrom = (
 
   while (position < tokens.length) {
     let next = node.children.get(tokens[position].value);
-    if (next === undefined) {
+    // The `gb` test is the cheap first term of `kitSpecLength`, hoisted: this branch runs on the
+    // last step of EVERY walk, and almost none of them follow a capacity.
+    if (next === undefined && tokens[position - 1]?.value === "gb") {
       // A skip that leads nowhere leaves `position` past the last complete name, so G1 refuses:
       // `"GeForce RTX 5060 Ti 16GB (2x8GB)"` is a miss. Only a name that ENDS at its capacity can
       // reach that, no such title is a kit, and a miss is safe -- so there is no guard for it.
-      position += kitSpecLength(tokens, position);
-      next = position < tokens.length ? node.children.get(tokens[position].value) : undefined;
+      const skip = kitSpecLength(tokens, position);
+      if (skip > 0) {
+        position += skip;
+        next = position < tokens.length ? node.children.get(tokens[position].value) : undefined;
+      }
     }
     if (next === undefined) break;
     node = next;
