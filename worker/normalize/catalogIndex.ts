@@ -284,6 +284,12 @@ const DIGITS = /^[0-9]+$/;
  * Returns 4 -- the tokens `N x M gb` to step over -- ONLY when the two tokens just walked are a
  * capacity `C gb`, `N` is 2, and `N x M` equals `C`. Otherwise 0.
  *
+ * WHAT A MUTATION CAN AND CANNOT KILL HERE, MEASURED: `N = 2` (KS2, KS3) and `N x M = C` (KS4,
+ * T14c) each go red alone. The four unit/shape tokens -- `gb` before, `x`, `gb` after -- do NOT:
+ * every RAM name puts `gb` after its capacity and `ddr` after that, so no title can satisfy the
+ * rest of the walk with one of them missing. They are kept because they ARE the shape the rule
+ * names, and that equivalence is a fact about today's catalog, not a property of the code.
+ *
  * N = 2 ONLY, AND THAT IS A POOL DECISION, NOT A TOKENIZER ONE. A four-module kit of the same total
  * (`"Corsair Vengeance LPX 32GB (4x8GB) DDR4"`) is a different product from the two-module kit the
  * catalog name means -- different board compatibility, different price -- so it stays unmatched.
@@ -296,26 +302,22 @@ const DIGITS = /^[0-9]+$/;
  * equivalent mutant. T14c pins that count map per type, so the day a non-RAM name continues past a GB
  * capacity, the scope question comes back to a human.
  */
-const kitSpecLength = (tokens: readonly Token[], position: number, start: number): number => {
-  if (position - 2 < start) return 0;
+const kitSpecLength = (tokens: readonly Token[], position: number): number => {
   const capacity = tokens[position - 2];
-  const unit = tokens[position - 1];
   const count = tokens[position];
-  const times = tokens[position + 1];
   const size = tokens[position + 2];
-  const sizeUnit = tokens[position + 3];
   if (
-    unit.value !== "gb" ||
-    !DIGITS.test(capacity.value) ||
+    tokens[position - 1]?.value !== "gb" ||
     count?.value !== "2" ||
-    times?.value !== "x" ||
+    tokens[position + 1]?.value !== "x" ||
+    tokens[position + 3]?.value !== "gb" ||
     size === undefined ||
-    !DIGITS.test(size.value) ||
-    sizeUnit?.value !== "gb"
+    capacity === undefined
   ) {
     return 0;
   }
-  return 2 * Number(size.value) === Number(capacity.value) ? 4 : 0;
+  // N x M = C, with N already pinned to 2. A non-numeric token is NaN, which equals nothing.
+  return Number(count.value) * Number(size.value) === Number(capacity.value) ? 4 : 0;
 };
 
 /**
@@ -389,7 +391,7 @@ const walkFrom = (
       // A skip that leads nowhere leaves `position` past the last complete name, so G1 refuses:
       // `"GeForce RTX 5060 Ti 16GB (2x8GB)"` is a miss. Only a name that ENDS at its capacity can
       // reach that, no such title is a kit, and a miss is safe -- so there is no guard for it.
-      position += kitSpecLength(tokens, position, start);
+      position += kitSpecLength(tokens, position);
       next = position < tokens.length ? node.children.get(tokens[position].value) : undefined;
     }
     if (next === undefined) break;
