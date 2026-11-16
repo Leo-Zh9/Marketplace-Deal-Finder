@@ -125,7 +125,7 @@ price:
 | key | means |
 |---|---|
 | `recorded` / `restored` | the listing entered the benchmark; `restored` means its observation had been deleted and was recreated |
-| `removed` | it used to contribute and no longer does — a re-sighting whose model key, market or price changed, or whose validity stopped being `VALID`. **No longer** a catalogued listing re-sighted by a search of another type: that used to be the dominant source of this key (see below) |
+| `removed` | it used to contribute and no longer does — a re-sighting whose model key, market or price changed, or whose validity stopped being `VALID`. A catalogued listing re-sighted by a search of another type **mostly** no longer lands here — that used to be the dominant source of this key — **except** a real part whose title carries an accessory word (`"RTX 3080 with backplate"`, `"Corsair RM850x with all cables"`, `"... with box"`, `"... triple fan"`): it is `VALID` under its own search and `accessory` under a foreign one, so it still flips (see [the accessory residual](#the-type-comes-from-the-title-when-the-title-proves-it)) |
 | `none` | `UNCHANGED`: nothing about it moved |
 | `skipped-invalid` | the rule refused it: wrong component, whole system, trade-only, for parts, a wanted ad, an accessory for another type's part, an unknown quantity, an ambiguous `CA$0`, or a title at the token cap |
 | `skipped-no-model` | the rule accepted it as the right component and could not name it — a real component the catalog does not list |
@@ -353,20 +353,42 @@ fit — `"12VHPWR cable for RTX 4090"` from a psu search evidences one type (gpu
 model — and the resolution alone stored each one as a `VALID` reference for that part: a
 CA$15–90 observation in the model's mean, and once 5 references exist the accessory itself a
 `DEAL`. Found on review with a cable, a waterblock, a mounting bracket, a replacement fan, a riser
-mount, thermal pads and a backplate, each from the matching search. So when the resolution would
-**change** the type and the title carries an `ACCESSORY` phrase (`cable(s)`, `adapter`,
-`bracket`, `waterblock` / `water block`, `backplate`, `riser`, `mount(ing)`, `shroud`,
-`thermal pad(s)`, `fan for`) or reads `for <catalog model>` — `for` directly before the matched
+mount, thermal pads and a backplate, each from the matching search — and in a second round with
+a fan replacement, replacement fans, an empty box, a box, a cpu box and a GPU holder. So when the
+resolution would **change** the type and the title carries an `ACCESSORY` phrase (`cable(s)`,
+`adapter`, `bracket`, `waterblock` / `water block`, `backplate`, `riser`, `mount(ing)`, `shroud`,
+`thermal pad(s)`, `fan(s)`, `replacement`, `box`, `holder`, `stand`, `support`) or reads
+`for <catalog model>` — `for` directly before the matched
 model, never a bare `for`, because `"for sale"` is everywhere — the listing keeps the search's
 type and is refused `NEEDS_REVIEW` / `accessory` (rule 3b below). **Measured over all 217
 sightings of the live sample, before and after the refusal: 0 outcomes change** — none of them
-is an accessory the resolution would have moved.
+is an accessory the resolution would have moved, and the second round of words changed none
+either. **The trade is deliberate**: the list runs only on a cross-type resolution, where a false
+refusal costs a `NEEDS_REVIEW` (a lost reference) and a missed accessory writes a wrong price.
+**One exemption**: `fan` and `fans` do not count when the resolution is **to** `case_fan`, because
+a case fan is a fan — five catalog names carry the word (`Lian Li UNI FAN SL120 V2`, …), and
+without it a real fan found by another type's search could never move (`AX-f`, and T12 drops by
+40 pairs).
 
 **It is cross-type ONLY, and the same-type hole stays, named.** Applied under every type it would
 refuse ordinary same-type copy — a PSU "with all cables", a card with a "support bracket" — and a
 test (`AX-c`) goes red if it is. The cost is the pre-existing hole: `"GPU support bracket RTX
 4090"` from a **gpu** search is still a `VALID` RTX 4090 reference, as it was before this change.
 It is pinned in `ACCEPTED_EXPOSURE` (`AX-r`) for the accessory corpus work in Part 2.
+
+**And the cross-type scope leaves a flip, named.** A **real** part whose title carries an
+accessory word — `"RTX 3080 with backplate"`, `"RTX 4090 + 12VHPWR adapter included"`,
+`"Corsair RM850x with all cables"`, and with the second round `"... with box"` and
+`"... triple fan"` — is `VALID` with its model under its own search and `NEEDS_REVIEW` /
+`accessory` under a foreign one, so across searches it still removes and restores its
+contribution and re-queues evaluation, exactly as every model-matched cross-type listing did
+before this change. It is a **strict subset** of what flipped before, and it never writes a wrong
+price: the foreign-search side refuses, it does not mis-key. **The Part 2 direction (from review)
+closes it and the same-type hole together:** make the accessory rule a property of the title
+alone — an `ACCESSORY` phrase, or `for` before the first model span — applied under **every**
+search, so a listing classifies the same way whichever search finds it. That needs the
+accessory corpus first, because applied everywhere today it would refuse `AX-c`'s PSU "with all
+cables".
 
 **And one consequence for `MAXIMUM_PRICE`.** A catalogued listing found only by a search of
 another type used to be `INVALID_REFERENCE` → `NOT_DEAL`. It is now `VALID` with its model on
@@ -509,7 +531,8 @@ live 5080 is CA$3,000. Any threshold would be a fabricated number.
   check adds work only on the resolving path** — an `ACCESSORY` phrase scan and one more span walk
   of the resolved type — and re-measured with it (load average 6–7, three runs): `T40c` p95
   4.33–4.93 ms, `T40c-r` p50 3.79–4.72 and p95 4.90–5.79 ms. Still under the 8 ms invariant, with
-  less headroom on that path than before.
+  less headroom on that path than before. After the second round of accessory words (load average
+  7–11, three runs): `T40c` p95 3.95–5.64 ms, `T40c-r` p50 4.25–4.40 and p95 5.32–5.86 ms.
 
 ### The residuals, named — and the corpora they are measured from
 

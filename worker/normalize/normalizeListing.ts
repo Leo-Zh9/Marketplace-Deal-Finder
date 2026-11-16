@@ -260,7 +260,10 @@ export const MULTI_UNIT = new Set(["pack"]);
  * SCOPED TO THE CROSS-TYPE CASE ON PURPOSE. Applied under every type it would refuse ordinary
  * same-type copy -- a PSU "with all cables", a card "with support bracket". THE SAME-TYPE HOLE IS
  * PRE-EXISTING AND STAYS, NAMED: `"GPU support bracket RTX 4090"` under a gpu search is still a
- * VALID RTX 4090 (pinned in ACCEPTED_EXPOSURE), for the corpus work that follows.
+ * VALID RTX 4090 (pinned in ACCEPTED_EXPOSURE), for the corpus work that follows. AND THE SCOPE
+ * LEAVES A FLIP: a REAL part with an accessory word (`"RTX 3080 with backplate"`) is VALID under
+ * its own search and `accessory` under a foreign one -- a strict subset of what flipped before,
+ * never a wrong price. docs/collector-ingest.md names both and the Part 2 fix for both.
  *
  * NO BARE `for`: `"for sale"` is everywhere. The `X for <model>` shape is caught positionally
  * instead -- `for` immediately before a matched catalog model -- in `accessoryEvidence`.
