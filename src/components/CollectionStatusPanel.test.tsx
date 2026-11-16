@@ -411,8 +411,10 @@ describe("the Discord alert line", () => {
    * and showing either at zero, which fails the both-zero row.
    */
   it.each<[string, NonNullable<CollectionStatus["notifications"]>, string]>([
-    ["on, pending only", { state: "on", ...COUNTS, pending: 2 }, "Discord alerts: on, 3 sent in the last 24 hours, 1 delivery unknown, 2 pending"],
-    ["on, failed only", { state: "on", ...COUNTS, failed: 4 }, "Discord alerts: on, 3 sent in the last 24 hours, 1 delivery unknown, 4 failed"],
+    // 1, NOT A LARGER NUMBER, in the two single-count rows: the first pending or failed alert must
+    // show, so a threshold mutated from `> 0` to `> 1` has to fail here.
+    ["on, pending only", { state: "on", ...COUNTS, pending: 1 }, "Discord alerts: on, 3 sent in the last 24 hours, 1 delivery unknown, 1 pending"],
+    ["on, failed only", { state: "on", ...COUNTS, failed: 1 }, "Discord alerts: on, 3 sent in the last 24 hours, 1 delivery unknown, 1 failed"],
     ["on, both", { state: "on", ...COUNTS, pending: 2, failed: 4 }, "Discord alerts: on, 3 sent in the last 24 hours, 1 delivery unknown, 2 pending, 4 failed"],
     ["on, both zero", { state: "on", ...COUNTS }, "Discord alerts: on, 3 sent in the last 24 hours, 1 delivery unknown"],
     [
