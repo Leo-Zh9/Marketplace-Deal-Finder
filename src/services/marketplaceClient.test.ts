@@ -574,4 +574,28 @@ describe("the notifications field of /api/status", () => {
 
     expect(status).toEqual({ ...BODY, notifications: { state: "unreadable" } });
   });
+
+  /**
+   * C-n4: THE FIELD IS REBUILT, NOT PASSED THROUGH. An inert state comes back as `{state}` alone
+   * and a counted state with only its checked fields, so nothing unchecked reaches the panel.
+   * The first row is review D's exact body: passed through, its `sent24h` threw a TypeError in
+   * the panel and unmounted the app. The mutation is returning the checked field as received.
+   */
+  it.each<[string, unknown, unknown]>([
+    [
+      "an inert state carrying an unprintable count",
+      { state: "off", sent24h: { toString: null, valueOf: null } },
+      { state: "off" },
+    ],
+    ["an inert state carrying stray fields", { state: "unconfigured", note: "x" }, { state: "unconfigured" }],
+    [
+      "a counted state carrying stray fields",
+      { state: "on", ...COUNTS, note: { toString: null } },
+      { state: "on", ...COUNTS },
+    ],
+  ])("C-n4: rebuilds %s from the checked fields only", async (_label, notifications, expected) => {
+    stubJson({ ...BODY, notifications });
+
+    expect((await marketplaceClient.getStatus(noToken)).notifications).toEqual(expected);
+  });
 });

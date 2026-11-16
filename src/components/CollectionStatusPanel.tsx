@@ -1,4 +1,4 @@
-import type { CollectionStatus } from "../types";
+import type { CollectionStatus, NotificationCounts } from "../types";
 
 /**
  * THE COLLECTOR'S STATUS, ON THE PAGE. THE USER'S CHOSEN NOTIFICATION CHANNEL IS "JUST THE WEB
@@ -122,16 +122,21 @@ const agePhrase = (ageMinutes: number): string => {
 };
 
 /**
- * THE DISCORD ALERT LINE, ONE SENTENCE PER STATE. The counts are rendered for `on` and
- * `webhook-rejected` only, because only those states carry them; an inert state that somehow
- * arrived with counts still reads as its state alone. `sent24h` is a ROLLING 24-hour window
+ * THE COUNTS, for `on` and `webhook-rejected` only. `sent24h` is a ROLLING 24-hour window
  * (worker/notify/status.ts), so the sentence says "in the last 24 hours", never "today".
  */
+const countsPhrase = (counts: NotificationCounts): string => {
+  const phrase = `${counts.sent24h} sent in the last 24 hours, ${counts.deliveryUnknown} delivery unknown`;
+  return phrase;
+};
+
+/**
+ * THE DISCORD ALERT LINE, ONE SENTENCE PER STATE. The counts are built INSIDE the two branches
+ * that show them, never before the switch: review D found that a count built up front threw for
+ * an inert state carrying an unprintable value, and the TypeError unmounted the app. The client
+ * rebuilds the field as well (`marketplaceClient.ts`); this is the second half.
+ */
 const alertLine = (notifications: NonNullable<CollectionStatus["notifications"]>): string => {
-  const counts =
-    "sent24h" in notifications
-      ? `${notifications.sent24h} sent in the last 24 hours, ${notifications.deliveryUnknown} delivery unknown`
-      : null;
   switch (notifications.state) {
     case "unconfigured":
       return "Discord alerts: not configured";
@@ -140,11 +145,13 @@ const alertLine = (notifications: NonNullable<CollectionStatus["notifications"]>
     case "off":
       return "Discord alerts: off (webhook ready)";
     case "on":
-      return counts === null ? "Discord alerts: on (counts unavailable)" : `Discord alerts: on, ${counts}`;
+      return "sent24h" in notifications
+        ? `Discord alerts: on, ${countsPhrase(notifications)}`
+        : "Discord alerts: on (counts unavailable)";
     case "webhook-rejected":
-      return counts === null
-        ? "Discord alerts: webhook rejected, replace the secret"
-        : `Discord alerts: webhook rejected, replace the secret. ${counts}`;
+      return "sent24h" in notifications
+        ? `Discord alerts: webhook rejected, replace the secret. ${countsPhrase(notifications)}`
+        : "Discord alerts: webhook rejected, replace the secret";
     case "unreadable":
       return "Discord alerts: status unreadable";
   }

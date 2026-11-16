@@ -1136,6 +1136,23 @@ describe("the control panel", () => {
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
+  /**
+   * A-n4: REVIEW D'S BODY, THROUGH THE REAL CLIENT, DOES NOT BLANK THE PAGE. An inert state with
+   * an unprintable `sent24h` threw a TypeError inside the panel's render and unmounted the app.
+   */
+  it("A-n4: an inert state carrying an unprintable count renders its line, and the form survives", async () => {
+    stubWire({
+      watch: LIVE_WATCH,
+      settings: null,
+      statusRaw: { ...HEALTHY_STATUS, notifications: { state: "off", sent24h: { toString: null, valueOf: null } } },
+    });
+    render(<App getToken={noToken} />);
+    await waitForLoad("9 of 9 searches used");
+
+    expect(await screen.findByText("Discord alerts: off (webhook ready)")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save searches" })).toBeEnabled();
+  });
+
   /** A-n3: THE LINK. A real `on` body reaches the page with its counts. */
   it("A-n3: an on body reaches the page with its counts", async () => {
     stubWire({

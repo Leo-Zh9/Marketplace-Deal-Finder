@@ -53,33 +53,41 @@ const isCount = (value: unknown): value is number =>
 /**
  * `notifications` IS CHECKED SEPARATELY FROM THE REST OF THE BODY, AND A BAD ONE IS NOT A FAILED
  * POLL. It is one line of the panel, so it must not be able to cost the whole panel -- #20's F1
- * lesson, one level down. The three inert states carry nothing else worth checking. `on` and
- * `webhook-rejected` must carry ALL the counts or (for `on` only, the Worker's answer when its
- * table read fails) NONE: a half-present set would render a number the Worker did not send.
+ * lesson, one level down. `on` and `webhook-rejected` must carry ALL the counts or (for `on`
+ * only, the Worker's answer when its table read fails) NONE: a half-present set would render a
+ * number the Worker did not send.
+ *
+ * IT RETURNS A REBUILT VALUE, NEVER THE ONE IT WAS GIVEN, so nothing unchecked reaches the panel.
+ * An inert state is `{state}` alone; a counted state is its checked fields only. Review D found
+ * why: `{state: "off", sent24h: {toString: null, valueOf: null}}` passed an inert-state check that
+ * looked only at `state`, and the panel's string-building threw a TypeError that unmounted the
+ * app. `null` means present but malformed.
  */
-const isNotificationsStatus = (value: unknown): value is NotificationsStatus => {
-  if (typeof value !== "object" || value === null) return false;
+const checkNotifications = (value: unknown): NotificationsStatus | null => {
+  if (typeof value !== "object" || value === null) return null;
   const fields = value as Record<string, unknown>;
-  if (fields.state === "unconfigured" || fields.state === "invalid-url" || fields.state === "off") {
-    return true;
+  const { state } = fields;
+  if (state === "unconfigured" || state === "invalid-url" || state === "off") return { state };
+  if (state !== "on" && state !== "webhook-rejected") return null;
+  if (![...COUNT_FIELDS, "lastSentAt"].some((field) => field in fields)) {
+    return state === "on" ? { state } : null;
   }
-  if (fields.state !== "on" && fields.state !== "webhook-rejected") return false;
-  if (![...COUNT_FIELDS, "lastSentAt"].some((field) => field in fields)) return fields.state === "on";
-  return (
-    COUNT_FIELDS.every((field) => isCount(fields[field])) &&
-    (fields.lastSentAt === null || isCount(fields.lastSentAt))
-  );
+  const { pending, sent24h, deliveryUnknown, failed, lastSentAt } = fields;
+  if (!isCount(pending) || !isCount(sent24h) || !isCount(deliveryUnknown) || !isCount(failed)) {
+    return null;
+  }
+  if (lastSentAt !== null && !isCount(lastSentAt)) return null;
+  return { state, pending, sent24h, deliveryUnknown, failed, lastSentAt };
 };
 
 /**
  * ABSENT STAYS ABSENT: an API Worker older than the notifications backend sends no field, and the
  * page renders as it did before it existed. PRESENT AND MALFORMED becomes `{state: "unreadable"}`,
- * which the panel names in words. Valid passes through untouched.
+ * which the panel names in words. Valid comes back rebuilt from its checked fields.
  */
 const withCheckedNotifications = (status: CollectionStatus): CollectionStatus => {
   if (status.notifications === undefined) return status;
-  if (isNotificationsStatus(status.notifications)) return status;
-  return { ...status, notifications: { state: "unreadable" } };
+  return { ...status, notifications: checkNotifications(status.notifications) ?? { state: "unreadable" } };
 };
 
 /** `search_revisions`' three columns, which are exactly `PUT /api/settings`' ACCEPTED_FIELDS. */
