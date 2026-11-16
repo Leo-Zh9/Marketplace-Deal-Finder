@@ -101,6 +101,11 @@ const CASES: Case[] = [
 
   // Rule 7: more than one unit, so the price is not a unit price.
   ["T31 (rule 7): an explicit lot", "Lot of 3 RTX 5060 graphics cards", 120000, "gpu", "NEEDS_REVIEW", null, "unknown-quantity"],
+  // `combo`: a board MODEL plus a CPU, no board MARKER, so rule 5 cannot see the board. Both were
+  // VALID with the chip's key before `combo` joined MULTIPLE; the control below stays a CPU.
+  ["CB1 (rule 7): an Intel board-and-cpu combo", "MSI PRO Z690-A i7 12700K combo", 52100, "cpu", "NEEDS_REVIEW", null, "unknown-quantity"],
+  ["CB2 (rule 7): an AMD board-and-cpu combo", "ASUS TUF B650-Plus and Ryzen 7 7700X combo", 52300, "cpu", "NEEDS_REVIEW", null, "unknown-quantity"],
+  ["CB-c: the same chip alone is still the chip", "i7 12700K", 52500, "cpu", "VALID", "Core i7-12700K", "matched"],
   ["T32 (rule 7): a numbered multi-pack", "Arctic P12 PWM PST 5 Pack", 3900, "case_fan", "NEEDS_REVIEW", null, "unknown-quantity"],
   ["T32b (rule 7): A FAN PACK REALLY IS A PACK", "Arctic P12 Max fan pack", 4900, "case_fan", "NEEDS_REVIEW", null, "unknown-quantity"],
   ["T40 (rule 7): a leading multiplier", "3x Arctic P14 Max case fans", 9900, "case_fan", "NEEDS_REVIEW", null, "unknown-quantity"],
@@ -373,6 +378,7 @@ describe("normalizeListing -- every vocabulary element, one at a time", () => {
     ["two", "unknown-quantity"],
     ["three", "unknown-quantity"],
     ["both", "unknown-quantity"],
+    ["combo", "unknown-quantity"],
   ])("T21: %s refuses the listing as %s", (phrase, reason) => {
     const result = normalizeListing({ title: GPU_FRAME(phrase), priceCents: 299000, componentType: "gpu" });
     expect(result.reason).toBe(reason);

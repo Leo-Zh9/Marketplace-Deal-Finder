@@ -134,8 +134,10 @@ export const containsPhrase = (values: readonly string[], phrase: string): boole
  * is named with a motherboard marker -- `"i7 12700K and motherboard combo"` is refused by rule 5
  * as `mixed-components` -- so what leaks is the phrasing that names a board model and no marker.
  *
- * THE FIX IS ONE WORD, AND IT IS DELIBERATELY NOT MADE HERE: `combo` as a one-word MULTIPLE
- * phrase closes both halves at once. MULTIPLE is global across all nine types, so a new entry
+ * CLOSED, IN PART 2: `combo` is now a MULTIPLE phrase (normalizeListing.ts), and CB1/CB2 pin
+ * both titles above as `unknown-quantity`. The history below is why it waited, kept because it is
+ * the measurement the decision rests on. THE FIX WAS ONE WORD, AND IT WAS DELIBERATELY NOT MADE
+ * THEN: `combo` as a one-word MULTIPLE phrase closes both halves at once. MULTIPLE is global across all nine types, so a new entry
  * needs its own collision sweep against all 336 names, the 15 live titles and all seven corpora
  * -- which is exactly the cost this slice has already learned that new vocabulary carries. It is
  * the first thing to try the next time that vocabulary is opened.
