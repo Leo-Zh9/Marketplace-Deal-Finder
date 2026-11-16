@@ -8,8 +8,8 @@
  * nowhere.
  *
  * FIXTURE CORRELATION. No two parameters that reach the code under test share a value: every
- * title below is distinct EXCEPT TR-r1, which is T15r's live title under a cpu search because the
- * same listing reaching two searches is its subject; every `priceCents` is distinct EXCEPT the
+ * title below is distinct EXCEPT TR-r1 and TR-r5, which are T15r's and T36g's live titles under
+ * another type's search because the same listing reaching two searches is their subject; every `priceCents` is distinct EXCEPT the
  * three cases where `0` is the subject, no price is 0, 1 or 100 other than those, and the
  * declared type spans all nine. So no assertion here can pass because the rule is hardwired to
  * one component type or because a price happened to equal a constant.
@@ -18,6 +18,7 @@
 import type { Listing } from "../storage/types";
 import { tokenValues, tokenize } from "./catalogIndex";
 import {
+  ACCESSORY,
   BROKEN,
   MARKERS,
   MULTIPLE,
@@ -177,6 +178,9 @@ const CASES: Case[] = [
  * the corpus they were measured from is the thing that keeps them honest.
  */
 const ACCEPTED_EXPOSURE: Case[] = [
+  // THE SAME-TYPE ACCESSORY HOLE, PRE-EXISTING AND KEPT: the accessory refusal is cross-type only
+  // (see ACCESSORY), so a bracket found by a gpu search still pools into the card it fits.
+  ["AX-r: an accessory found by its own part's search still matches", "GPU support bracket RTX 4090", 4100, "gpu", "VALID", "GeForce RTX 4090", "matched"],
   ["T36a: a year-suffixed revision pools into the base model", "Corsair RM850x 2021 power supply", 17900, "psu", "VALID", "Corsair RM850x", "matched"],
   ["T36b: a laptop with every detector stripped reads as a GPU", "MINT custom x17 R2 Flagship Ecosystem - RTX 5080 (16GB)", 350000, "gpu", "VALID", "GeForce RTX 5080", "matched"],
   // F2's remainder, pinned rather than left to be discovered. Both are the INFLATING direction.
@@ -245,6 +249,9 @@ const TYPE_RESOLUTION: Case[] = [
   ["TR-r2: live -- a GeForce card found by a motherboard search", "GIGABYTE EAGLE RTX 5070 12GB VRAM", 119300, "motherboard", "VALID", "GeForce RTX 5070", "matched", "gpu"],
   ["TR-r3: live -- a Ryzen found by a ram search", "AMD Ryzen 7 9700x CPU", 29700, "ram", "VALID", "Ryzen 7 9700X", "matched", "cpu"],
   ["TR-r4: live -- resolution does not skip rule 4", "Gaming PC \u2013 GTX 1080 Ti 11GB | 16GB RAM", 65100, "cpu", "INVALID_REFERENCE", null, "whole-system", "gpu"],
+  // Rule 4 must run under the RESOLVED type: only `MARKERS.cpu` covers `desktop` here, so under
+  // the search's type this live title would be refused as a whole system. SOLE killer of that.
+  ["TR-r5: live -- retail cpu wording found by a gpu search", "AMD Ryzen 5 5600 Desktop Processor", 22300, "gpu", "VALID", "Ryzen 5 5600", "matched", "cpu"],
   ["TR-m1: live -- a RAM kit by marker only, in a gpu search", "Ram DDR4 16gb 2x8gb 3000MHz", 12100, "gpu", "INVALID_REFERENCE", null, "wrong-component"],
   ["TR-m2: live -- a motherboard by marker only, in a cpu search", "MSI B850 Tomahawk Max Wifi Motherboard Only", 26300, "cpu", "INVALID_REFERENCE", null, "wrong-component"],
   ["TR-m3: live -- a drive dock by marker only, in a ram search", "5-Bay Hard Drive Station", 7700, "ram", "INVALID_REFERENCE", null, "wrong-component"],
@@ -252,6 +259,27 @@ const TYPE_RESOLUTION: Case[] = [
   // The live "Gaming PC – Ryzen 7 9800X3D / RTX 5080 16GB" with its whole-system words removed,
   // so rule 4 cannot answer first. Both halves are catalogued -- that is what makes it a killer.
   ["TR-2: live, trimmed -- two catalogued parts of two types, in a ram search", "Ryzen 7 9800X3D / RTX 5080 16GB", 133900, "ram", "INVALID_REFERENCE", null, "wrong-component"],
+];
+
+/**
+ * AN ACCESSORY IS NOT MOVED. Each title is what an accessory search returns: it names the part it
+ * fits, so it evidences exactly one type with a catalog model, and the type resolution alone
+ * would store it as a VALID reference for that part -- a CA$15-90 observation in the model's
+ * mean, and once 5 references exist the accessory itself a DEAL. Refused `accessory` under the
+ * search's type instead. The TR-r rows above are the controls: real parts found by a foreign
+ * search still move.
+ */
+const ACCESSORY_CROSS_TYPE: Case[] = [
+  ["AX1: a power cable from a psu search", "12VHPWR cable for RTX 4090", 3300, "psu", "NEEDS_REVIEW", null, "accessory"],
+  ["AX2: a waterblock from a cooler search", "EK waterblock for RTX 3080", 2900, "cpu_cooler", "NEEDS_REVIEW", null, "accessory"],
+  ["AX3: a mounting bracket from a cooler search", "AM4 mounting bracket for Ryzen 5 5600X", 1900, "cpu_cooler", "NEEDS_REVIEW", null, "accessory"],
+  ["AX4: a replacement fan from a case-fan search", "Replacement fan for RTX 3070", 2300, "case_fan", "NEEDS_REVIEW", null, "accessory"],
+  ["AX5: a riser mount from a case search", "Vertical GPU mount riser fits RTX 4090", 4700, "case", "NEEDS_REVIEW", null, "accessory"],
+  ["AX6: thermal pads from a cpu search", "Thermal pads for RTX 3080", 1700, "cpu", "NEEDS_REVIEW", null, "accessory"],
+  ["AX7: a backplate from a cpu search", "RTX 3080 backplate", 3100, "cpu", "NEEDS_REVIEW", null, "accessory"],
+  // THE CONTROL FOR THE SCOPE: same-type copy naming an accessory word is NOT refused. Applying
+  // the refusal under every type goes red here.
+  ["AX-c: a psu that comes with its cables, from a psu search", "Corsair RM850x Shift power supply with all cables", 18100, "psu", "VALID", "Corsair RM850x Shift", "matched"],
 ];
 
 const assertCase = ([, title, priceCents, componentType, validity, modelKey, reason, resolved]: Case): void => {
@@ -278,6 +306,10 @@ describe("normalizeListing -- the classification rules", () => {
   });
 
   it.each(TYPE_RESOLUTION)("%s", (...testCase) => {
+    assertCase(testCase);
+  });
+
+  it.each(ACCESSORY_CROSS_TYPE)("%s", (...testCase) => {
     assertCase(testCase);
   });
 });
@@ -441,6 +473,32 @@ describe("normalizeListing -- every vocabulary element, one at a time", () => {
   it("T23c control: a leading 'free' followed by the item itself still counts", () => {
     expect(
       normalizeListing({ title: "Free GeForce RTX 5080", priceCents: 0, componentType: "gpu" }),
+    ).toEqual({ componentType: "gpu", modelKey: "GeForce RTX 5080", variantKey: null, validity: "VALID", reason: "matched" });
+  });
+
+  /**
+   * T21f: ACCESSORY, element by element, in the frame where the type resolution would otherwise
+   * fire: a catalog GPU under a cpu search. Literal copy, per this block's rule.
+   */
+  it.each([
+    ["cable"], ["cables"], ["adapter"], ["bracket"], ["waterblock"], ["water block"],
+    ["backplate"], ["riser"], ["mount"], ["mounting"], ["shroud"], ["thermal pad"],
+    ["thermal pads"], ["fan for"],
+  ])("T21f: %s keeps a cross-type listing out of the resolution", (phrase) => {
+    expect(
+      normalizeListing({ title: `GeForce RTX 5080 ${phrase}`, priceCents: 39100, componentType: "cpu" }),
+    ).toEqual({ componentType: "cpu", modelKey: null, variantKey: null, validity: "NEEDS_REVIEW", reason: "accessory" });
+  });
+
+  it("T21f: `for` directly before the model reads as an accessory", () => {
+    expect(
+      normalizeListing({ title: "Support for GeForce RTX 5080", priceCents: 39200, componentType: "cpu" }),
+    ).toEqual({ componentType: "cpu", modelKey: null, variantKey: null, validity: "NEEDS_REVIEW", reason: "accessory" });
+  });
+
+  it("T21f control: a bare `for` elsewhere does not -- the card still moves to gpu", () => {
+    expect(
+      normalizeListing({ title: "GeForce RTX 5080 for sale", priceCents: 39300, componentType: "cpu" }),
     ).toEqual({ componentType: "gpu", modelKey: "GeForce RTX 5080", variantKey: null, validity: "VALID", reason: "matched" });
   });
 
@@ -911,7 +969,7 @@ describe("normalizeListing -- properties of the vocabularies", () => {
    * here until it is removed, neutralised, or -- as with `pack` -- deliberately allowed to win.
    * The four SYSTEM_PHRASES rows are harmless: both paths give `whole-system`.
    */
-  it("T13: exactly fifteen sub-phrase overlaps exist across the sixteen vocabularies", () => {
+  it("T13: exactly fifteen sub-phrase overlaps exist across the seventeen vocabularies", () => {
     const vocabularies: [string, readonly string[]][] = [
       ...(Object.entries(MARKERS) as [string, readonly string[]][]).map(
         ([type, phrases]) => [`MARKERS.${type}`, phrases] as [string, readonly string[]],
@@ -923,8 +981,9 @@ describe("normalizeListing -- properties of the vocabularies", () => {
       ["MULTIPLE", MULTIPLE],
       ["WHOLE_UNIT", [...WHOLE_UNIT]],
       ["MULTI_UNIT", [...MULTI_UNIT]],
+      ["ACCESSORY", ACCESSORY],
     ];
-    expect(vocabularies).toHaveLength(16);
+    expect(vocabularies).toHaveLength(17);
 
     const sequence = (phrase: string): string[] => tokenValues(tokenize(phrase));
     const isSubPhrase = (inner: string[], outer: string[]): boolean => {

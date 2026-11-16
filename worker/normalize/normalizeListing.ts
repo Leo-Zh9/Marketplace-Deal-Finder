@@ -46,7 +46,8 @@ export type NormalizationReason =
   | "wanted-ad"
   | "unknown-quantity"
   | "ambiguous-zero-price"
-  | "title-too-long";
+  | "title-too-long"
+  | "accessory";
 
 export interface Normalization {
   /**
@@ -244,6 +245,42 @@ export const MULTIPLE = ["lot of", "bundle", "pair of", "set of", "pcs", "pieces
  * Cost: 0 of the 15 live titles.
  */
 export const MULTI_UNIT = new Set(["pack"]);
+
+/**
+ * THINGS SOLD FOR A COMPONENT RATHER THAN AS ONE, consulted ONLY when the type resolution would
+ * move a listing away from the search's type -- see `accessoryEvidence`.
+ *
+ * WHY IT EXISTS. An accessory search returns accessories that NAME the part they fit:
+ * `"12VHPWR cable for RTX 4090"` under a psu search evidences one type (gpu) with a catalog
+ * model, so the resolution would store a CA$40 cable as a VALID GeForce RTX 4090 reference --
+ * pulling that model's mean down until the cable itself read as a DEAL. MEASURED on review:
+ * a cable, a waterblock, a mounting bracket, a replacement fan, a riser mount, thermal pads and a
+ * backplate, each from the matching accessory search, all resolved VALID with a model.
+ *
+ * SCOPED TO THE CROSS-TYPE CASE ON PURPOSE. Applied under every type it would refuse ordinary
+ * same-type copy -- a PSU "with all cables", a card "with support bracket". THE SAME-TYPE HOLE IS
+ * PRE-EXISTING AND STAYS, NAMED: `"GPU support bracket RTX 4090"` under a gpu search is still a
+ * VALID RTX 4090 (pinned in ACCEPTED_EXPOSURE), for the corpus work that follows.
+ *
+ * NO BARE `for`: `"for sale"` is everywhere. The `X for <model>` shape is caught positionally
+ * instead -- `for` immediately before a matched catalog model -- in `accessoryEvidence`.
+ */
+export const ACCESSORY = [
+  "cable",
+  "cables",
+  "adapter",
+  "bracket",
+  "waterblock",
+  "water block",
+  "backplate",
+  "riser",
+  "mount",
+  "mounting",
+  "shroud",
+  "thermal pad",
+  "thermal pads",
+  "fan for",
+];
 
 const DIGITS = /^[0-9]+$/;
 const LETTERS = /^[a-z]+$/;
@@ -486,6 +523,21 @@ export const freeItemEvidence = (
   );
 };
 
+/**
+ * True when the title reads as something sold FOR a `type` part: an ACCESSORY phrase, or `for`
+ * directly before a matched catalog model of that type (`"... for RTX 4090"`,
+ * `"... for Ryzen 5 5600X"`). Called only for a resolution that would change the type.
+ */
+export const accessoryEvidence = (
+  values: readonly string[],
+  tokens: readonly Token[],
+  type: Listing["componentType"],
+): boolean =>
+  containsAnyPhrase(values, ACCESSORY) ||
+  matchCatalogSpans(MODEL_INDEXES[type], tokens).some(
+    (span) => span.start > 0 && values[span.start - 1] === "for",
+  );
+
 export const systemEvidence = (
   values: readonly string[],
   tokens: readonly Token[],
@@ -576,10 +628,18 @@ export const normalizeListing = (input: {
   // VALID-no-key and INVALID across searches. It never touches an aggregate (no key), but its
   // verdict goes stale. See docs/collector-ingest.md.
   //
+  // AN ACCESSORY IS NOT MOVED. A title that proves one type but reads as something sold FOR that
+  // type (`"12VHPWR cable for RTX 4090"` from a psu search) keeps the search's type and is refused
+  // as `accessory` after rules 1-3. Without this the resolution turned accessories from accessory
+  // searches into VALID references for the part they fit. See ACCESSORY for why it is cross-type
+  // only.
+  //
   // FROM HERE ON `declared` IS THE RESOLVED TYPE; every rule below that says "declared" means it.
   const [only] = evidenced;
-  const declared: Listing["componentType"] =
+  const proven: Listing["componentType"] =
     evidenced.length === 1 && modelsByType[only].length > 0 ? only : input.componentType;
+  const accessory = proven !== input.componentType && accessoryEvidence(values, tokens, proven);
+  const declared = accessory ? input.componentType : proven;
   const models = modelsByType[declared];
   const foreign = evidenced.filter((type) => type !== declared);
   const refuseAs = (validity: ObservationValidity, reason: NormalizationReason): Normalization =>
@@ -589,6 +649,10 @@ export const normalizeListing = (input: {
   if (containsAnyPhrase(values, WANTED)) return refuseAs("INVALID_REFERENCE", "wanted-ad");
   if (containsAnyPhrase(values, TRADE)) return refuseAs("INVALID_REFERENCE", "trade-only");
   if (containsAnyPhrase(values, BROKEN)) return refuseAs("INVALID_REFERENCE", "not-working");
+
+  // 3b: an accessory for a part of ANOTHER type than the search's. NEEDS_REVIEW, not
+  // INVALID_REFERENCE: the title says what it fits, not that it is the wrong thing.
+  if (accessory) return refuseAs("NEEDS_REVIEW", "accessory");
 
   // 4: THE DANGEROUS CASE. A CA$2,000 machine whose title names a real GPU must never enter that
   // GPU's average.
