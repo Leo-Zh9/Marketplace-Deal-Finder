@@ -112,6 +112,13 @@ const PHRASE_TOKENS = new Map<string, readonly string[]>();
  * module constants, so this cache is bounded by their size (~150 phrases); a phrase used to be
  * re-tokenized on every check of every listing -- about a hundred times per title. Pure
  * performance: the tokens are exactly `tokenValues(tokenize(phrase))`, by construction.
+ *
+ * NOT `Object.freeze`d, ON A MEASUREMENT. The cached array is shared by every later request in
+ * the isolate, so a caller that mutated it would poison them all; freezing would make that throw.
+ * But a frozen array leaves V8's fast element path: MEASURED in Node 24, `phraseSpans` over frozen
+ * phrase arrays costs 2.8x the plain ones, and frozen, the T40c batch went from p50 ~2.4 to
+ * ~4.0 ms file-alone and past the 8 ms budget under the full parallel suite. The guard is the
+ * `readonly string[]` return type instead: a mutating caller does not compile.
  */
 export const phraseTokens = (phrase: string): readonly string[] => {
   let cached = PHRASE_TOKENS.get(phrase);
