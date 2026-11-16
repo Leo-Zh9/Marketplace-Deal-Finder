@@ -103,7 +103,24 @@ export const phraseSpans = (
  * punctuation inside a phrase carry no meaning: `"i 9"`, `"i9"` and `"i-9"` are one phrase.
  */
 export const containsPhrase = (values: readonly string[], phrase: string): boolean =>
-  phraseSpans(values, tokenValues(tokenize(phrase))).length > 0;
+  phraseSpans(values, phraseTokens(phrase)).length > 0;
+
+const PHRASE_TOKENS = new Map<string, readonly string[]>();
+
+/**
+ * A vocabulary phrase's token values, tokenized ONCE per isolate. The vocabularies are fixed
+ * module constants, so this cache is bounded by their size (~150 phrases); a phrase used to be
+ * re-tokenized on every check of every listing -- about a hundred times per title. Pure
+ * performance: the tokens are exactly `tokenValues(tokenize(phrase))`, by construction.
+ */
+export const phraseTokens = (phrase: string): readonly string[] => {
+  let cached = PHRASE_TOKENS.get(phrase);
+  if (cached === undefined) {
+    cached = tokenValues(tokenize(phrase));
+    PHRASE_TOKENS.set(phrase, cached);
+  }
+  return cached;
+};
 
 /**
  * Vendor prefixes a seller drops freely: `"RTX 5080"` is the same card as `"GeForce RTX 5080"`.
@@ -134,8 +151,10 @@ export const containsPhrase = (values: readonly string[], phrase: string): boole
  * is named with a motherboard marker -- `"i7 12700K and motherboard combo"` is refused by rule 5
  * as `mixed-components` -- so what leaks is the phrasing that names a board model and no marker.
  *
- * THE FIX IS ONE WORD, AND IT IS DELIBERATELY NOT MADE HERE: `combo` as a one-word MULTIPLE
- * phrase closes both halves at once. MULTIPLE is global across all nine types, so a new entry
+ * CLOSED, IN PART 2: `combo` is now a MULTIPLE phrase (normalizeListing.ts), and CB1/CB2 pin
+ * both titles above as `unknown-quantity`. The history below is why it waited, kept because it is
+ * the measurement the decision rests on. THE FIX WAS ONE WORD, AND IT WAS DELIBERATELY NOT MADE
+ * THEN: `combo` as a one-word MULTIPLE phrase closes both halves at once. MULTIPLE is global across all nine types, so a new entry
  * needs its own collision sweep against all 336 names, the 15 live titles and all seven corpora
  * -- which is exactly the cost this slice has already learned that new vocabulary carries. It is
  * the first thing to try the next time that vocabulary is opened.
@@ -239,12 +258,82 @@ const SUFFIX_WORDS = new Set([
   "argb",
 ]);
 
+/**
+ * MSI's sub-brand words, droppable from INSIDE a catalog name.
+ * `"MSI B850 Tomahawk Max Wifi Motherboard Only"` is the live title; the catalog name is
+ * `MSI MAG B850 Tomahawk MAX WiFi`, and sellers leave `MAG` out. Like OPTIONAL_LEADING this only
+ * ADDS entry points: the full name is still inserted first and still matches.
+ *
+ * WHY THESE THREE AND NO OTHERS. Each names a tier of a board or PSU whose model number is unique
+ * without it, so dropping it cannot merge two products. MEASURED over the 336 names: the 13 that
+ * carry one (`mag` 9, `mpg` 3, `meg` 1) produce 13 new entry points, 0 of them equal to any other
+ * name or entry point, and the T47 prefix-pair set is unchanged (the one pair they touch,
+ * `MSI MAG B550 Tomahawk < ... MAX WiFi`, is already a reviewed row).
+ *
+ * NO "NOT THE FIRST TOKEN" GUARD, and that is measured rather than forgotten: 0 catalog names
+ * begin with one of these words (all 13 follow `MSI`), so such a guard is an equivalent mutant
+ * and this file deletes guards no mutation can kill. A future name that LEADS with one is caught
+ * by T14b's count map, which counts only inner positions and would stop matching the total.
+ *
+ * NOT ADMITTED, AND THAT IS DELIBERATE: ASUS `ROG Strix` and `TUF`, Gigabyte `Aorus`, MSI `PRO`.
+ * `PRO` is a separate MSI product line, not a tier word over the same board, and `Aorus` /
+ * `ROG Strix` / `TUF` each name boards whose model number is shared with a cheaper sibling
+ * (`B650 Aorus Elite` vs `B650 Gaming X`), so dropping them is how two prices pool. A seller who
+ * omits one of those words gets no match -- a miss, which is safe.
+ */
+const INNER_SUB_BRAND = new Set(["mag", "mpg", "meg"]);
+
 /** A prefix trie node; the exported index is its root. */
 export interface ModelIndex {
   children: Map<string, ModelIndex>;
   /** The catalog name that ENDS here, or null when this node is only a prefix. */
   model: string | null;
 }
+
+/**
+ * A RAM KIT SPEC sitting between a catalog name's capacity and the rest of it:
+ * `"G.SKILL Ripjaws V 16GB (2x8GB) DDR4-3600 RAM"` is the live title, and the catalog name is
+ * `G.Skill Ripjaws V 16GB DDR4`. The parentheses are separators to the tokenizer, so the title
+ * reads `16 gb 2 x 8 gb ddr 4`, and without this the name is not contiguous and nothing matches.
+ *
+ * Returns 4 -- the tokens `N x M gb` to step over -- ONLY when the two tokens just walked are a
+ * capacity `C gb`, `N` is 2, and `N x M` equals `C`. Otherwise 0.
+ *
+ * WHAT A MUTATION CAN AND CANNOT KILL HERE, MEASURED: `N = 2` (KS2, KS3) and `N x M = C` (KS4,
+ * T14c) each go red alone. The four unit/shape tokens -- `gb` before, `x`, `gb` after -- do NOT:
+ * every RAM name puts `gb` after its capacity and `ddr` after that, so no title can satisfy the
+ * rest of the walk with one of them missing. They are kept because they ARE the shape the rule
+ * names, and that equivalence is a fact about today's catalog, not a property of the code.
+ *
+ * N = 2 ONLY, AND THAT IS A POOL DECISION, NOT A TOKENIZER ONE. A four-module kit of the same total
+ * (`"Corsair Vengeance LPX 32GB (4x8GB) DDR4"`) is a different product from the two-module kit the
+ * catalog name means -- different board compatibility, different price -- so it stays unmatched.
+ * And a spec that does not multiply out (`16GB (2x16GB)`) is a title that contradicts itself, which
+ * is refused the same way. Both are misses, never wrong keys.
+ *
+ * IT IS NOT SCOPED TO THE RAM INDEX, AND THAT IS MEASURED RATHER THAN CARELESS. A skip can only
+ * produce a match when the catalog name CONTINUES after `C gb`, and today only the 26 RAM names
+ * do (every GPU and storage name with a GB capacity ENDS there), so a ram-only flag would be an
+ * equivalent mutant. T14c pins that count map per type, so the day a non-RAM name continues past a GB
+ * capacity, the scope question comes back to a human.
+ */
+const kitSpecLength = (tokens: readonly Token[], position: number): number => {
+  const capacity = tokens[position - 2];
+  const count = tokens[position];
+  const size = tokens[position + 2];
+  if (
+    tokens[position - 1]?.value !== "gb" ||
+    count?.value !== "2" ||
+    tokens[position + 1]?.value !== "x" ||
+    tokens[position + 3]?.value !== "gb" ||
+    size === undefined ||
+    capacity === undefined
+  ) {
+    return 0;
+  }
+  // N x M = C, with N already pinned to 2. A non-numeric token is NaN, which equals nothing.
+  return Number(count.value) * Number(size.value) === Number(capacity.value) ? 4 : 0;
+};
 
 /**
  * Insert each model's full token sequence plus every suffix obtained by dropping leading
@@ -271,14 +360,18 @@ export const buildModelIndex = (models: readonly string[]): ModelIndex => {
   };
 
   for (const model of models) {
-    const sequence = tokenValues(tokenize(model));
-    insert(sequence, model);
-    // `< length - 1`: a model whose name is ENTIRELY optional-leading tokens never becomes an
-    // empty core, which would make the root itself terminal and match every title.
-    let start = 0;
-    while (start < sequence.length - 1 && OPTIONAL_LEADING.has(sequence[start])) {
-      start += 1;
-      insert(sequence.slice(start), model);
+    const full = tokenValues(tokenize(model));
+    const withoutSubBrand = full.filter((value) => !INNER_SUB_BRAND.has(value));
+    const variants = withoutSubBrand.length < full.length ? [full, withoutSubBrand] : [full];
+    for (const sequence of variants) {
+      insert(sequence, model);
+      // `< length - 1`: a model whose name is ENTIRELY optional-leading tokens never becomes an
+      // empty core, which would make the root itself terminal and match every title.
+      let start = 0;
+      while (start < sequence.length - 1 && OPTIONAL_LEADING.has(sequence[start])) {
+        start += 1;
+        insert(sequence.slice(start), model);
+      }
     }
   }
   return root;
@@ -302,27 +395,42 @@ const walkFrom = (
   start: number,
 ): { model: string; depth: number } | null => {
   let node = index;
-  let depth = 0;
-  let terminalDepth = -1;
+  // `position` is the next TITLE token; it runs ahead of the trie depth only by a skipped kit spec.
+  let position = start;
+  let terminalEnd = -1;
   let terminalModel: string | null = null;
 
-  while (start + depth < tokens.length) {
-    const next = node.children.get(tokens[start + depth].value);
+  while (position < tokens.length) {
+    let next = node.children.get(tokens[position].value);
+    // A PERFORMANCE TEST, NOT A CORRECTNESS ONE, and behaviourally inert (`kitSpecLength` refuses
+    // the same cases): this branch runs on the last step of EVERY walk -- nine indexes x every
+    // start position -- and nearly all of them end at the root, where no capacity was walked.
+    // MEASURED on T40c-r's batch: without it the rule cost ~0.28 ms more per 100 listings.
+    if (next === undefined && node !== index && tokens[position - 1].value === "gb") {
+      // A skip that leads nowhere leaves `position` past the last complete name, so G1 refuses:
+      // `"GeForce RTX 5060 Ti 16GB (2x8GB)"` is a miss. Only a name that ENDS at its capacity can
+      // reach that, no such title is a kit, and a miss is safe -- so there is no guard for it.
+      const skip = kitSpecLength(tokens, position);
+      if (skip > 0) {
+        position += skip;
+        next = position < tokens.length ? node.children.get(tokens[position].value) : undefined;
+      }
+    }
     if (next === undefined) break;
     node = next;
-    depth += 1;
+    position += 1;
     if (node.model !== null) {
-      terminalDepth = depth;
+      terminalEnd = position;
       terminalModel = node.model;
     }
   }
 
   if (terminalModel === null) return null;
-  if (terminalDepth < depth) return null;
-  if (!tokens[start + terminalDepth - 1].endsRun) return null;
-  const after = tokens[start + terminalDepth];
+  if (terminalEnd < position) return null;
+  if (!tokens[terminalEnd - 1].endsRun) return null;
+  const after = tokens[terminalEnd];
   if (after !== undefined && SUFFIX_WORDS.has(after.value)) return null;
-  return { model: terminalModel, depth: terminalDepth };
+  return { model: terminalModel, depth: terminalEnd - start };
 };
 
 /**

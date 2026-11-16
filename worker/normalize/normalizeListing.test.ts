@@ -101,6 +101,11 @@ const CASES: Case[] = [
 
   // Rule 7: more than one unit, so the price is not a unit price.
   ["T31 (rule 7): an explicit lot", "Lot of 3 RTX 5060 graphics cards", 120000, "gpu", "NEEDS_REVIEW", null, "unknown-quantity"],
+  // `combo`: a board MODEL plus a CPU, no board MARKER, so rule 5 cannot see the board. Both were
+  // VALID with the chip's key before `combo` joined MULTIPLE; the control below stays a CPU.
+  ["CB1 (rule 7): an Intel board-and-cpu combo", "MSI PRO Z690-A i7 12700K combo", 52100, "cpu", "NEEDS_REVIEW", null, "unknown-quantity"],
+  ["CB2 (rule 7): an AMD board-and-cpu combo", "ASUS TUF B650-Plus and Ryzen 7 7700X combo", 52300, "cpu", "NEEDS_REVIEW", null, "unknown-quantity"],
+  ["CB-c: the same chip alone is still the chip", "i7 12700K", 52500, "cpu", "VALID", "Core i7-12700K", "matched"],
   ["T32 (rule 7): a numbered multi-pack", "Arctic P12 PWM PST 5 Pack", 3900, "case_fan", "NEEDS_REVIEW", null, "unknown-quantity"],
   ["T32b (rule 7): A FAN PACK REALLY IS A PACK", "Arctic P12 Max fan pack", 4900, "case_fan", "NEEDS_REVIEW", null, "unknown-quantity"],
   ["T40 (rule 7): a leading multiplier", "3x Arctic P14 Max case fans", 9900, "case_fan", "NEEDS_REVIEW", null, "unknown-quantity"],
@@ -115,6 +120,13 @@ const CASES: Case[] = [
   ["T44 (rule 7): a 2x16GB kit is ONE kit -- regression only", "Corsair Vengeance 32GB DDR5 (2x16GB)", 18900, "ram", "VALID", "Corsair Vengeance 32GB DDR5", "matched"],
   ["T45 (rule 7): 'SN850X 2TB' is a model, not a count -- regression only", "WD Black SN850X 2TB nvme ssd", 21900, "storage", "VALID", "WD Black SN850X 2TB", "matched"],
   ["T46 (rule 7): a LEADING kit spec is still one kit -- SOLE killer of the letter test", "2x16GB Corsair Vengeance 32GB DDR5", 19900, "ram", "VALID", "Corsair Vengeance 32GB DDR5", "matched"],
+  // The kit spec INSIDE the name (catalogIndex.ts `kitSpecLength`): stepped over for two modules
+  // that multiply out to the capacity, and for nothing else. The four-module rows are PINNED
+  // misses: a 4x8GB kit is a different pool from the 2x16GB kit the catalog name means.
+  ["KS1: live -- a 2x8GB spec between the capacity and DDR4", "G.SKILL Ripjaws V 16GB (2x8GB) DDR4-3600 RAM", 15100, "ram", "VALID", "G.Skill Ripjaws V 16GB DDR4", "matched"],
+  ["KS2: a 4x8GB kit under a 32GB name is not keyed", "Corsair Vengeance LPX 32GB (4x8GB) DDR4", 15300, "ram", "VALID", null, "model-unmatched"],
+  ["KS3: a 4x16GB kit under a 64GB name is not keyed", "Corsair Vengeance RGB 64GB (4x16GB) DDR5", 26900, "ram", "VALID", null, "model-unmatched"],
+  ["KS4: a spec that does not multiply out is not keyed", "Kingston Fury Beast 32GB (2x8GB) DDR4", 34900, "ram", "VALID", null, "model-unmatched"],
   // F2: the INFLATING direction -- N units at one price makes a genuine listing look like a deal.
   ["F2a (rule 7): the count word 'two'", "Two GeForce RTX 5080 cards", 403000, "gpu", "NEEDS_REVIEW", null, "unknown-quantity"],
   ["F2b (rule 7): a TRAILING multiplier", "GeForce RTX 5080 x2", 401000, "gpu", "NEEDS_REVIEW", null, "unknown-quantity"],
@@ -253,7 +265,9 @@ const TYPE_RESOLUTION: Case[] = [
   // the search's type this live title would be refused as a whole system. SOLE killer of that.
   ["TR-r5: live -- retail cpu wording found by a gpu search", "AMD Ryzen 5 5600 Desktop Processor", 22300, "gpu", "VALID", "Ryzen 5 5600", "matched", "cpu"],
   ["TR-m1: live -- a RAM kit by marker only, in a gpu search", "Ram DDR4 16gb 2x8gb 3000MHz", 12100, "gpu", "INVALID_REFERENCE", null, "wrong-component"],
-  ["TR-m2: live -- a motherboard by marker only, in a cpu search", "MSI B850 Tomahawk Max Wifi Motherboard Only", 26300, "cpu", "INVALID_REFERENCE", null, "wrong-component"],
+  // Was TR-m2, a marker-only residual, until MSI's inner `MAG` became droppable (catalogIndex.ts
+  // INNER_SUB_BRAND): the title now names its catalog model, so it moves like any other.
+  ["TR-r6: live -- a board without its MAG sub-brand, in a cpu search", "MSI B850 Tomahawk Max Wifi Motherboard Only", 26300, "cpu", "VALID", "MSI MAG B850 Tomahawk MAX WiFi", "matched", "motherboard"],
   ["TR-m3: live -- a drive dock by marker only, in a ram search", "5-Bay Hard Drive Station", 7700, "ram", "INVALID_REFERENCE", null, "wrong-component"],
   ["TR-m4: live -- a tablet whose only marker is ssd, in a psu search", "Microsoft Surface Pro 11th Edition \u2013 Snapdragon X Elite \u2013 16GB RAM \u2013 512GB SSD", 95300, "psu", "INVALID_REFERENCE", null, "wrong-component"],
   // The live "Gaming PC – Ryzen 7 9800X3D / RTX 5080 16GB" with its whole-system words removed,
@@ -373,6 +387,7 @@ describe("normalizeListing -- every vocabulary element, one at a time", () => {
     ["two", "unknown-quantity"],
     ["three", "unknown-quantity"],
     ["both", "unknown-quantity"],
+    ["combo", "unknown-quantity"],
   ])("T21: %s refuses the listing as %s", (phrase, reason) => {
     const result = normalizeListing({ title: GPU_FRAME(phrase), priceCents: 299000, componentType: "gpu" });
     expect(result.reason).toBe(reason);

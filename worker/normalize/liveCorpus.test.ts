@@ -112,14 +112,19 @@ describe("live corpus -- hard gates (precision)", () => {
   });
 });
 
-describe("live corpus -- the floor (recall), pinned on master 404677e", () => {
+describe("live corpus -- the floor (recall), pinned on master 404677e and raised by Part 2", () => {
   const components = LIVE_CORPUS.filter((entry) => entry.label.kind !== "not-a-component");
   const catalogued = LIVE_CORPUS.filter((entry) => entry.label.kind === "component");
   const recalledEverywhere = catalogued.filter((entry) =>
     sightings(entry).every(([, result]) => keyed(result)),
   );
 
-  it("counts: 36 standalone components, 13 of them catalogued, 9 of 13 keyed under every search", () => {
+  /**
+   * 9 of 13 ON MASTER 404677e. PART 2 RAISES IT ONE RULE AT A TIME, each move deliberate:
+   * +1 the inner `MAG` sub-brand (`MSI B850 Tomahawk ...`), +1 the two-module kit-spec skip
+   * (`G.SKILL Ripjaws V 16GB (2x8GB) ...`).
+   */
+  it("counts: 36 standalone components, 13 of them catalogued, 11 of 13 keyed under every search", () => {
     expect({
       titles: LIVE_CORPUS.length,
       standaloneComponents: components.length,
@@ -131,16 +136,16 @@ describe("live corpus -- the floor (recall), pinned on master 404677e", () => {
       titles: 141,
       standaloneComponents: 36,
       catalogued: 13,
-      recalledUnderEverySearch: 9,
-      keyedUnderSomeSearch: 9,
+      recalledUnderEverySearch: 11,
+      keyedUnderSomeSearch: 11,
     });
   });
 
   /**
-   * THE FOUR MISSES, BY TITLE, WITH WHAT EACH ONE NEEDS. This list is the recall work queue; a
+   * THE MISSES, BY TITLE, WITH WHAT EACH ONE NEEDS. This list is the recall work queue; a
    * change that closes one moves it here on purpose.
    */
-  it("misses exactly these four catalogued titles", () => {
+  it("misses exactly these two catalogued titles", () => {
     expect(
       catalogued
         .filter((entry) => !recalledEverywhere.includes(entry))
@@ -150,12 +155,8 @@ describe("live corpus -- the floor (recall), pinned on master 404677e", () => {
       [
         // No `gtx`: series words are not droppable, so `1050 ti` alone is not the catalog name.
         "1050TI GPU",
-        // The kit spec `(2x8GB)` sits between `16GB` and `DDR4`, so the name is not contiguous.
-        "G.SKILL Ripjaws V 16GB (2x8GB) DDR4-3600 RAM",
         // The seller wrote RTX for a GTX card; the series word is not droppable, by design.
         "Gigabyte GeForce RTX 1650 4GB",
-        // The catalog name carries MSI's `MAG` sub-brand, which the seller left out.
-        "MSI B850 Tomahawk Max Wifi Motherboard Only",
       ].sort(),
     );
   });

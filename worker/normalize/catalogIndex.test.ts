@@ -166,6 +166,73 @@ describe("catalog index -- every vocabulary element, one at a time", () => {
   });
 
   /**
+   * T14b. INNER_SUB_BRAND, element by element, with the count map as the evidence that each word
+   * is carried by real catalog names (not inert). Each row drops the word from a catalog name
+   * and must still resolve to that name; the NOT-ADMITTED rows pin the words deliberately left
+   * out, whose omission must stay a miss.
+   */
+  it("T14b: MSI's inner sub-brand words are droppable, and no other line's are", () => {
+    // Counted at EVERY position and at inner positions separately: production drops the word
+    // wherever it sits, and that is safe only while no catalog name LEADS with one.
+    const anywhere: Record<string, number> = { mag: 0, mpg: 0, meg: 0 };
+    const inner: Record<string, number> = { mag: 0, mpg: 0, meg: 0 };
+    for (const componentType of WORKER_TYPES) {
+      for (const model of catalogModels(componentType)) {
+        tokenize(model).forEach((token, index) => {
+          if (!(token.value in anywhere)) return;
+          anywhere[token.value] += 1;
+          if (index > 0) inner[token.value] += 1;
+        });
+      }
+    }
+    expect(inner).toEqual({ mag: 9, mpg: 3, meg: 1 });
+    expect(anywhere).toEqual(inner);
+
+    expect(match("motherboard", "MSI B850 Tomahawk Max Wifi")).toBe("MSI MAG B850 Tomahawk MAX WiFi");
+    expect(match("motherboard", "MSI X870E Carbon WiFi")).toBe("MSI MPG X870E Carbon WiFi");
+    expect(match("psu", "MSI Ai1300P PCIE5")).toBe("MSI MEG Ai1300P PCIE5");
+    // The full names still match: the variant is an extra entry point, never a replacement.
+    expect(match("motherboard", "MSI MAG B850 Tomahawk MAX WiFi")).toBe("MSI MAG B850 Tomahawk MAX WiFi");
+
+    // NOT ADMITTED. Each would merge a board with a cheaper sibling of the same model number.
+    expect(match("motherboard", "ASUS B850-F Gaming WiFi")).toBeNull();
+    expect(match("motherboard", "ASUS Gaming B760-Plus WiFi")).toBeNull();
+    expect(match("motherboard", "Gigabyte B850 Elite WiFi7")).toBeNull();
+    // The brand word is not optional: dropping `MAG` leaves `MSI B850 ...`, not `B850 ...`.
+    expect(match("motherboard", "B850 Tomahawk MAX WiFi")).toBeNull();
+  });
+
+  /**
+   * T14c. THE KIT-SPEC SKIP, both directions. Only a two-module kit whose modules multiply out to
+   * the named capacity is stepped over; a four-module kit is a different pool and stays a miss.
+   * The count map is the evidence that the skip can only ever fire inside a RAM name: it is the
+   * number of catalog names, per type, that CONTINUE after a `<digits> gb` capacity.
+   */
+  it("T14c: a 2-module kit spec after the capacity is skipped, and nothing else is", () => {
+    const continuesAfterGb: Partial<Record<Listing["componentType"], number>> = {};
+    for (const componentType of WORKER_TYPES) {
+      for (const model of catalogModels(componentType)) {
+        const values = tokenValues(tokenize(model));
+        const continues = values.some(
+          (value, index) => value === "gb" && /^[0-9]+$/.test(values[index - 1] ?? "") && index < values.length - 1,
+        );
+        if (continues) continuesAfterGb[componentType] = (continuesAfterGb[componentType] ?? 0) + 1;
+      }
+    }
+    expect(continuesAfterGb).toEqual({ ram: 26 });
+
+    expect(match("ram", "G.SKILL Ripjaws V 16GB (2x8GB) DDR4-3600 RAM")).toBe("G.Skill Ripjaws V 16GB DDR4");
+    expect(match("ram", "Corsair Vengeance LPX 32GB 2x16GB DDR4")).toBe("Corsair Vengeance LPX 32GB DDR4");
+    // NOT SKIPPED: four modules (a different pool), and a spec that does not multiply out.
+    expect(match("ram", "Corsair Vengeance LPX 32GB (4x8GB) DDR4")).toBeNull();
+    expect(match("ram", "Corsair Vengeance RGB 64GB (4x16GB) DDR5")).toBeNull();
+    expect(match("ram", "Corsair Vengeance LPX 32GB (2x8GB) DDR4")).toBeNull();
+    expect(match("ram", "Corsair Vengeance LPX 32GB (2x32GB) DDR4")).toBeNull();
+    // The spec must sit right AFTER the capacity: a leading spec is not a spec of anything.
+    expect(match("ram", "Corsair Vengeance LPX (2x16GB) 32GB DDR4")).toBeNull();
+  });
+
+  /**
    * T20. SUFFIX_WORDS, element by element: each one, following an otherwise-complete model name,
    * must refuse the match. The control is what stops this being satisfiable by a matcher that
    * refuses EVERY trailing word.
@@ -358,16 +425,24 @@ describe("catalog index -- exhaustive properties", () => {
     // A LITERAL MIRROR OF OPTIONAL_LEADING TOO, for the same reason as SUFFIX_MIRROR: importing
     // it would make this blind to a deletion from it.
     const LEADING_MIRROR = new Set(["geforce", "nvidia", "radeon", "amd", "intel", "core"]);
-    // Every core buildModelIndex inserts: the full token sequence, plus each suffix obtained by
-    // dropping leading optional tokens. `< length - 1` mirrors the production loop's guard
-    // against a name that is entirely optional-leading tokens collapsing to an empty core.
+    // And of INNER_SUB_BRAND: the sub-brand-dropped name is an entry point too, and a prefix
+    // relation that exists only between two dropped names pools exactly as badly.
+    const INNER_MIRROR = new Set(["mag", "mpg", "meg"]);
+    // Every core buildModelIndex inserts: the full token sequence and its sub-brand-dropped
+    // variant, plus each suffix obtained by dropping leading optional tokens. `< length - 1`
+    // mirrors the production loop's guard against a name that is entirely optional-leading
+    // tokens collapsing to an empty core.
     const cores = (model: string): string[][] => {
-      const sequence = tokenValues(tokenize(model));
-      const out = [sequence];
-      let start = 0;
-      while (start < sequence.length - 1 && LEADING_MIRROR.has(sequence[start])) {
-        start += 1;
-        out.push(sequence.slice(start));
+      const full = tokenValues(tokenize(model));
+      const dropped = full.filter((value, index) => index === 0 || !INNER_MIRROR.has(value));
+      const out: string[][] = [];
+      for (const sequence of dropped.length < full.length ? [full, dropped] : [full]) {
+        out.push(sequence);
+        let start = 0;
+        while (start < sequence.length - 1 && LEADING_MIRROR.has(sequence[start])) {
+          start += 1;
+          out.push(sequence.slice(start));
+        }
       }
       return out;
     };

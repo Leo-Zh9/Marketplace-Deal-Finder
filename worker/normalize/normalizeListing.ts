@@ -23,6 +23,7 @@ import {
   matchCatalogModels,
   matchCatalogSpans,
   phraseSpans,
+  phraseTokens,
   tokenValues,
   tokenize,
   type Token,
@@ -229,8 +230,28 @@ export const WHOLE_UNIT = new Set([
  *   `x 2`   -- as an anywhere-phrase it matches the catalog name `WD Black SN850X 2TB`.
  *   `x 3`   -- matches 8 X3D CPUs (`Ryzen 9 9950X3D`, ...).
  * The trailing form of `x N` ships instead, as `multiplierSuffix` below.
+ *
+ * `combo` CLOSES A BUNDLE HOLE THE `core` ENTRY POINT WIDENED (see OPTIONAL_LEADING in
+ * catalogIndex.ts). MEASURED: `"MSI PRO Z690-A i7 12700K combo"` under a cpu search was
+ * `VALID / Core i7-12700K` -- a board-plus-CPU bundle in the chip's own average, the INFLATING
+ * direction -- and `"ASUS TUF B650-Plus and Ryzen 7 7700X combo"` was `VALID / Ryzen 7 7700X`.
+ * Both name a board MODEL and no board MARKER, so rule 5 could not see the board. MEASURED: 0 of
+ * the 336 catalog names and no title any committed corpus pins as a match contains the word; the
+ * one live-corpus title that does (`"ASUS Motherboard CPU Combo with case included"`) is a bundle
+ * rule 5 already refused, and its outcome does not move.
  */
-export const MULTIPLE = ["lot of", "bundle", "pair of", "set of", "pcs", "pieces", "two", "three", "both"];
+export const MULTIPLE = [
+  "lot of",
+  "bundle",
+  "pair of",
+  "set of",
+  "pcs",
+  "pieces",
+  "two",
+  "three",
+  "both",
+  "combo",
+];
 
 /**
  * Multiplicity TOKENS, checked UNCONDITIONALLY -- NOT through `hasUncovered`.
@@ -476,7 +497,7 @@ const markerCoverage = (
   const covered = new Set<number>();
   const modelSpans = matchCatalogSpans(MODEL_INDEXES[declared], tokens);
   for (const phrase of MARKERS[declared]) {
-    for (const [from, to] of phraseSpans(values, tokenValues(tokenize(phrase)))) {
+    for (const [from, to] of phraseSpans(values, phraseTokens(phrase))) {
       const trailsAModel = modelSpans.some((span) => from >= span.end);
       for (let index = from; index < to; index += 1) {
         if (COVERED_ONLY_WHEN_TRAILING.has(values[index]) && !trailsAModel) continue;
