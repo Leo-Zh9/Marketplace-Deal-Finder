@@ -348,7 +348,7 @@ describe("the collection status panel", () => {
  * and asserts the exact sentence the user reads.
  */
 describe("the Discord alert line", () => {
-  const COUNTS = { pending: 2, sent24h: 3, deliveryUnknown: 1, failed: 4, lastSentAt: 1_800_000_000 };
+  const COUNTS = { pending: 0, sent24h: 3, deliveryUnknown: 1, failed: 0, lastSentAt: 1_800_000_000 };
 
   /**
    * N-1: EVERY STATE HAS ITS OWN SENTENCE. The mutation is collapsing any one branch -- the
@@ -402,4 +402,20 @@ describe("the Discord alert line", () => {
       expect(screen.getByText(/^Discord alerts: /)).not.toHaveTextContent(/sent|delivery/);
     },
   );
+
+  /**
+   * N-5: A COUNT THAT CANNOT BE PRINTED, ON A STATE THAT DOES NOT SHOW COUNTS, DOES NOT THROW.
+   * Review D's body. The mutation is building the counts string before the switch: then the
+   * template literal throws a TypeError for `off`, and with no error boundary the app unmounts.
+   * The client rebuilds the field too (C-n4); this row is the panel's own half.
+   */
+  it("N-5: off carrying an unprintable count still renders its line", () => {
+    const notifications = {
+      state: "off",
+      sent24h: { toString: null, valueOf: null },
+    } as unknown as CollectionStatus["notifications"];
+    render(<CollectionStatusPanel status={status({ notifications })} pending={false} />);
+
+    expect(screen.getByText("Discord alerts: off (webhook ready)")).toBeInTheDocument();
+  });
 });

@@ -71,7 +71,9 @@ The Collection panel renders `notifications` as one line (`src/components/Collec
 `N` is `sent24h`, a rolling 24-hour window rather than a calendar day, and `M` is
 `deliveryUnknown`. The counts appear only for `on` and `webhook-rejected`. The client
 (`src/services/marketplaceClient.ts`) checks the field separately from the rest of the status
-body, so a malformed field costs this one line and never fails the status poll.
+body, so a malformed field costs this one line and never fails the status poll. It also rebuilds
+the field from its checked parts, so nothing unchecked reaches the panel: an inert state is
+`{state}` alone.
 
 ## The table
 
