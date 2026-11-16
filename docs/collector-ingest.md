@@ -199,9 +199,10 @@ searches, each hand-labelled as one catalogued component (with its model), one u
 component, or not a standalone component, and each run under every search that returned it.
 Two hard gates — **0 wrong keys** (a keyed title carries its label's model and type under every
 search) and **no non-component keyed** — and a pinned floor: on master `404677e`, **36**
-standalone components, **13** catalogued, **9 of 13** keyed under every search, with the four
-misses named in the test. A rule change that should raise yield moves that floor on purpose; one
-that lowers it, or keys anything wrongly, goes red.
+standalone components, **13** catalogued, **9 of 13** keyed under every search. Part 2 raised it
+to **11 of 13** with two match rules (below) and names the two remaining misses in the test. A
+rule change that should raise yield moves that floor on purpose; one that lowers it, or keys
+anything wrongly, goes red.
 
 ### Status codes
 
@@ -329,6 +330,19 @@ and only removes a spurious `DEAL`.
 
 Two or more distinct models in one title is a refusal, not a choice.
 
+**Two ways a seller's wording differs from a catalog name are bridged, and both only ADD matches
+(Part 2, measured against the live corpus: +2 keyed, 0 wrong keys):**
+
+- **MSI's tier word is optional inside a name.** `mag`, `mpg` and `meg` may be left out —
+  `"MSI B850 Tomahawk Max Wifi"` is `MSI MAG B850 Tomahawk MAX WiFi`. 13 catalog names carry one,
+  each still matches in full, and 0 of the 13 extra entry points equals any other name. ASUS
+  `ROG Strix` / `TUF`, Gigabyte `Aorus` and MSI `PRO` are **not** optional: each names a board
+  whose model number a cheaper sibling shares, so dropping it is how two prices pool.
+- **A two-module kit spec right after the capacity is stepped over.** `"G.SKILL Ripjaws V 16GB
+  (2x8GB) DDR4"` is `G.Skill Ripjaws V 16GB DDR4` — but only when there are **2** modules and
+  2 × size = capacity. A `32GB (4x8GB)` kit is a different pool from the two-module kit the name
+  means and stays unmatched, as does a spec that does not multiply out.
+
 ### The type comes from the title when the title proves it
 
 `listings` is keyed `(source, listing_id)` and holds **one** `component_type`, and Facebook
@@ -444,7 +458,7 @@ Not addressed here; it belongs to the later parts that gate that leg.
                       desktop, ...)                                         -> INVALID_REFERENCE
 5.  foreign parts     another component type is evidenced                   -> INVALID_REFERENCE
 6.  multiple models   two catalog models of the declared type               -> INVALID_REFERENCE
-7.  unknown quantity  lot of / bundle / pcs / two / three / both, a `pack`
+7.  unknown quantity  lot of / bundle / pcs / two / three / both / combo, a `pack`
                       token, or an `Nx` multiplier in the first two tokens
                       or the last two                                       -> NEEDS_REVIEW
 8.  placeholder zero  price 0 and nothing says the ITEM is free: `free` must
