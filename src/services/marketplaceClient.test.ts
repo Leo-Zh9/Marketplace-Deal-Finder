@@ -483,4 +483,22 @@ describe("the kept searches", () => {
     expect(status.collector).toBeNull();
     expect(status.status).toBe("unknown");
   });
+
+  /**
+   * THE PRE-ALERTING WORKER'S BODY IS REFUSED, NOT CAST. Its `status` is a known word, so a
+   * check on `status` alone would pass it; `causes` and `collector` are what it lacks. The
+   * mutation is returning the body unchecked.
+   */
+  it.each<[string, unknown]>([
+    ["the old stub body", { status: "ok", phase: 2, authentication: "firebase-google" }],
+    ["an unknown status word", { status: "fine", causes: [], reportedAt: 0, ageMinutes: 0, collector: null }],
+    ["a collector without its counts", { status: "ok", causes: [], reportedAt: 0, ageMinutes: 0, collector: {} }],
+  ])("refuses %s as unreadable", async (_label, body) => {
+    stubJson(body);
+
+    await expect(marketplaceClient.getStatus(noToken)).rejects.toMatchObject({
+      name: "ApiRequestError",
+      kind: "unexpected",
+    });
+  });
 });

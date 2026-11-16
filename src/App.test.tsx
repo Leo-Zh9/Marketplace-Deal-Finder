@@ -99,6 +99,8 @@ interface Wire {
   verdicts?: { listings: Listing[]; truncated: boolean };
   /** What `GET /api/status` answers. The default is a healthy nine-target collector. */
   status?: CollectionStatus;
+  /** A raw `/api/status` body, served exactly as given. Wins over `status`. */
+  statusRaw?: unknown;
   statusStatus?: number;
 }
 
@@ -160,7 +162,7 @@ const stubWire = (wire: Wire = {}) => {
       if (path === "/api/status") {
         return wire.statusStatus !== undefined && wire.statusStatus !== 200
           ? reply({ error: { code: "AUTH_KEYS_UNAVAILABLE" } }, wire.statusStatus)
-          : reply(wire.status ?? HEALTHY_STATUS);
+          : reply(wire.statusRaw ?? wire.status ?? HEALTHY_STATUS);
       }
       throw new Error(`unexpected request: ${method} ${String(url)}`);
     },
@@ -1004,6 +1006,29 @@ describe("the control panel", () => {
     // `role="alert"`, and the absence of ANY alert is the assertion: a status failure must not
     // put a page-level error over the form the user came to edit.
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  /**
+   * A-2b: THE PRE-ALERTING WORKER'S `/api/status` BODY, EXACTLY, DOES NOT BLANK THE PAGE.
+   *
+   * The frontend and the API Worker deploy separately, so this body reaches the new panel when
+   * the frontend ships first, when the API deploy fails, or when the API is rolled back. It has
+   * a known `status` word and no `causes` or `collector`. THE MUTATION IS RETURNING THE BODY
+   * UNCHECKED from `getStatus`: the panel's render then throws on `causes.length`, nothing in
+   * `src/` catches it, and the whole dashboard goes blank, so the form below is not found.
+   */
+  it("A-2b: the old Worker's status body reads as unreadable, and the form still renders", async () => {
+    stubWire({
+      watch: LIVE_WATCH,
+      settings: null,
+      statusRaw: { status: "ok", phase: 2, authentication: "firebase-google" },
+    });
+    render(<App getToken={noToken} />);
+    await waitForLoad("9 of 9 searches used");
+
+    expect(await screen.findByText(/status could not be read/)).toBeInTheDocument();
+    expect(screen.queryByText("Collecting")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save searches" })).toBeEnabled();
   });
 
   /**

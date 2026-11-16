@@ -967,6 +967,13 @@ the Mac awake (the user's machine, not ours).
 > **Before EITHER lands**, the route does not exist and the deployed Worker falls through to
 > `authenticateRequest`, so the POST answers **401 `AUTH_TOKEN_MISSING`** — measured, not
 > predicted. Same consequence: one trailing line, no change to any exit code.
+>
+> **THEN THE API WORKER, THEN THE FRONTEND.** The full order is: migration →
+> `marketplace-deal-finder-api` (`wrangler.jsonc`) → `marketplace-deal-finder` (the dashboard,
+> `wrangler.frontend.jsonc`). The old API answers `/api/status` with `{status:"ok", phase:2}`,
+> which has no `causes` and no `collector`. The dashboard checks the body and shows "The
+> collector's status could not be read" rather than going blank, so a frontend that lands first
+> (or an API rollback) costs the panel, not the page. The order is still API first.
 
 > **REVERSAL, RECORDED.** This paragraph also listed **a Worker-side "last collection at"
 > endpoint** as deliberately not done. It is now built: `POST /api/collector-health` and the
