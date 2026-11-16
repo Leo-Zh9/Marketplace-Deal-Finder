@@ -348,6 +348,7 @@ describe("the collection status panel", () => {
  * and asserts the exact sentence the user reads.
  */
 describe("the Discord alert line", () => {
+  // `pending` and `failed` are 0 here, so the N-1 sentences are the quiet-day ones. N-4 sets them.
   const COUNTS = { pending: 0, sent24h: 3, deliveryUnknown: 1, failed: 0, lastSentAt: 1_800_000_000 };
 
   /**
@@ -402,6 +403,33 @@ describe("the Discord alert line", () => {
       expect(screen.getByText(/^Discord alerts: /)).not.toHaveTextContent(/sent|delivery/);
     },
   );
+
+  /**
+   * N-4: `pending` AND `failed` SHOW WHEN NON-ZERO, ON BOTH COUNTED STATES. Review D: without
+   * them a sender that has stalled (rows piling up PENDING) or is being refused (FAILED) reads
+   * exactly like a quiet day. The mutations are dropping either phrase, which fails its own rows,
+   * and showing either at zero, which fails the both-zero row.
+   */
+  it.each<[string, NonNullable<CollectionStatus["notifications"]>, string]>([
+    ["on, pending only", { state: "on", ...COUNTS, pending: 2 }, "Discord alerts: on, 3 sent in the last 24 hours, 1 delivery unknown, 2 pending"],
+    ["on, failed only", { state: "on", ...COUNTS, failed: 4 }, "Discord alerts: on, 3 sent in the last 24 hours, 1 delivery unknown, 4 failed"],
+    ["on, both", { state: "on", ...COUNTS, pending: 2, failed: 4 }, "Discord alerts: on, 3 sent in the last 24 hours, 1 delivery unknown, 2 pending, 4 failed"],
+    ["on, both zero", { state: "on", ...COUNTS }, "Discord alerts: on, 3 sent in the last 24 hours, 1 delivery unknown"],
+    [
+      "webhook-rejected, pending only",
+      { state: "webhook-rejected", ...COUNTS, pending: 2 },
+      "Discord alerts: webhook rejected, replace the secret. 3 sent in the last 24 hours, 1 delivery unknown, 2 pending",
+    ],
+    [
+      "webhook-rejected, failed only",
+      { state: "webhook-rejected", ...COUNTS, failed: 4 },
+      "Discord alerts: webhook rejected, replace the secret. 3 sent in the last 24 hours, 1 delivery unknown, 4 failed",
+    ],
+  ])("N-4: %s", (_label, notifications, sentence) => {
+    render(<CollectionStatusPanel status={status({ notifications })} pending={false} />);
+
+    expect(screen.getByText(sentence)).toBeInTheDocument();
+  });
 
   /**
    * N-5: A COUNT THAT CANNOT BE PRINTED, ON A STATE THAT DOES NOT SHOW COUNTS, DOES NOT THROW.

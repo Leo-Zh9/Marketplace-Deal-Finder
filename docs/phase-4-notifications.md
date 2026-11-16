@@ -62,14 +62,16 @@ The Collection panel renders `notifications` as one line (`src/components/Collec
 | `unconfigured` | Discord alerts: not configured |
 | `invalid-url` | Discord alerts: webhook URL invalid |
 | `off` | Discord alerts: off (webhook ready) |
-| `on` with counts | Discord alerts: on, N sent in the last 24 hours, M delivery unknown |
+| `on` with counts | Discord alerts: on, N sent in the last 24 hours, M delivery unknown[, P pending][, F failed] |
 | `on` with no counts (the Worker could not read the table) | Discord alerts: on (counts unavailable) |
-| `webhook-rejected` | Discord alerts: webhook rejected, replace the secret. N sent in the last 24 hours, M delivery unknown |
+| `webhook-rejected` | Discord alerts: webhook rejected, replace the secret. N sent in the last 24 hours, M delivery unknown[, P pending][, F failed] |
 | present but malformed | Discord alerts: status unreadable |
 | absent (an API Worker older than this backend) | no line; the rest of the panel renders as before |
 
 `N` is `sent24h`, a rolling 24-hour window rather than a calendar day, and `M` is
-`deliveryUnknown`. The counts appear only for `on` and `webhook-rejected`. The client
+`deliveryUnknown`. `P` (`pending`) and `F` (`failed`) are added only when they are above 0, so a
+sender that has stalled or is being refused does not read like a quiet day. The counts appear only
+for `on` and `webhook-rejected`. The client
 (`src/services/marketplaceClient.ts`) checks the field separately from the rest of the status
 body, so a malformed field costs this one line and never fails the status poll. It also rebuilds
 the field from its checked parts, so nothing unchecked reaches the panel: an inert state is
