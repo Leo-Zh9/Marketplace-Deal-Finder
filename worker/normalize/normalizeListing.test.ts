@@ -18,7 +18,9 @@
  */
 
 import type { Listing } from "../storage/types";
-import { tokenValues, tokenize } from "./catalogIndex";
+import { phraseTokens, tokenValues, tokenize } from "./catalogIndex";
+import { parsePriceText } from "../api/priceText";
+import { LIVE_CORPUS } from "./testing/liveCorpus";
 import {
   ACCESSORY,
   BROKEN,
@@ -333,6 +335,11 @@ const ACCESSORY_EVERYWHERE: [name: string, title: string, priceCents: number][] 
   ["AX-g2: a gpu fan for a named card", "GPU fan PWM 4pin replacement for RTX 3070", 2450],
   ["AX-g3: a gpu cooler fan with no other accessory word", "RTX 3080 FE fan", 2550],
   ["AX-g4: a case fan sold for a named card's build", "Arctic P12 PWM case fan for RTX 4090 build", 2000],
+  // THE OPEN-BOX EXEMPTION NEEDS `open` DIRECTLY BEFORE `box`. Anywhere-in-the-title would key
+  // the first as a VALID RTX 4090 at a box price, and "open to offers" is common seller copy.
+  // The second is ACCESSORY's own example: one exempt `box` does not excuse another.
+  ["AX-o1: a box, open to offers", "RTX 4090 original box - open to offers", 2650],
+  ["AX-o2: an open box that is also an original box", "RTX 4090 open box with original box", 2750],
 ];
 
 /**
@@ -1153,6 +1160,40 @@ describe("normalizeListing -- properties of the vocabularies", () => {
         "ACCESSORY:fans < MARKERS.case_fan:case fans",
       ].sort(),
     );
+  });
+
+  /**
+   * T49: THE SHARED PHRASE CACHE IS NEVER MUTATED. `phraseTokens` hands every caller the SAME
+   * array for a phrase, for the life of the isolate, and it is deliberately not frozen (a frozen
+   * array measured 2.8x slower to read; see catalogIndex.ts). So a caller that mutated one would
+   * poison every later request. This runs real traffic first -- every live-corpus title under
+   * every search that returned it, and the T21f frames under a cross-type and a same-type search
+   * -- then checks each cached phrase against a fresh tokenization. No runtime cost.
+   */
+  it("T49: after real traffic, every cached phrase still equals its fresh tokenization", () => {
+    for (const entry of LIVE_CORPUS) {
+      for (const componentType of entry.searchedAs) {
+        normalizeListing({ title: entry.title, priceCents: parsePriceText(entry.priceText), componentType });
+      }
+    }
+    for (const phrase of ACCESSORY) {
+      for (const componentType of ["cpu", "gpu"] as const) {
+        normalizeListing({ title: `GeForce RTX 5080 ${phrase}`, priceCents: 39100, componentType });
+      }
+    }
+    const phrases = [
+      ...Object.values(MARKERS).flat(),
+      ...WANTED,
+      ...TRADE,
+      ...BROKEN,
+      ...SYSTEM_PHRASES,
+      ...MULTIPLE,
+      ...ACCESSORY,
+    ];
+    expect(phrases.map((phrase) => [phrase, [...phraseTokens(phrase)]])).toEqual(
+      phrases.map((phrase) => [phrase, tokenValues(tokenize(phrase))]),
+    );
+    expect(phrases.length).toBeGreaterThan(100);
   });
 
   /** T37: the spec's 3B acceptance gate -- every component type is exercised, not just gpu. */
