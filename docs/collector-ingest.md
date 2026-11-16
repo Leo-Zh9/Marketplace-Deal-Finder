@@ -304,7 +304,7 @@ owns what a listing *is*. Both are pure functions of `(title, priceCents, compon
 Lower-case, split on every non-alphanumeric character, then split each run at its letter/digit
 boundaries — so `"rtx5080"`, `"RTX 5080"` and `"RTX-5080"` tokenize alike. There is deliberately
 **no `normalize("NFKD")`**: measured, `"RTX™".toLowerCase().normalize("NFKD")` is `"rtxTM"`,
-because U+2122 decomposes to an upper-case `TM`, and 0 of the 336 catalog names contain a
+because U+2122 decomposes to an upper-case `TM`, and 0 of the 337 catalog names contain a
 non-ASCII character anyway.
 
 The tokenizer stops at **64 tokens**. A title that reaches that bound *may* have been truncated,
@@ -317,8 +317,8 @@ the 15 live titles is 18, so nothing real is near the bound.
 ### The match: a prefix trie per component type, and three guards
 
 Each component type gets a trie built once at module load from its catalog names, plus every
-suffix obtained by dropping a leading `geforce`/`nvidia`/`radeon`/`amd`/`intel`/`core` — 336
-models, 423 entry points (the names plus 87 vendor-stripped cores: geforce 43, radeon 20,
+suffix obtained by dropping a leading `geforce`/`nvidia`/`radeon`/`amd`/`intel`/`core` — 337
+models, 424 entry points (the names plus 87 vendor-stripped cores: geforce 43, radeon 20,
 intel 5, core 19). Series words (`rtx`, `rx`, `gtx`, `arc`) are **not** droppable: a bare `5080`
 in the trie would match Dell's OptiPlex 5080. The cost is that `"Selling my 4070 Super"` is a
 miss, and a miss is safe.
@@ -757,7 +757,7 @@ discovered in an aggregate.
 > own rule resolves to a catalog model together with a positive price.
 >
 > What the server still decides: `model_key` is not a wire field and cannot be chosen directly —
-> it is one of the 336 names in `src/data/catalog.ts` or `NULL`, and only a title the rule
+> it is one of the 337 names in `src/data/catalog.ts` or `NULL`, and only a title the rule
 > resolves to that model produces it. `variant_key` is written as `''` by `recordSightings`'
 > `normalizeVariantKey`. `validity` comes from the same rule, so a listing the rule refuses
 > cannot be marked `VALID`, and `model_key IS NOT NULL` implies `validity = 'VALID'`.

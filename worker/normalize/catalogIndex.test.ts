@@ -10,7 +10,7 @@
  * RE-DERIVED: the per-guard figures below were measured over 5,808 generated titles against THE
  * 176-NAME CATALOG AS OF PR #14 (176 names x (1 + 16 suffixes x 2 concatenation forms)) --
  * removing one guard and keeping the rest changed W 84 results, G1 5, B2 518, G2 1,580. The
- * catalog now holds 336 names, so the title count is 11,088 and those four numbers no longer
+ * catalog now holds 337 names, so the title count is 11,121 and those four numbers no longer
  * describe this repo. A faithful reconstruction of the generator gave W 44, G1 0, B2 171,
  * G2 2,284 against the same 176 names, so the construction that produced them is not recoverable
  * and the post-change figures were NOT invented to replace them.
@@ -154,7 +154,7 @@ describe("catalog index -- the match and its guards", () => {
  * Intel Arc listing that omits the word "Intel".
  *
  * Named limitation: these pin removals and changes, NOT additions. A new entry in either set is
- * caught only where it breaks T11's 336 self-resolutions, T13's overlap audit, or -- for a
+ * caught only where it breaks T11's 337 self-resolutions, T13's overlap audit, or -- for a
  * catalog name rather than a vocabulary entry -- T47 and T48 below.
  */
 describe("catalog index -- every vocabulary element, one at a time", () => {
@@ -322,7 +322,7 @@ describe("catalog index -- exhaustive properties", () => {
    * With nine numbers a MOVE shows as two counts changing and the diff NAMES BOTH TYPES, a name
    * added to the wrong block shows as the total plus one count, and a deletion shows as the
    * total. The consequence of a misfile is a LOST reference rather than a wrong price -- the
-   * real listing stops matching and the foreign side is refused by rule 5 -- but with 336 names
+   * real listing stops matching and the foreign side is refused by rule 5 -- but with 337 names
    * hand-sorted into nine arrays, which array a line landed in is the single most likely error
    * in this file.
    *
