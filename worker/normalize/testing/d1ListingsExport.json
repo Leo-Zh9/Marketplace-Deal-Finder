@@ -1,0 +1,113 @@
+[
+  {
+    "results": [
+      {
+        "listing_id": "fx-same",
+        "title": "GIGABYTE EAGLE RTX 5070 12GB VRAM",
+        "price_cents": 119900,
+        "component_type": "gpu",
+        "validity": "VALID",
+        "model_key": "GeForce RTX 5070"
+      },
+      {
+        "listing_id": "fx-gain",
+        "title": "ASUS RTX 5070 Ti Prime OC 16G(see description)",
+        "price_cents": 194900,
+        "component_type": "cpu",
+        "validity": "INVALID_REFERENCE",
+        "model_key": null
+      },
+      {
+        "listing_id": "fx-lose",
+        "title": "Gaming PC i9 RTX 3070 16gb RAM",
+        "price_cents": 95000,
+        "component_type": "gpu",
+        "validity": "VALID",
+        "model_key": "GeForce RTX 3070"
+      },
+      {
+        "listing_id": "fx-change",
+        "title": "Zotac Gaming RTX 3080 Trinity OC 10Gb",
+        "price_cents": 69000,
+        "component_type": "gpu",
+        "validity": "VALID",
+        "model_key": "GeForce RTX 3080 Ti"
+      },
+      {
+        "listing_id": "fx-validity",
+        "title": "Several Hard Drives",
+        "price_cents": 1000,
+        "component_type": "storage",
+        "validity": "VALID",
+        "model_key": null
+      },
+      {
+        "listing_id": "fx-type",
+        "title": "Gaming PC – GTX 1080 Ti 11GB | 16GB RAM",
+        "price_cents": 65000,
+        "component_type": "cpu",
+        "validity": "INVALID_REFERENCE",
+        "model_key": null
+      },
+      {
+        "listing_id": "fx-unmatched",
+        "title": "MSI PRO Z790-A MAX WIFI MOTHERBOARD",
+        "price_cents": 20000,
+        "component_type": "motherboard",
+        "validity": "VALID",
+        "model_key": null
+      },
+      {
+        "listing_id": "fx-quantity",
+        "title": "Bulk Lot of Key-Shaped USB Flash Drives 30 pieces",
+        "price_cents": 500,
+        "component_type": "gpu",
+        "validity": "NEEDS_REVIEW",
+        "model_key": null
+      },
+      {
+        "listing_id": "fx-no-price",
+        "title": "1050TI GPU",
+        "price_cents": null,
+        "component_type": "gpu",
+        "validity": "VALID",
+        "model_key": null
+      },
+      {
+        "listing_id": "fx-multiline",
+        "title": "Cobra CPI 450 Power Inverter – $40 CAD\n\nCobra 400W DC to AC Power Inverter (800W peak).\n\nIncludes:",
+        "price_cents": 4000,
+        "component_type": "cpu",
+        "validity": "NEEDS_REVIEW",
+        "model_key": null
+      },
+      {
+        "listing_id": "fx-same",
+        "title": "GIGABYTE EAGLE RTX 5070 12GB VRAM",
+        "price_cents": 119900,
+        "component_type": "gpu",
+        "validity": "VALID",
+        "model_key": "GeForce RTX 5070"
+      },
+      {
+        "listing_id": "fx-skipped",
+        "title": "AMD RX 580 8G GDDR5 Graphics Card",
+        "price_cents": 15000,
+        "component_type": "gpuu",
+        "validity": "VALID",
+        "model_key": null
+      }
+    ],
+    "success": true,
+    "meta": {
+      "served_by": "fixture",
+      "duration": 0.3,
+      "changes": 0,
+      "last_row_id": 0,
+      "changed_db": false,
+      "size_after": 0,
+      "rows_read": 12,
+      "rows_written": 0
+    }
+  }
+]

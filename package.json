@@ -10,6 +10,7 @@
     "build": "tsc -b && vite build",
     "typecheck:worker": "tsc -p tsconfig.worker.json",
     "typecheck:collector": "tsc -p tsconfig.collector.json",
+    "typecheck:scripts": "tsc -p tsconfig.scripts.json",
     "lint": "eslint .",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -18,7 +19,7 @@
     "preview": "vite preview",
     "db:migrate:local": "wrangler d1 migrations apply marketplace-deal-finder-db --local",
     "db:migrate": "wrangler d1 migrations apply marketplace-deal-finder-db --remote",
-    "check": "npm run lint && npm run test && npm run build && npm run typecheck:worker && npm run typecheck:collector"
+    "check": "npm run lint && npm run test && npm run build && npm run typecheck:worker && npm run typecheck:collector && npm run typecheck:scripts"
   },
   "dependencies": {
     "firebase": "^12.19.0",
