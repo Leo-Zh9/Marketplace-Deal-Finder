@@ -20,6 +20,15 @@ import {
   type CollectorConfig,
   type RunSummary,
 } from "./run.ts";
+import type { HealthPostResult, RunHealthReport } from "./postRunHealth.ts";
+import {
+  advanceState,
+  parseRunState,
+  selectProbe,
+  serializeRunState,
+  type PairOverlap,
+  type TargetRun,
+} from "./runState.ts";
 import {
   parseMarket,
   parseTarget,
@@ -181,9 +190,25 @@ export interface RunAllTargetsConfig {
 
 export interface RunAllTargetsDependencies {
   fetchTargets: (input: FetchWatchTargetsInput) => Promise<FetchWatchTargetsResult>;
-  run: (config: CollectorConfig) => Promise<{ exitCode: number; summary: RunSummary }>;
+  run: (
+    config: CollectorConfig,
+  ) => Promise<{ exitCode: number; summary: RunSummary; listingIds: readonly string[] }>;
   sleep: (milliseconds: number) => Promise<void>;
   log: (line: string) => void;
+  /**
+   * THE THREE NEW SEAMS, AND ALL THREE ARE REQUIRED RATHER THAN OPTIONAL. The lesson main.ts's
+   * own header draws from the throttle is that "a dependency supplied here is only as good as
+   * what observes it" -- and an optional seam with a no-op default is a dependency nothing
+   * observes. A missing one is a `tsc` error.
+   *
+   * `readState` returns the file's bytes, or `null` when there is no file. It must NOT throw;
+   * `runAllTargets` catches anyway, and an unreadable file is a fresh state at FULL volume.
+   */
+  readState: () => Promise<string | null>;
+  /** Writes the bytes. A throw is caught, reported as `guard-blind`, and changes no exit code. */
+  writeState: (serialized: string) => Promise<void>;
+  /** One report per run line. A failure is reported on a trailing log line, never as an exit. */
+  postHealth: (report: RunHealthReport) => Promise<HealthPostResult>;
 }
 
 interface TargetOutcome {
@@ -192,6 +217,19 @@ interface TargetOutcome {
   exitCode: number;
   summary?: RunSummary;
   error?: string;
+  /**
+   * NOT LOGGED, and that is the point of keeping it off `summary`. `emitTarget` spreads
+   * `...outcome.summary` into the per-target line, so ids held there would put 216 of them into
+   * every run's worth of the one file that is the real signal history.
+   */
+  listingIds?: readonly string[];
+  /**
+   * ALSO NOT LOGGED, and for a smaller reason: the query is already in the watch list the
+   * operator edits, so repeating it 216 times a day adds nothing. It reaches `advanceState` so
+   * that two rows carrying the SAME query under different component types are not read as a
+   * generic feed -- they make the identical request, so they overlap 1.000 by construction.
+   */
+  query: string;
 }
 
 /**
@@ -210,7 +248,16 @@ interface TargetOutcome {
  *
  * THERE IS NO `attempted` FIELD AND NO `ran` FIELD. Adding one is the obvious way to reconcile
  * the invariant, and it is the wrong one: it makes "how many ran" the headline number and
- * invites a later edit to redefine `targets` to match.
+ * invites a later edit to redefine `targets` to match. THE THREE FIELDS ADDED BELOW DO NOT
+ * REINTRODUCE ONE: `canary` is a BOOLEAN decided from the persisted latch, not a count, and the
+ * page's "2 of 9" sentence is derived from `targets` and CANARY_TARGETS (P-8).
+ *
+ * THE THREE NEW FIELDS ARE APPENDED AFTER `dryRun`/`error`, AND THE ORDER IS A HARD CONSTRAINT
+ * RATHER THAN A STYLE. `scripts/e2e-local.sh` matches SUBSTRINGS of this serialized line --
+ * `'"targets":3,"complete":false,"exitCode":6,"exitCodes":{"0":2,"6":1}'` at :384 and two more
+ * at :245 and :641 -- which stay contiguous only while every new field goes on the END of every
+ * object literal that builds a RunLine. Inserting one in the middle turns those rows red for a
+ * reason that has nothing to do with what they test.
  */
 export interface RunLine {
   kind: "run";
@@ -221,6 +268,28 @@ export interface RunLine {
   delayMs: number;
   dryRun: boolean;
   error?: string;
+  /**
+   * THE VOLUME CUT IS ENGAGED: strictly fewer searches ran than the watch list holds, because a
+   * guard is latched. DECIDED FROM THE PERSISTED LATCH AND NEVER FROM HOW MANY TARGETS
+   * SUCCEEDED -- see the invariant below, whose third clause is only non-vacuous because of it.
+   */
+  canary: boolean;
+  /**
+   * THE LATCHED CAUSES, SORTED, PLUS THE TWO NON-LATCHING REPORTS (`canary-expired`,
+   * `guard-blind`). `health-unreported` is DELIBERATELY NOT HERE: it is not known until after
+   * this line has been printed, so putting it here would mean either buffering the line behind a
+   * network call or letting the log's `alarms` and the health row's `alarms` differ by
+   * construction -- two authorities on one field. It gets its own trailing line instead.
+   */
+  alarms: string[];
+  /**
+   * THE WORST MEASURABLE PAIR, LOGGED ON EVERY RUN, INCLUDING WHEN IT DID NOT TRIP AND INCLUDING
+   * WHEN IT SAT BELOW THE FLOOR. That is what keeps OVERLAP_ALARM_FRACTION re-derivable from
+   * production rather than frozen at the ten ad-hoc pairs it was derived from -- and it is the
+   * only positive evidence available at the process layer that the computation ran at all.
+   * `null` when no pair had two non-empty id sets.
+   */
+  overlap: PairOverlap | null;
 }
 
 const histogram = (codes: readonly number[]): Record<string, number> => {
@@ -241,19 +310,33 @@ const isComplete = (targets: number, codes: readonly number[]): boolean =>
   targets > 0 && codes.length === targets && codes.every((code) => code === EXIT_OK);
 
 /**
- * THE INVARIANT HAS TWO CLAUSES AND BOTH ARE TOTAL:
+ * THE INVARIANT HAS THREE CLAUSES AND ALL THREE ARE TOTAL:
  *
- *   error !== undefined  =>  exitCodes is EMPTY
- *   error === undefined  =>  sum(Object.values(exitCodes)) === targets
+ *   error !== undefined                =>  exitCodes is EMPTY
+ *   error === undefined && !canary     =>  sum(Object.values(exitCodes)) === targets
+ *   error === undefined && canary      =>  sum === probeSet.length  AND  0 < probeSet.length < targets
  *
  * The one-clause form ("the sum always equals targets") is FALSE on two of the four whole-run
  * failure paths -- cap-exceeded and null-market both report `targets:N` with an empty
  * `exitCodes` -- and stating it flatly is not a cosmetic error: an implementer reconciles it the
  * obvious way by redefining `targets` as the count that RAN, and under that redefinition the
  * natural `targets.filter(parseOk)` reports `complete:true`, exit 0, and SILENTLY STOPS ONE OF
- * THE USER'S SEARCHES while every other test still passes. The two-clause form is what makes a
- * dropped target unrepresentable. runTargets.test.ts L-11 asserts it as a property over every
+ * THE USER'S SEARCHES while every other test still passes. The multi-clause form is what makes
+ * a dropped target unrepresentable. runTargets.test.ts L-11 asserts it as a property over every
  * case in that file.
+ *
+ * CLAUSE 3'S SECOND CONJUNCT IS LOAD-BEARING AND WAS NEARLY LEFT OUT. The shorter form
+ * `sum === probeSet.length < targets` HOLDS at `probeSet.length = 0` -- `0 === 0 && 0 < targets`
+ * -- which pushes the "a run that collects nothing and exits 0 is unrepresentable" guarantee out
+ * of the invariant and into a behaviour test. `0 < probeSet.length` is what keeps the invariant
+ * witnessing the guarantee its own docstring claims. L-26 is the behavioural half and both
+ * halves are kept.
+ *
+ * AND CLAUSE 3 IS SAFE ONLY BECAUSE `canary` IS DECIDED FROM THE PERSISTED LATCH, NEVER FROM HOW
+ * MANY TARGETS RAN OR SUCCEEDED. `selectProbe` returns the INDICES to run and the boolean
+ * together, so `probeSet.length` is the length of that plan and not a count taken afterwards. If
+ * a future edit derives `canary` from the ran-count, this clause becomes a tautology again and
+ * the dropped-target guarantee is gone with it. L-17 and L-18 are the pins.
  */
 const wholeRunFailure = (
   config: RunAllTargetsConfig,
@@ -269,14 +352,73 @@ const wholeRunFailure = (
   delayMs: config.delayMs,
   dryRun: config.process.dryRun,
   error,
+  // NO TARGETS RAN, so no volume was cut, nothing was measured and no state is written at all.
+  // A whole-run failure that reported `canary:true` would claim a reduction it did not make.
+  canary: false,
+  alarms: [],
+  overlap: null,
 });
 
 export const runAllTargets = async (
   config: RunAllTargetsConfig,
   dependencies: RunAllTargetsDependencies,
 ): Promise<number> => {
-  const emit = (line: RunLine): number => {
+  /**
+   * THE RUN LINE GOES OUT FIRST AND SYNCHRONOUSLY. THEN the health POST. THEN, only on failure,
+   * one trailing line. THAT ORDER IS A RULING AND REVERSING IT IS THE DEFECT.
+   *
+   * `emitTarget` below states the contract in capitals -- "PRINTED AS IT HAPPENS, not buffered:
+   * a process killed mid-run still leaves the record of everything that completed" -- and the
+   * run line is subject to the same contract for a sharper reason: it is the laptop's only
+   * durable record, it is what `docs/collector-ingest.md`'s shipped health check reads, and
+   * today it CANNOT BE LOST AT ALL.
+   *
+   * Awaiting a 10 s network call BEFORE printing it would make it losable, and the exposure
+   * window would be LONGEST EXACTLY WHEN THE WORKER IS UNREACHABLE -- i.e. in the scenario this
+   * whole slice exists for. The loss probability is not a flat 10 s in 1,800; it is CORRELATED
+   * WITH THE FAILURE BEING REPORTED.
+   *
+   * THE TRAILING LINE IS WHY `health-unreported` IS NOT IN `alarms`. Putting it there would need
+   * the POST's outcome before the line is serialized, which is the ordering above; the
+   * alternative -- reporting it in the log but not in the body that was sent -- makes the log's
+   * `alarms` and the health row's `alarms` differ by construction. Append-only, so it breaks no
+   * substring any existing gate row matches, and the two arrays are identical by construction.
+   */
+  const emit = async (line: RunLine): Promise<number> => {
     dependencies.log(JSON.stringify(line));
+
+    /**
+     * WRAPPED, AND THE REASON IS STRUCTURAL RATHER THAN A KNOWN BUG. `postRunHealth` catches its
+     * own `fetch` rejection, so nothing reachable throws here today -- but leaving it unwrapped
+     * makes invariant 1 ("the exit codes are the operator's only signal") rest on a CALLEE's
+     * internal discipline instead of on this function's shape. An unhandled rejection out of
+     * here would replace the operator's only signal with exit 1 and a stack trace, and launchd
+     * would record a failure for a health report. `writeState` below is wrapped for the same
+     * reason; the two seams now agree.
+     */
+    let reported: HealthPostResult;
+    try {
+      reported = await dependencies.postHealth({
+        exitCode: line.exitCode,
+        complete: line.complete,
+        canary: line.canary,
+        dryRun: line.dryRun,
+        // `COLLECTOR_HTML_FILE` IS THE SAME LIE AS `COLLECTOR_DRY_RUN` BY A DIFFERENT MECHANISM:
+        // a punctual run, exit 0, `complete:true`, every listing stored -- off a saved page.
+        fixture: config.process.htmlFile !== null,
+        targets: line.targets,
+        alarms: line.alarms,
+      });
+    } catch {
+      reported = { ok: false, reason: "threw" };
+    }
+
+    if (!reported.ok) {
+      dependencies.log(
+        JSON.stringify({ kind: "run-health", reported: false, reason: reported.reason }),
+      );
+    }
+
     return line.exitCode;
   };
 
@@ -302,7 +444,7 @@ export const runAllTargets = async (
   // reach it. main.ts is the one file no unit test runs. A non-integer is refused for the same
   // reason -- `sleep(NaN)` is `setTimeout(NaN)`, which fires immediately.
   if (!Number.isInteger(config.delayMs) || config.delayMs < 0) {
-    return emit(
+    return await emit(
       wholeRunFailure(
         config,
         0,
@@ -316,7 +458,7 @@ export const runAllTargets = async (
   // large cannot fit MAX_TARGETS_PER_RUN inside one schedule window, and the failure it causes
   // is a silently skipped window rather than anything an operator would notice.
   if (config.delayMs * (MAX_TARGETS_PER_RUN - 1) > SCHEDULE_WINDOW_MS) {
-    return emit(
+    return await emit(
       wholeRunFailure(
         config,
         0,
@@ -325,6 +467,26 @@ export const runAllTargets = async (
       ),
     );
   }
+
+  /**
+   * THE STATE IS READ BEFORE ANY NETWORK CALL, AND THAT ORDER IS THE RULING. A hung
+   * `fetchTargets` is bounded at REQUEST_TIMEOUT_MS, but a watch-list GET that fails strands the
+   * whole run -- and the guard's decision must not be one of the things it strands.
+   *
+   * AN UNREADABLE FILE IS A FRESH STATE AND THE RUN PROCEEDS AT FULL VOLUME. The absent file is
+   * the NORMAL case, not an exceptional one: there is no state file at all until the first run
+   * writes one, which is also why a read failure is NOT reported as `guard-blind`. Reporting it
+   * would put a permanent alarm on the page for every first-ever run, and the condition is
+   * already visible in what the run then does -- full volume, no alarms. The WRITE is the half
+   * that is reported, because a write that fails means the next run forgets this one.
+   */
+  let stored: string | null;
+  try {
+    stored = await dependencies.readState();
+  } catch {
+    stored = null;
+  }
+  const state = parseRunState(stored);
 
   const fetched = await dependencies.fetchTargets({
     apiBase: config.process.apiBase,
@@ -335,7 +497,7 @@ export const runAllTargets = async (
     // The SAME 4xx/5xx split postListings already draws: 4xx is a contract error and a human
     // must look; 5xx, a transport failure and a timeout are the server's problem and the next
     // run is the retry. A 200 of the wrong shape is a contract error too.
-    return emit(
+    return await emit(
       wholeRunFailure(
         config,
         0,
@@ -351,11 +513,11 @@ export const runAllTargets = async (
 
   if (returned === 0) {
     // Exit 2's documented meaning is "nothing was fetched", which is exactly this.
-    return emit(wholeRunFailure(config, 0, EXIT_CONFIG, "the watch list is empty"));
+    return await emit(wholeRunFailure(config, 0, EXIT_CONFIG, "the watch list is empty"));
   }
 
   if (returned > MAX_TARGETS_PER_RUN) {
-    return emit(
+    return await emit(
       wholeRunFailure(
         config,
         returned,
@@ -370,17 +532,33 @@ export const runAllTargets = async (
     // NO DEFAULT MARKET IS EVER INVENTED. A wrong market collects into the wrong `market_key`
     // silently, and `targets` still reports the returned count so the operator is not told they
     // have zero targets when they have two.
-    return emit(
+    return await emit(
       wholeRunFailure(config, returned, EXIT_CONFIG, `the watch market is unusable: ${market.reason}`),
     );
   }
 
+  /**
+   * THE WATCH LIST AS IDS, TAKEN FROM THE RAW ROWS AND NOT FROM `parseTarget`.
+   *
+   * `readString` is used on purpose, and the choice is what makes L-17 pass: a row whose
+   * `componentType` is empty FAILS `parseTarget` but still has a usable `targetId`, so it can be
+   * IN a probe set and still produce its own exit 2 line. Building the list from validated rows
+   * would be `filter(parseOk)` by another name -- the removal the invariant above exists to make
+   * unrepresentable -- and the probe set would silently shrink by exactly the broken rows.
+   *
+   * A row that is not an object at all yields `""`. It cannot be the target of any cause: `""`
+   * only enters `consecutive` as a key, and a non-object row exits 2, which latches nothing (the
+   * counters only count 3 and 5, and `refused:` needs an exit 5 with a refusal reason).
+   */
+  const watchList = fetched.targets.map((raw) => readString(raw, "targetId"));
+  const plan = selectProbe(state, watchList);
+
   const outcomes: TargetOutcome[] = [];
 
-  for (let index = 0; index < fetched.targets.length; index += 1) {
-    // BETWEEN targets: not before the first, not after the last. Exactly N-1 sleeps, whatever
-    // each target's outcome was.
-    if (index > 0) await dependencies.sleep(config.delayMs);
+  for (const [position, index] of plan.indices.entries()) {
+    // BETWEEN targets: not before the first, not after the last. Exactly N-1 sleeps over
+    // WHATEVER SET RAN, whatever each target's outcome was. A probe of 2 sleeps once.
+    if (position > 0) await dependencies.sleep(config.delayMs);
 
     const raw = fetched.targets[index];
     const parsed = parseTarget(raw);
@@ -394,6 +572,9 @@ export const runAllTargets = async (
         componentType: readString(raw, "componentType"),
         exitCode: EXIT_CONFIG,
         error: parsed.reason,
+        // `""` WHEN THE ROW HAD NO USABLE QUERY, and `maxPairOverlap` never treats two empty
+        // strings as equal: two broken rows are not the same search.
+        query: readString(raw, "query"),
       };
       outcomes.push(failed);
       emitTarget(failed);
@@ -415,6 +596,8 @@ export const runAllTargets = async (
         componentType: target.componentType,
         exitCode: result.exitCode,
         summary: result.summary,
+        listingIds: result.listingIds,
+        query: target.query,
       };
     } catch (error) {
       // BELT AND BRACES for a throw `parseTarget` cannot anticipate. It is NOT the justification
@@ -424,6 +607,7 @@ export const runAllTargets = async (
         componentType: target.componentType,
         exitCode: EXIT_CONFIG,
         error: error instanceof Error ? error.message : String(error),
+        query: target.query,
       };
     }
 
@@ -433,7 +617,70 @@ export const runAllTargets = async (
 
   const codes = outcomes.map((outcome) => outcome.exitCode);
 
-  return emit({
+  /**
+   * ONE RUN'S EVIDENCE, FOLDED. `advanceState` is PURE; everything stateful about this slice is
+   * the two lines below it.
+   *
+   * `ran` carries the per-target `reason` because the two IMMEDIATE_REFUSAL_REASONS latch on the
+   * first occurrence and nothing else can tell them from the ordinary exit 5 that a failed POST
+   * produces (measured in the real log: `state:"SUCCESS", reason:"ok", httpStatus:null`).
+   */
+  const ran: TargetRun[] = outcomes.map((outcome) => ({
+    targetId: outcome.target,
+    exitCode: outcome.exitCode,
+    reason: outcome.summary?.reason ?? null,
+    ids: outcome.listingIds ?? [],
+    query: outcome.query,
+  }));
+
+  const advanced = advanceState({
+    state,
+    watchList,
+    ran,
+    canary: plan.canary,
+    expired: plan.expired,
+    nextProbe: plan.nextProbe,
+  });
+
+  /**
+   * THE WRITE IS BEST-EFFORT FOR THE EXIT CODE AND LOUD IN THE LOG, and the two halves of that
+   * are both deliberate. A health surface that manufactures an exit 2 out of a read-only disk is
+   * worse than none -- the exit code is launchd's `LastExitStatus` and the operator's only
+   * signal. But a write that failed means the NEXT run forgets this one, so it is reported.
+   *
+   * `guard-blind` IS NOT A LATCHING CAUSE AND NEVER ENTERS `state.alarm`. The guard's mode is
+   * decided from `state.alarm` and never from the run line's `alarms`, because otherwise a
+   * read-only disk would pin the collector at 2 of 9 over a local filesystem problem that
+   * reducing Facebook traffic does nothing whatsoever about. L-19.
+   */
+  let guardBlind = false;
+  try {
+    await dependencies.writeState(serializeRunState(advanced.state));
+  } catch {
+    guardBlind = true;
+  }
+
+  const alarms = [
+    ...advanced.causes,
+    /**
+     * THE EXPIRY IS REPORTED ONLY WHILE A CAUSE IS STILL LATCHED, AND THE EXTRA CONJUNCT IS A FIX.
+     *
+     * `plan.expired` is decided BEFORE the loop, from the state the previous run left. The expiry
+     * run is also the best possible probe -- it measures every cause and all 36 pairs -- so it is
+     * exactly the run most likely to CLEAR the last cause. Reporting `canary-expired`
+     * unconditionally therefore put an alarm on a fully recovered run: `exit 0`, nine of nine
+     * targets clean, every cause gone, and the page read `degraded` because
+     * `alarms.length > 0`. The operator's first good run in two days would have looked like a
+     * bad one.
+     *
+     * It still stands when a cause survived, which is the case it exists for: nine searches ran
+     * that run and the reduction is still in force, so the page has to say why.
+     */
+    ...(plan.expired && advanced.causes.length > 0 ? ["canary-expired"] : []),
+    ...(guardBlind ? ["guard-blind"] : []),
+  ].sort();
+
+  return await emit({
     kind: "run",
     targets: returned,
     complete: isComplete(returned, codes),
@@ -441,5 +688,8 @@ export const runAllTargets = async (
     exitCodes: histogram(codes),
     delayMs: config.delayMs,
     dryRun: config.process.dryRun,
+    canary: plan.canary,
+    alarms,
+    overlap: advanced.overlap,
   });
 };

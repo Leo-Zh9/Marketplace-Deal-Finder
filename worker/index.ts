@@ -5,6 +5,7 @@ import {
   type WorkerEnvironment,
 } from "./auth/verifyFirebaseToken";
 import { authorizeCollector, type CollectorEnvironment } from "./auth/collectorToken";
+import { handlePostCollectorHealth, readCollectorHealth } from "./api/collectorHealth";
 import { handlePostListings } from "./api/listings";
 import { handleGetSettings, handlePutSettings } from "./api/settings";
 import { handleGetVerdicts } from "./api/verdicts";
@@ -122,6 +123,14 @@ const errorMessages: Record<string, string> = {
   // read succeeded and every row was unpresentable. One sends an operator to D1, the other to
   // the catalog and the collector.
   VERDICTS_ROWS_UNUSABLE: "No stored listing could be presented.",
+  // DISTINCT FROM INVALID_LISTINGS AND INVALID_SETTINGS for the reason the three *_STORAGE_FAILED
+  // codes already record: this is a THIRD request body with a third field set, and an operator
+  // reading "the listings in the request are not valid" on a health report would go looking in
+  // the wrong place. The `field` detail names which one.
+  INVALID_COLLECTOR_HEALTH: "The collector health report in the request is not valid.",
+  // DISTINCT FROM INGEST_STORAGE_FAILED AND SETTINGS_STORAGE_FAILED, same rule: three different
+  // fixes behind one code sends an operator to the wrong one.
+  COLLECTOR_HEALTH_STORAGE_FAILED: "The collector health report could not be stored.",
 };
 
 type ExtraHeaders = Record<string, string>;
@@ -329,6 +338,46 @@ export const handleRequest = async (
       : errorResponse(result.code, result.status, { Vary: "Origin" });
   }
 
+  /**
+   * THE HEALTH REPORT IS ON THE COLLECTOR CREDENTIAL, for the same reason the ingest route is
+   * and on the same terms: a headless `node collector/main.ts` on the operator's Mac is neither
+   * the loopback-only development identity nor a Firebase ID token on APPROVED_EMAILS. It is
+   * strictly less privileged than the listings write the same token already buys.
+   *
+   * `/api/collector-health` IS ABSENT FROM ROUTE_METHODS for the reason X6c records for
+   * `/api/listings` and X-a for `/api/watch-targets`: that table is the ADVERTISED BROWSER
+   * SURFACE and feeds only the OPTIONS preflight. MEASURED for its two siblings and true here
+   * for the same mechanism -- adding a row would make `OPTIONS /api/collector-health` answer 204
+   * advertising `POST, OPTIONS`, a real browser channel for a route whose only caller is a
+   * laptop, while every existing test stayed green. X-n2 is the only guard on that.
+   *
+   * THE READ SIDE IS NOT HERE. `GET /api/status` below serves this row to the browser, behind
+   * `authenticateRequest` like every other browser route, so the two credential systems stay
+   * disjoint in both directions: this route writes and admits only the collector, that one reads
+   * and admits only the two identities every browser route admits.
+   */
+  if (request.method === "POST" && url.pathname === "/api/collector-health") {
+    const authorized = await authorizeCollector(request, environment);
+    if (!authorized.ok) {
+      return errorResponse(authorized.code, authorized.status, { Vary: "Origin" });
+    }
+
+    const db = environment.DB;
+    if (db === undefined) return errorResponse("DATABASE_UNAVAILABLE", 503, { Vary: "Origin" });
+
+    const result = await handlePostCollectorHealth(
+      request,
+      db,
+      dependencies?.now() ?? Math.floor(Date.now() / 1000),
+    );
+
+    // `{ Vary: "Origin" }`, NEVER `cors`: `authorizeCollector` refuses a request bearing ANY
+    // Origin, so no health response can ever carry Access-Control-Allow-Origin. X-n1 pins it.
+    return result.ok
+      ? json(result.body, result.status, { Vary: "Origin" })
+      : errorResponse(result.code, result.status, { Vary: "Origin" }, result.details);
+  }
+
   const authentication = await authenticateRequest(request, environment, dependencies);
   if (!authentication.ok) {
     return errorResponse(authentication.code, authentication.status, cors);
@@ -338,16 +387,28 @@ export const handleRequest = async (
     return json({ identity: authentication.identity }, 200, cors);
   }
 
+  /**
+   * `/api/status` TELLS THE TRUTH ABOUT COLLECTION, AND WHAT IT USED TO DO IS WHY THIS SLICE
+   * TOUCHES IT. It was `{status: "ok", phase: 2, authentication}` -- three values, two of them
+   * literals. It answered "ok" when collection had been dead for a week, and `phase: 2` had been
+   * stale since Phase 3. `phase` IS DELETED RATHER THAN UPDATED: nothing read it, and a version
+   * number nobody maintains is the second authority that drifts. X-n3 is the guard, and it goes
+   * red on the two exhaustive `toEqual`s in worker/index.test.ts rather than silently.
+   *
+   * THE READ CANNOT 503 AND THERE IS NO `DB` GUARD ABOVE IT. `readCollectorHealth` takes
+   * `D1Database | undefined` and answers 200 `unknown` for a missing binding or a throwing read,
+   * because the one endpoint that reports health must not go dark exactly when something is
+   * wrong. That is the opposite of what `/api/settings` and `/api/watch` do, deliberately: their
+   * caller can retry a save, this one's caller is asking whether anything is collecting at all.
+   * H-8 is the guard.
+   */
   if (request.method === "GET" && url.pathname === "/api/status") {
-    return json(
-      {
-        status: "ok",
-        phase: 2,
-        authentication: authentication.identity.authenticationMethod,
-      },
-      200,
-      cors,
+    const health = await readCollectorHealth(
+      environment.DB,
+      dependencies?.now() ?? Math.floor(Date.now() / 1000),
     );
+
+    return json({ ...health, authentication: authentication.identity.authenticationMethod }, 200, cors);
   }
 
   if (

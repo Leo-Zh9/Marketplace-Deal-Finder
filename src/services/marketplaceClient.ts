@@ -1,3 +1,4 @@
+import { ApiRequestError } from "../auth/authTypes";
 import { requestJsonWithAuth } from "./apiClient";
 /**
  * THE SELECTION RULES LIVE IN `./watchSelection`, not here, so that `worker/api/watch.test.ts` can
@@ -5,11 +6,43 @@ import { requestJsonWithAuth } from "./apiClient";
  * into the Worker's tsc program. See that file's header.
  */
 import { verdictsQuery, type StoredTarget, type WatchSaveBody } from "./watchSelection";
-import type { ComponentType, DealRule, Listing, PreviewResult, SearchSettings } from "../types";
+import type {
+  CollectionStatus,
+  ComponentType,
+  DealRule,
+  Listing,
+  PreviewResult,
+  SearchSettings,
+} from "../types";
 
 export type { StoredTarget, WatchSaveBody } from "./watchSelection";
 
 type GetToken = (forceRefresh: boolean) => Promise<string | null>;
+
+const STATUS_WORDS: readonly string[] = ["ok", "stale", "degraded", "unknown"];
+
+/**
+ * THE STATUS BODY IS CHECKED, NOT CAST, BECAUSE THE PAGE AND THE API DEPLOY SEPARATELY. The
+ * pre-alerting Worker answers `{status:"ok", phase:2, authentication}`: a known word, but no
+ * `causes` and no `collector`. Cast through, `status.causes.length` threw inside the panel's
+ * render, and with no error boundary in `src/` the whole dashboard went blank. That happens on a
+ * frontend deployed first, a failed API deploy, or an API rollback. Checked here, a bad body is
+ * a failed poll, and the panel says the status could not be read. Only the fields the page
+ * renders are checked; extra fields pass through untouched.
+ */
+const isCollectionStatus = (body: unknown): body is CollectionStatus => {
+  if (typeof body !== "object" || body === null) return false;
+  const fields = body as Record<string, unknown>;
+  if (typeof fields.status !== "string" || !STATUS_WORDS.includes(fields.status)) return false;
+  if (!Array.isArray(fields.causes) || !fields.causes.every((cause) => typeof cause === "string")) {
+    return false;
+  }
+  if (typeof fields.reportedAt !== "number" || typeof fields.ageMinutes !== "number") return false;
+  if (fields.collector === null) return true;
+  if (typeof fields.collector !== "object" || fields.collector === undefined) return false;
+  const collector = fields.collector as Record<string, unknown>;
+  return typeof collector.canary === "boolean" && typeof collector.targets === "number";
+};
 
 /** `search_revisions`' three columns, which are exactly `PUT /api/settings`' ACCEPTED_FIELDS. */
 export type DealMode = "DISCOUNT" | "MAXIMUM_PRICE" | "BOTH";
@@ -38,6 +71,13 @@ export interface MarketplaceClient {
   saveWatch(body: WatchSaveBody, getToken: GetToken): Promise<WatchWire>;
   getSettings(getToken: GetToken): Promise<WireSettings | null>;
   saveDealRule(rule: DealRule, getToken: GetToken): Promise<void>;
+  /**
+   * THE COLLECTOR'S HEALTH. It is a SEPARATE read from `getWatch`/`getSettings` and must stay
+   * one: those two gate Save -- a failed read there costs the write, because starting from the
+   * form's defaults and saving is how a live watch list of nine rows gets replaced -- whereas a
+   * failed status read must cost nothing but the badge. A-2 is the guard.
+   */
+  getStatus(getToken: GetToken, signal?: AbortSignal): Promise<CollectionStatus>;
 }
 
 interface VerdictsResponse {
@@ -150,5 +190,20 @@ export const marketplaceClient: MarketplaceClient = {
       method: "PUT",
       body: dealRuleToSettings(rule),
     });
+  },
+
+  /**
+   * `signal` IS FORWARDED, AND IT IS THE ONLY REQUEST HERE THAT NEEDS ONE. The caller polls, so
+   * an unbounded read is two hazards at once: the age it reports is attributed to a send time
+   * that may be minutes stale, and two overlapping polls can land out of order and move the
+   * displayed age BACKWARD. `apiClient.ts` forwards `options.signal` and nothing else, so without
+   * this parameter there is no way to bound either.
+   */
+  async getStatus(getToken, signal) {
+    const body = await requestJsonWithAuth<unknown>("/api/status", getToken, { signal });
+    if (!isCollectionStatus(body)) {
+      throw new ApiRequestError("The collector's status came back in a shape this page cannot read.", "unexpected");
+    }
+    return body;
   },
 };

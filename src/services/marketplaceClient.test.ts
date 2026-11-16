@@ -402,4 +402,105 @@ describe("the kept searches", () => {
     expect(init?.method).toBe("PUT");
     expect(JSON.parse(String(init?.body)).preservedTargetIds).toEqual(["cpu-toronto"]);
   });
+
+  /**
+   * THE STATUS READ IS A GET TO `/api/status` WITH THE TOKEN AND NO BODY, and the body is passed
+   * through UNFLATTENED.
+   *
+   * THE MUTATION THAT MATTERS IS RESHAPING IT HERE -- picking fields, or defaulting `collector`
+   * to an object. Every field below is rendered by the panel, and the panel's whole contract is
+   * that it renders nothing the collector did not report; a client that invented a `collector`
+   * where the server sent `null` would make "No collector run has reported yet" unreachable,
+   * which is the state the deleted panel's "Stopped" occupied.
+   *
+   * `getStatus` IS THE SIXTH METHOD ON THE CLIENT AND IT DELIBERATELY DOES NOT JOIN THE TWO
+   * MOUNT READS. See `MarketplaceClient` for why: those two gate Save, and this one must not.
+   */
+  it("reads GET /api/status with the token and passes the body through unchanged", async () => {
+    const body = {
+      status: "degraded",
+      causes: ["canary", "feed-overlap:gpu-radeon+gpu-rtx"],
+      reportedAt: 1_800_000_000,
+      ageMinutes: 6,
+      collector: {
+        exitCode: 0,
+        complete: false,
+        canary: true,
+        dryRun: false,
+        fixture: false,
+        targets: 9,
+        alarms: ["feed-overlap:gpu-radeon+gpu-rtx"],
+      },
+      authentication: "firebase-google",
+    };
+    const fetchMock = stubJson(body);
+
+    const status = await marketplaceClient.getStatus(async () => "a-firebase-id-token");
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/api/status");
+    expect(init?.method).toBe("GET");
+    expect(init?.body).toBeUndefined();
+    expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer a-firebase-id-token");
+    expect(status).toEqual(body);
+  });
+
+  /**
+   * THE SIGNAL IS FORWARDED, PINNED AT THIS LAYER AS WELL AS THROUGH `App`. `apiClient` forwards
+   * `options.signal` and nothing else, so a `getStatus` that accepted the parameter and dropped
+   * it would leave the poll unbounded while `App`'s own call site still looked correct -- and the
+   * displayed age's error would have no ceiling.
+   */
+  it("forwards an abort signal to /api/status, and sends none when given none", async () => {
+    const fetchMock = stubJson({
+      status: "ok",
+      causes: [],
+      reportedAt: 1_800_000_000,
+      ageMinutes: 3,
+      collector: null,
+    });
+    const controller = new AbortController();
+
+    await marketplaceClient.getStatus(noToken, controller.signal);
+    expect(fetchMock.mock.calls[0][1]?.signal).toBe(controller.signal);
+
+    await marketplaceClient.getStatus(noToken);
+    expect(fetchMock.mock.calls[1][1]?.signal).toBeUndefined();
+  });
+
+  it("passes a null collector through rather than inventing one", async () => {
+    stubJson({
+      status: "unknown",
+      causes: [],
+      reportedAt: 0,
+      ageMinutes: 0,
+      collector: null,
+      authentication: "local-development",
+    });
+
+    const status = await marketplaceClient.getStatus(noToken);
+
+    expect(status.collector).toBeNull();
+    expect(status.status).toBe("unknown");
+  });
+
+  /**
+   * THE PRE-ALERTING WORKER'S BODY IS REFUSED, NOT CAST. Its `status` is a known word, so a
+   * check on `status` alone would pass it; `causes` and `collector` are what it lacks. The
+   * mutation is returning the body unchecked.
+   */
+  it.each<[string, unknown]>([
+    ["the old stub body", { status: "ok", phase: 2, authentication: "firebase-google" }],
+    ["an unknown status word", { status: "fine", causes: [], reportedAt: 0, ageMinutes: 0, collector: null }],
+    ["a collector without its counts", { status: "ok", causes: [], reportedAt: 0, ageMinutes: 0, collector: {} }],
+    // EVERY OTHER FIELD VALID, so the `causes` check is the only thing that can refuse it.
+    ["a body with no causes", { status: "ok", reportedAt: 0, ageMinutes: 0, collector: null }],
+  ])("refuses %s as unreadable", async (_label, body) => {
+    stubJson(body);
+
+    await expect(marketplaceClient.getStatus(noToken)).rejects.toMatchObject({
+      name: "ApiRequestError",
+      kind: "unexpected",
+    });
+  });
 });

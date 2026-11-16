@@ -10,6 +10,7 @@ import evaluationSql from "../../migrations/0002_evaluation_tasks.sql?raw";
 import searchSql from "../../migrations/0003_search_settings.sql?raw";
 import monitorSql from "../../migrations/0004_monitor.sql?raw";
 import watchTargetsSql from "../../migrations/0005_watch_targets.sql?raw";
+import collectorHealthSql from "../../migrations/0006_collector_health.sql?raw";
 
 /**
  * Strip `--` line comments, split on `;`, trim, drop empties. The schema contains no
@@ -41,10 +42,19 @@ export interface TestDatabase {
  * drift apart. Without 0002 here, every 3D test would run against an evaluation_tasks table
  * with none of the evaluation columns; without 0003, every 3E-a settings test would fail on
  * a missing table; without 0004, every 3E-b monitoring test would fail on a missing
- * monitor_lock; without 0005, every watch-list test would fail on a missing watch_targets.
+ * monitor_lock; without 0005, every watch-list test would fail on a missing watch_targets;
+ * without 0006, every collector-health test would fail on a missing collector_health and S-n1
+ * would report ten tables instead of eleven.
  */
 export const applyMigrations = async (db: D1Database): Promise<void> => {
-  for (const sql of [schemaSql, evaluationSql, searchSql, monitorSql, watchTargetsSql]) {
+  for (const sql of [
+    schemaSql,
+    evaluationSql,
+    searchSql,
+    monitorSql,
+    watchTargetsSql,
+    collectorHealthSql,
+  ]) {
     await db.batch(splitSqlStatements(sql).map((statement) => db.prepare(statement)));
   }
 };
@@ -69,7 +79,7 @@ export const createTestDatabase = async (): Promise<TestDatabase> => {
 };
 
 /**
- * One batch of DELETEs across all ten tables, for `beforeEach` isolation.
+ * One batch of DELETEs across all eleven tables, for `beforeEach` isolation.
  *
  * search_settings BEFORE search_revisions, and that is not style. D1 runs with
  * `PRAGMA foreign_keys = 1`, search_settings.current_revision REFERENCES
@@ -102,6 +112,16 @@ export const truncateAll = async (db: D1Database): Promise<void> => {
     db.prepare("DELETE FROM monitor_runs"),
     db.prepare("DELETE FROM watch_targets"),
     db.prepare("DELETE FROM watch_market"),
+    // DELETED, NOT RESTORED, AND THAT DIFFERS FROM monitor_lock FOR THE SAME REASON THE TWO
+    // WATCH-LIST TABLES DO. monitor_lock's seed is load-bearing because the documented kill
+    // switch is a bare `UPDATE ... WHERE id = 1`, a silent no-op against an empty table.
+    // collector_health's only writer is an UPSERT, which creates the row it needs -- so the seed
+    // is not load-bearing for any writer. Both states it distinguishes are EXPLICIT, tested ones:
+    // no row at all reads as `unknown` with `collector: null` ("No collector run has reported
+    // yet"), and the seeded `reported_at = 0` reads as `unknown` too (H-7). The SHIPPED seed's own
+    // correctness is asserted by schema.test.ts S-n5, against a database this function never
+    // touches.
+    db.prepare("DELETE FROM collector_health"),
     db.prepare(
       `INSERT INTO monitor_lock (id, run_id, acquired_at, expires_at) VALUES (1, '', 0, 0)
        ON CONFLICT(id) DO UPDATE SET run_id = '', acquired_at = 0, expires_at = 0`,

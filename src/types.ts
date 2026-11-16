@@ -89,3 +89,37 @@ export interface PreviewResult {
   truncated: boolean;
   searchedAt: string;
 }
+
+/**
+ * WHAT `GET /api/status` REPORTS ABOUT COLLECTION, and it is the user's ONLY notification
+ * channel: no email, no push -- the web page IS the alert.
+ *
+ * THE HISTORY THIS TYPE HAS TO SURVIVE. A monitoring panel was deleted from this app wholesale
+ * because NOTHING WROTE THE VALUE IT DISPLAYED: it read "Not running / Stopped" forever, beside a
+ * sentence promising a 30-minute collector. So the rule for every field here is that a real
+ * writer puts it there -- `collector/runTargets.ts` posts one report per run line -- and the panel
+ * renders NO field the writer does not write.
+ *
+ * `collector` IS `null` WHEN NOTHING HAS EVER REPORTED, which is a state the panel names in
+ * words ("No collector run has reported yet") rather than rendering as "Stopped". That string is
+ * exactly what the old panel was deleted for.
+ */
+export interface CollectionStatus {
+  status: "ok" | "stale" | "degraded" | "unknown";
+  /** Whichever `degraded` clauses fired, as a set. Empty on `ok`, `stale` and `unknown`. */
+  causes: string[];
+  /** Unix SECONDS, the SERVER's clock. 0 when nothing has reported. */
+  reportedAt: number;
+  ageMinutes: number;
+  collector: {
+    exitCode: number;
+    complete: boolean;
+    /** The volume cut is engaged: strictly fewer searches ran than the watch list holds. */
+    canary: boolean;
+    dryRun: boolean;
+    fixture: boolean;
+    /** The count the SERVER returned, never the count that ran. The panel's "of N". */
+    targets: number;
+    alarms: string[];
+  } | null;
+}

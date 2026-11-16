@@ -303,9 +303,19 @@ describe("protected Worker API", () => {
         : await call("/api/status", { headers: { Authorization: await bearerFor() } });
 
     expect(response.status).toBe(200);
+    /**
+     * X-n3: `phase` IS GONE AND THIS EXHAUSTIVE `toEqual` IS THE GUARD ON THAT. It was `2` from
+     * Phase 2 and had been stale since Phase 3 -- a version number nothing read and nobody
+     * maintained, which is the second authority that drifts. `status: "unknown"` because these
+     * two environments have no `DB` binding at all, which is deliberately 200 rather than 503:
+     * the one endpoint that reports health must not go dark exactly when something is wrong.
+     */
     await expect(response.json()).resolves.toEqual({
-      status: "ok",
-      phase: 2,
+      status: "unknown",
+      causes: [],
+      reportedAt: 0,
+      ageMinutes: 0,
+      collector: null,
       authentication: method,
     });
   });
@@ -367,8 +377,11 @@ describe("protected Worker API", () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual({
-      status: "ok",
-      phase: 2,
+      status: "unknown",
+      causes: [],
+      reportedAt: 0,
+      ageMinutes: 0,
+      collector: null,
       authentication: "local-development",
     });
   });
@@ -1785,5 +1798,341 @@ describe("the browser watch route", () => {
     // 404 for a path that is not a route; the collector's own path is a GET-only collector route,
     // so a PUT there is a 404 too -- what matters is that neither reaches this handler.
     expect(response.status).toBe(404);
+  });
+});
+
+/**
+ * THE HEALTH ROUTE'S CREDENTIAL BOUNDARY, AND IT IS THE MIRROR OF THE TWO ROUTES ABOVE.
+ *
+ * `POST /api/collector-health` admits exactly the ONE identity the ingest route and the
+ * watch-list route admit -- the collector secret -- and it is ABSENT from the advertised browser
+ * surface, because a laptop is its only caller. The READ side is `GET /api/status`, which is
+ * behind `authenticateRequest` like every other browser route, so the two credential systems stay
+ * disjoint in both directions.
+ *
+ * X-d IS THE EXISTING X4 TABLE ABOVE, UNCHANGED AND NOT DUPLICATED HERE: that is what proves a
+ * collector token still buys nothing on the Firebase routes.
+ */
+describe("the collector health route's credential boundary", () => {
+  const collectorToken = "index-suite-health-token-7c2e91af60b4";
+  const healthPath = "/api/collector-health";
+
+  /** Any touch is a failure: the credential check runs before the handler. */
+  const untouchableDb = () =>
+    ({
+      prepare: () => {
+        throw new Error("the database must not be reached");
+      },
+      batch: () => {
+        throw new Error("the database must not be reached");
+      },
+    }) as unknown as D1Database;
+
+  let healthDatabase!: TestDatabase;
+
+  beforeAll(async () => {
+    healthDatabase = await createTestDatabase();
+    await truncateAll(healthDatabase.db);
+  }, 120_000);
+
+  afterAll(async () => {
+    await healthDatabase.dispose();
+  });
+
+  const healthEnvironment = (overrides: Partial<Environment> = {}): Environment =>
+    environment({ COLLECTOR_TOKEN: collectorToken, DB: untouchableDb(), ...overrides });
+
+  const report = JSON.stringify({
+    exitCode: 0,
+    complete: true,
+    canary: false,
+    dryRun: false,
+    fixture: false,
+    targets: 9,
+    alarms: [],
+  });
+
+  /**
+   * `headers` IS MERGED LAST ON PURPOSE. With `...init` after it, a caller passing only
+   * `{ headers: { "X-Collector-Token": ... } }` replaced the whole object and dropped
+   * `Content-Type` -- MEASURED: the "successful write" row answered 415 instead of 200, i.e. the
+   * row that is supposed to prove the happy path was testing the media-type check.
+   */
+  const health = (init: RequestInit = {}, env: Environment = healthEnvironment()) =>
+    handleRequest(
+      new Request(`${workerOrigin}${healthPath}`, {
+        method: "POST",
+        body: report,
+        ...init,
+        headers: {
+          "Content-Type": "application/json",
+          ...((init.headers ?? {}) as Record<string, string>),
+        },
+      }),
+      env,
+      dependencies,
+    );
+
+  /**
+   * X-n2: MEASURED for `/api/listings` in X6c and true here for the same mechanism. Adding
+   * `["/api/collector-health", ["POST"]]` to ROUTE_METHODS leaves every other test in this file
+   * passing while `OPTIONS /api/collector-health` from the allowed origin answers 204
+   * advertising `Access-Control-Allow-Methods: POST, OPTIONS` -- a real browser-usable WRITE
+   * channel, invisible to all of them. The table is the ADVERTISED BROWSER SURFACE and this
+   * route has no browser caller.
+   */
+  it("X-n2: /api/collector-health is deliberately absent from the advertised surface", () => {
+    expect(ROUTE_METHODS.has(healthPath)).toBe(false);
+  });
+
+  it("X-n2b: its preflight is refused and advertises nothing", async () => {
+    const response = await handleRequest(
+      new Request(`${workerOrigin}${healthPath}`, {
+        method: "OPTIONS",
+        headers: { Origin: pagesOrigin, "Access-Control-Request-Method": "POST" },
+      }),
+      healthEnvironment(),
+      dependencies,
+    );
+
+    expect(response.status).toBe(403);
+    expect(response.headers.get("Access-Control-Allow-Methods")).toBeNull();
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
+  });
+
+  it("X-n1: no token is 401 and the database is never reached", async () => {
+    const response = await health();
+
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "AUTH_TOKEN_MISSING" },
+    });
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
+  });
+
+  it("X-n1: a wrong token is 401", async () => {
+    const response = await health({
+      headers: { "X-Collector-Token": "not-the-collector-token-but-long-enough" },
+    });
+
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "AUTH_TOKEN_INVALID" },
+    });
+  });
+
+  /**
+   * X-n1: THE ALLOWED ORIGIN IS THE ROW THAT KILLS THE MUTATION, exactly as X6a is for ingest
+   * and X-b for the watch list. An evil origin is already refused by the pre-existing CORS
+   * block, so only this row can see the branch's own Origin refusal disappear.
+   */
+  it("X-n1: even the ALLOWED origin with a VALID token is 403 -- no browser channel at all", async () => {
+    const response = await health({
+      headers: { Origin: pagesOrigin, "X-Collector-Token": collectorToken },
+    });
+
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "CORS_ORIGIN_DENIED" },
+    });
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
+  });
+
+  /**
+   * X-n1: THE X10 / X-c MIRROR. An approved Firebase identity is not a collector, and routing
+   * this path through `authenticateRequest` would admit one -- which would let any approved
+   * browser session write the row the page reads, i.e. forge the collector's health.
+   */
+  it("X-n1: an approved Firebase identity gets 401 on the health route", async () => {
+    const response = await health(
+      { headers: { Authorization: await bearerFor() } },
+      healthEnvironment({ DB: healthDatabase.db }),
+    );
+
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "AUTH_TOKEN_MISSING" },
+    });
+  });
+
+  it("X-n1: the loopback development identity does not open it either", async () => {
+    for (const origin of ["http://localhost:8787", "http://127.0.0.1:8787"]) {
+      const response = await handleRequest(
+        new Request(`${origin}${healthPath}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: report,
+        }),
+        healthEnvironment({ APP_ENV: "local" }),
+        dependencies,
+      );
+      expect(response.status).toBe(401);
+    }
+  });
+
+  it("X-n1: a valid token with no Origin stores the report", async () => {
+    const response = await health(
+      { headers: { "X-Collector-Token": collectorToken } },
+      healthEnvironment({ DB: healthDatabase.db }),
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ stored: true });
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
+  });
+
+  it.each([
+    [
+      "a successful write",
+      200,
+      () =>
+        health(
+          { headers: { "X-Collector-Token": collectorToken } },
+          healthEnvironment({ DB: healthDatabase.db }),
+        ),
+    ],
+    ["a missing credential", 401, () => health()],
+    [
+      "an allowed browser origin",
+      403,
+      () => health({ headers: { Origin: pagesOrigin, "X-Collector-Token": collectorToken } }),
+    ],
+    [
+      "an unconfigured credential",
+      503,
+      () =>
+        health(
+          { headers: { "X-Collector-Token": collectorToken } },
+          healthEnvironment({ COLLECTOR_TOKEN: undefined }),
+        ),
+    ],
+    [
+      "a missing database binding",
+      503,
+      () =>
+        health(
+          { headers: { "X-Collector-Token": collectorToken } },
+          healthEnvironment({ DB: undefined }),
+        ),
+    ],
+    [
+      "an invalid body",
+      400,
+      () =>
+        handleRequest(
+          new Request(`${workerOrigin}${healthPath}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-Collector-Token": collectorToken },
+            body: JSON.stringify({ reportedAt: 1 }),
+          }),
+          healthEnvironment({ DB: healthDatabase.db }),
+          dependencies,
+        ),
+    ],
+  ])("X-n1: %s carries Vary, every security header and NO CORS header", async (_label, status, send) => {
+    const response = await send();
+
+    expect(response.status).toBe(status);
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
+    expect(response.headers.get("Vary")).toBe("Origin");
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(response.headers.get("Permissions-Policy")).toBe(
+      "camera=(), microphone=(), geolocation=()",
+    );
+    expect(response.headers.get("Referrer-Policy")).toBe("no-referrer");
+    expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff");
+    expect(response.headers.get("X-Frame-Options")).toBe("DENY");
+  });
+
+  /**
+   * The path and the method are matched EXACTLY. The database throws on contact, so a spelling
+   * that reached the handler could not answer 401 -- it would land on a 503 instead.
+   */
+  it.each([
+    ["a trailing slash", "/api/collector-health/"],
+    ["a cased spelling", "/api/Collector-Health"],
+    ["a longer path with the same prefix", "/api/collector-health-evil"],
+    ["an underscore spelling", "/api/collector_health"],
+  ])("X-n1: %s is not the health route", async (_label, path) => {
+    const response = await handleRequest(
+      new Request(`${workerOrigin}${path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Collector-Token": collectorToken },
+        body: report,
+      }),
+      healthEnvironment(),
+      dependencies,
+    );
+
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "AUTH_TOKEN_MISSING" },
+    });
+  });
+
+  it.each([["GET"], ["PUT"], ["DELETE"], ["PATCH"]])(
+    "X-n1: %s /api/collector-health is not the health route",
+    async (method) => {
+      const response = await handleRequest(
+        new Request(`${workerOrigin}${healthPath}`, {
+          method,
+          headers: { "X-Collector-Token": collectorToken },
+        }),
+        healthEnvironment(),
+        dependencies,
+      );
+
+      expect(response.status).toBe(401);
+    },
+  );
+
+  /**
+   * X-n4: THE WHOLE LOOP OVER HTTP -- the collector writes on its own credential and the BROWSER
+   * reads the same row back from `/api/status` on a Firebase identity. Neither half alone proves
+   * the two routes agree about the row; this is the only place in the suite that does.
+   */
+  it("X-n4: what the collector POSTs is what /api/status serves the browser", async () => {
+    const written = await handleRequest(
+      new Request(`${workerOrigin}${healthPath}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Collector-Token": collectorToken },
+        body: JSON.stringify({
+          exitCode: 0,
+          complete: false,
+          canary: true,
+          dryRun: false,
+          fixture: false,
+          targets: 9,
+          alarms: ["feed-overlap:gpu-radeon+gpu-rtx"],
+        }),
+      }),
+      healthEnvironment({ DB: healthDatabase.db }),
+      dependencies,
+    );
+    expect(written.status).toBe(200);
+
+    const read = await call(
+      "/api/status",
+      { headers: { Authorization: await bearerFor() } },
+      environment({ DB: healthDatabase.db }),
+    );
+
+    expect(read.status).toBe(200);
+    await expect(read.json()).resolves.toEqual({
+      status: "degraded",
+      causes: ["canary", "feed-overlap:gpu-radeon+gpu-rtx"],
+      reportedAt: now,
+      ageMinutes: 0,
+      collector: {
+        exitCode: 0,
+        complete: false,
+        canary: true,
+        dryRun: false,
+        fixture: false,
+        targets: 9,
+        alarms: ["feed-overlap:gpu-radeon+gpu-rtx"],
+      },
+      authentication: "firebase-google",
+    });
   });
 });
