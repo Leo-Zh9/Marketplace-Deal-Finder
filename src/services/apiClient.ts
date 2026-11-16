@@ -87,7 +87,7 @@ export interface RequestOptions {
   token?: string | null;
   signal?: AbortSignal;
   fetchImplementation?: FetchImplementation;
-  method?: "GET" | "PUT";
+  method?: "GET" | "PUT" | "POST";
   body?: unknown;
 }
 

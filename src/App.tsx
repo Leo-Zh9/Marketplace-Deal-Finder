@@ -1,11 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
-import { CollectionStatusPanel } from "./components/CollectionStatusPanel";
+import {
+  CollectionStatusPanel,
+  type MonitoringNotice,
+} from "./components/CollectionStatusPanel";
 import { ComponentSelector } from "./components/ComponentSelector";
 import { DealRuleForm } from "./components/DealRuleForm";
 import { ListingCard } from "./components/ListingCard";
 import { LocationSelector } from "./components/LocationSelector";
 import { ModelSelector } from "./components/ModelSelector";
-import type { AuthenticatedIdentity } from "./auth/authTypes";
+import { ApiRequestError, type AuthenticatedIdentity } from "./auth/authTypes";
 import { componentById, mockLocations } from "./data/catalog";
 import { requestErrorMessage } from "./services/apiClient";
 import { marketplaceClient, settingsToDealRule } from "./services/marketplaceClient";
@@ -134,6 +137,9 @@ function App({ identity, onSignOut, getToken }: AppProps) {
   } | null>(null);
   const [collectionPending, setCollectionPending] = useState(true);
   const [statusNow, setStatusNow] = useState(() => Date.now());
+  /** A Start/Stop request is in flight. The button's LABEL never changes until the re-read. */
+  const [monitoringPending, setMonitoringPending] = useState(false);
+  const [monitoringNotice, setMonitoringNotice] = useState<MonitoringNotice | null>(null);
 
   /**
    * BOTH READS, AND SAVE STAYS DISABLED UNTIL BOTH SUCCEED. MEASURED: a 503 on load plus one click
@@ -311,6 +317,49 @@ function App({ identity, onSignOut, getToken }: AppProps) {
       ageMinutes,
     };
   }, [collection, statusNow]);
+
+  /**
+   * START/STOP. THE BUTTON'S NEXT LABEL COMES FROM AN IMMEDIATE RE-READ OF `/api/status`, never
+   * from the click: the write's own answer is not used to relabel anything, so the panel cannot
+   * show a state the status route would not. A failed re-read keeps the last reading, as a failed
+   * poll does, and the next poll corrects it.
+   *
+   * THE 409 IS NAMED IN THE DASHBOARD'S WORDS: Start with no saved deal rule would record
+   * NO_SETTINGS every 30 minutes, so the Worker refuses it and the page says what to do instead.
+   */
+  const toggleMonitoring = async (next: "start" | "stop") => {
+    setMonitoringPending(true);
+    setMonitoringNotice(null);
+    try {
+      if (next === "start") await marketplaceClient.startMonitoring(getToken);
+      else await marketplaceClient.stopMonitoring(getToken);
+
+      const sentAt = Date.now();
+      try {
+        const status = await marketplaceClient.getStatus(getToken, AbortSignal.timeout(STATUS_POLL_MS));
+        setCollection({ status, fetchedAt: sentAt });
+      } catch {
+        // Kept, as on a failed poll.
+      }
+      setMonitoringNotice({
+        kind: "status",
+        text:
+          next === "start"
+            ? "Started. Your collector picks this up on its next run."
+            : "Stopped. Your collector skips its next run and no alerts are sent.",
+      });
+    } catch (error: unknown) {
+      setMonitoringNotice({
+        kind: "alert",
+        text:
+          error instanceof ApiRequestError && error.code === "MONITORING_NOT_READY"
+            ? "Save a deal rule before starting monitoring."
+            : (requestErrorMessage(error) ?? "Could not change monitoring. Try again."),
+      });
+    } finally {
+      setMonitoringPending(false);
+    }
+  };
 
   const selectedComponents = useMemo(
     () => settings.components.map((component) => componentById[component]),
@@ -858,7 +907,13 @@ function App({ identity, onSignOut, getToken }: AppProps) {
             * no listings.
             */}
           <aside className="results-column" id="preview-results">
-            <CollectionStatusPanel status={displayedCollection} pending={collectionPending} />
+            <CollectionStatusPanel
+              status={displayedCollection}
+              pending={collectionPending}
+              onToggleMonitoring={(next) => void toggleMonitoring(next)}
+              monitoringPending={monitoringPending}
+              monitoringNotice={monitoringNotice}
+            />
 
             <section className="results-panel" aria-live="polite" aria-busy={pendingAction === "preview"}>
               <div className="results-heading">

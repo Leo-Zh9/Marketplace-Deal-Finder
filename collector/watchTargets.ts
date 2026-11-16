@@ -44,7 +44,17 @@ export type FetchFailureReason =
  * fetcher that dropped it would make that impossible to report.
  */
 export type FetchWatchTargetsResult =
-  | { ok: true; market: unknown; targets: readonly unknown[] }
+  | {
+      ok: true;
+      market: unknown;
+      targets: readonly unknown[];
+      /**
+       * THE DASHBOARD'S START/STOP. "stopped" arrives with an empty `targets`, and `runAllTargets`
+       * must read this BEFORE it reads the empty list as exit 2. Absent means a Worker older than
+       * the field, which is running.
+       */
+      monitoring: "running" | "stopped";
+    }
   | {
       ok: false;
       status: number | null;
@@ -219,5 +229,18 @@ export const fetchWatchTargets = async (
     return { ok: false, status: 200, code: null, reason: "bad-shape", retryable: false };
   }
 
-  return { ok: true, market: body.market, targets: body.targets };
+  // ABSENT IS RUNNING (an older Worker); ANY OTHER VALUE IS A CONTRACT ERROR. Reading an unknown
+  // word as running would collect through a Stop the collector could not understand; reading it
+  // as stopped would stop silently. Exit 6 says the two sides disagree, loudly.
+  const { monitoring } = body;
+  if (monitoring !== undefined && monitoring !== "running" && monitoring !== "stopped") {
+    return { ok: false, status: 200, code: null, reason: "bad-shape", retryable: false };
+  }
+
+  return {
+    ok: true,
+    market: body.market,
+    targets: body.targets,
+    monitoring: monitoring ?? "running",
+  };
 };

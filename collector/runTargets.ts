@@ -509,6 +509,18 @@ export const runAllTargets = async (
     );
   }
 
+  /**
+   * STOPPED FROM THE DASHBOARD: ONE LINE, EXIT 0, AND NOTHING ELSE. Checked BEFORE the empty-list
+   * branch, because a stopped Worker answers `targets: []` and that branch would call a deliberate
+   * pause exit 2 and post degraded health every 30 minutes. It does not go through `emit`: no health
+   * POST (the page already says "stopped", and a report would only refresh `reportedAt` for a run
+   * that searched nothing) and no state write (the guard's memory belongs to runs that ran).
+   */
+  if (fetched.monitoring === "stopped") {
+    dependencies.log(JSON.stringify({ kind: "stopped" }));
+    return EXIT_OK;
+  }
+
   const returned = fetched.targets.length;
 
   if (returned === 0) {

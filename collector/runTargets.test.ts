@@ -153,6 +153,7 @@ const harness = async (options: HarnessOptions = {}) => {
         ok: true,
         market: "market" in options ? options.market : market,
         targets,
+        monitoring: "running",
       },
     run: async (config) => {
       const index = runCalls.length;
@@ -380,6 +381,40 @@ describe("running every target in the watch list", () => {
       exitCodes: {},
     });
     expect(runLine.error).toBe("the watch list is empty");
+  });
+
+  /**
+   * L-m1: STOPPED FROM THE DASHBOARD IS ONE LINE AND EXIT 0, AND NOTHING ELSE. Paired with L-6
+   * above on the same empty list: there, running, it is exit 2 and a degraded health POST. Here
+   * the word is "stopped" and a latched state file is present, so a run that wrote state, posted
+   * health or searched would show it. Targets are present on purpose: a Worker that sent them
+   * anyway must still not be searched. Kills: dropping the early return (exit 2 or a run), moving
+   * it after the empty-list check (exit 2), and routing it through `emit` (a health POST).
+   */
+  it("L-m1: monitoring stopped logs kind:stopped, exits 0, posts no health and writes no state", async () => {
+    const { exitCode, runCalls, lines, healthReports, written, events } = await harness({
+      fetchResult: { ok: true, market, targets: [target("a")], monitoring: "stopped" },
+      state: stateFile({ consecutive: { a: { sourceEmpty: 0, transient: 2 } }, probe: 1 }),
+    });
+
+    expect(exitCode).toBe(0);
+    expect(lines).toEqual([JSON.stringify({ kind: "stopped" })]);
+    expect(runCalls).toEqual([]);
+    expect(healthReports).toEqual([]);
+    expect(written).toEqual([]);
+    expect(events).toEqual(["log:stopped:"]);
+  });
+
+  it("L-m1b: the same empty list with monitoring stopped is exit 0, running is exit 2", async () => {
+    const stopped = await harness({
+      fetchResult: { ok: true, market, targets: [], monitoring: "stopped" },
+    });
+    const running = await harness({
+      fetchResult: { ok: true, market, targets: [], monitoring: "running" },
+    });
+
+    expect([stopped.exitCode, running.exitCode]).toEqual([0, 2]);
+    expect([stopped.healthReports.length, running.healthReports.length]).toEqual([0, 1]);
   });
 
   /**
@@ -1017,7 +1052,7 @@ describe("running every target in the watch list", () => {
     const lines: string[] = [];
     const { runAllTargetsExitCode, healthLines } = await (async () => {
       const dependencies: RunAllTargetsDependencies = {
-        fetchTargets: async () => ({ ok: true, market, targets: [target("only")] }),
+        fetchTargets: async () => ({ ok: true, market, targets: [target("only")], monitoring: "running" }),
         run: async () => ({ exitCode: 0, summary: summaryFor(0), listingIds: [] }),
         sleep: async () => undefined,
         log: (line) => lines.push(line),

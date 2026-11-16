@@ -19,6 +19,7 @@
  * deliberate exception -- it MUST be fresh per execution, and §"the lease token" below is why.
  */
 
+import { loadMonitoringState } from "../api/monitoring";
 import { evaluateBatch } from "../evaluation/evaluateBatch";
 import { EVALUATION_BATCH_SIZE, type EvaluationSettings } from "../evaluation/types";
 import type { NotifyEnvironment } from "../notify/config";
@@ -69,7 +70,13 @@ export interface MonitorOptions {
   notifyTimeoutMs?: number;
 }
 
-export type MonitorStatus = "OK" | "SKIPPED_LOCKED" | "NO_SETTINGS" | "LOCK_LOST" | "DEGRADED";
+export type MonitorStatus =
+  | "OK"
+  | "SKIPPED_LOCKED"
+  | "STOPPED"
+  | "NO_SETTINGS"
+  | "LOCK_LOST"
+  | "DEGRADED";
 
 /**
  * Status PRECEDENCE, lowest rank wins. A run can reach more than one of these -- a drain step
@@ -79,10 +86,13 @@ export type MonitorStatus = "OK" | "SKIPPED_LOCKED" | "NO_SETTINGS" | "LOCK_LOST
  */
 const STATUS_RANK: Record<MonitorStatus, number> = {
   SKIPPED_LOCKED: 0,
-  NO_SETTINGS: 1,
-  LOCK_LOST: 2,
-  DEGRADED: 3,
-  OK: 4,
+  // The operator's Stop (migrations/0008). Decided in the same step as NO_SETTINGS and checked
+  // before it, so a stopped install with no settings reads STOPPED -- the thing to undo first.
+  STOPPED: 1,
+  NO_SETTINGS: 2,
+  LOCK_LOST: 3,
+  DEGRADED: 4,
+  OK: 5,
 };
 
 /**
@@ -405,7 +415,7 @@ export const runMonitor = async (
   };
 
   /**
-   * FINALIZE RUNS ON EVERY PATH, all five statuses included. A skipped run that leaves no
+   * FINALIZE RUNS ON EVERY PATH, all six statuses included. A skipped run that leaves no
    * record is exactly what telemetry exists to prevent, and on the SKIPPED_LOCKED and
    * LOCK_LOST paths the fenced release simply matches nothing and reports `changes: 0` without
    * raising.
@@ -468,8 +478,10 @@ export const runMonitor = async (
 
     // The only signal a run gives without a database query, and there is no alerting until
     // Phase 4. Truncation is not a failure, so it does not set a status -- but an operator who
-    // never learns the source list was incomplete cannot act on it either.
-    if (run.status !== "OK" || run.sourcesTruncated) {
+    // never learns the source list was incomplete cannot act on it either. STOPPED is not a
+    // failure either: it is the operator's own choice, and 48 warnings a day for it would bury
+    // the ones that mean something.
+    if ((run.status !== "OK" && run.status !== "STOPPED") || run.sourcesTruncated) {
       console.warn(
         `monitor ${runId}: ${run.status}`,
         JSON.stringify({
@@ -511,8 +523,30 @@ export const runMonitor = async (
   //    task it touched COMPLETE at the current revision -- ineligible under all four claim
   //    tiers, carrying a verdict computed from settings nobody chose, unrecoverable without a
   //    manual revision bump.
-  const loaded = await runStep("load-settings", async () => loadCurrentSettings(db));
+  //
+  //    THE STOP FLAG IS READ IN THE SAME STEP, so it costs no step and is memoized with the
+  //    settings it gates. `stopped` is OPTIONAL on purpose: a step result memoized by a Worker
+  //    older than this field has none, and that reads as running -- the state it was in. Its row
+  //    read goes through `spend()` like every other statement, so the run's telemetry stays exact.
+  //    STOPPED IS CHECKED FIRST: the operator's Stop is the thing to undo before a missing rule.
+  const loaded: Awaited<ReturnType<typeof loadCurrentSettings>> & { stopped?: boolean } =
+    await runStep("load-settings", async () => {
+      const current = await loadCurrentSettings(db);
+      const state = await loadMonitoringState(db);
+      return {
+        settings: current.settings,
+        stopped: state.monitoring.state === "stopped",
+        usage: {
+          rowsRead: current.usage.rowsRead + state.usage.rowsRead,
+          rowsWritten: current.usage.rowsWritten + state.usage.rowsWritten,
+        },
+      };
+    });
   spend(loaded.usage);
+  if (loaded.stopped === true) {
+    escalate("STOPPED");
+    return finalize();
+  }
   if (loaded.settings === null) {
     escalate("NO_SETTINGS");
     return finalize();

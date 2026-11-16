@@ -1,4 +1,5 @@
 import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { CollectionStatusPanel } from "./CollectionStatusPanel";
 import type { CollectionStatus } from "../types";
 
@@ -447,5 +448,107 @@ describe("the Discord alert line", () => {
     render(<CollectionStatusPanel status={status({ notifications })} pending={false} />);
 
     expect(screen.getByText("Discord alerts: off (webhook ready)")).toBeInTheDocument();
+  });
+});
+
+describe("the Start/Stop control", () => {
+  const changedAt = 1_800_000_420;
+  const changedClock = new Date(changedAt * 1000).toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  const running = status({ monitoring: { state: "running", changedAt: 0 } });
+  const stopped = status({
+    status: "stopped",
+    causes: [],
+    monitoring: { state: "stopped", changedAt },
+  });
+
+  /**
+   * P-m1: STOPPED READS STOPPED, SAYS WHEN AND WHAT IT MEANS, AND OFFERS START. The timestamp line
+   * stays: the user can still see when the last run was. Kills: labelling from anything but
+   * `monitoring.state`, and dropping the explanatory line.
+   */
+  it("P-m1: stopped shows the badge, the stop time and a Start button that asks to start", async () => {
+    const user = userEvent.setup();
+    const onToggle = vi.fn();
+    render(<CollectionStatusPanel status={stopped} pending={false} onToggleMonitoring={onToggle} />);
+
+    expect(screen.getByText("Stopped")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        `Stopped at ${changedClock}. The collector skips its runs and no alerts are sent until you start it.`,
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText(`Last reported ${expectedClock}, 12 minutes ago.`)).toBeInTheDocument();
+    const button = screen.getByRole("button", { name: "Start monitoring" });
+    expect(button).toHaveClass("primary-button");
+
+    await user.click(button);
+    expect(onToggle).toHaveBeenCalledWith("start");
+  });
+
+  it("P-m2: running offers Stop as a secondary button and shows no stopped line", async () => {
+    const user = userEvent.setup();
+    const onToggle = vi.fn();
+    render(<CollectionStatusPanel status={running} pending={false} onToggleMonitoring={onToggle} />);
+
+    const button = screen.getByRole("button", { name: "Stop monitoring" });
+    expect(button).toHaveClass("secondary-button");
+    expect(screen.queryByText(/Stopped at/)).not.toBeInTheDocument();
+    expect(screen.queryByText("Stopped")).not.toBeInTheDocument();
+
+    await user.click(button);
+    expect(onToggle).toHaveBeenCalledWith("stop");
+  });
+
+  /**
+   * P-m3: NO FIELD, NO BUTTON. An older Worker sends none and a failed read sends null; neither
+   * says which label is true. Kills: defaulting a missing field to running ("Stop monitoring"
+   * over a Worker that has no Stop route).
+   */
+  it.each<[string, CollectionStatus]>([
+    ["absent (an older Worker)", status()],
+    ["null (the Worker could not read it)", status({ monitoring: null })],
+  ])("P-m3: monitoring %s renders no Start/Stop button", (_label, body) => {
+    render(<CollectionStatusPanel status={body} pending={false} onToggleMonitoring={vi.fn()} />);
+
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+  });
+
+  it("P-m4: a request in flight disables the button and leaves its label alone", () => {
+    render(
+      <CollectionStatusPanel
+        status={running}
+        pending={false}
+        onToggleMonitoring={vi.fn()}
+        monitoringPending
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Stop monitoring" })).toBeDisabled();
+  });
+
+  it("P-m5: a refusal is an alert and a confirmation is a status", () => {
+    const { rerender } = render(
+      <CollectionStatusPanel
+        status={stopped}
+        pending={false}
+        onToggleMonitoring={vi.fn()}
+        monitoringNotice={{ kind: "alert", text: "Save a deal rule before starting monitoring." }}
+      />,
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent("Save a deal rule before starting monitoring.");
+
+    rerender(
+      <CollectionStatusPanel
+        status={running}
+        pending={false}
+        onToggleMonitoring={vi.fn()}
+        monitoringNotice={{ kind: "status", text: "Started. Your collector picks this up on its next run." }}
+      />,
+    );
+    expect(screen.getByRole("status")).toHaveTextContent("Started. Your collector picks this up on its next run.");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 });

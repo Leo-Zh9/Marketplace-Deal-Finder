@@ -18,6 +18,8 @@
  * are separate from the revision log precisely so that isolation is structural. W-1 asserts it.
  */
 
+import { loadMonitoringState } from "./monitoring";
+
 export interface WatchMarket {
   location: string;
   latitude: number;
@@ -39,6 +41,13 @@ export interface WatchTargetsBody {
    */
   market: WatchMarket | null;
   targets: WatchTarget[];
+  /**
+   * THE DASHBOARD'S START/STOP, migrations/0008. "stopped" comes with an EMPTY `targets`, and the
+   * collector must not read that as an empty watch list (exit 2, degraded health): it reads the
+   * word first and exits 0. A collector older than this field ignores it and sees `targets: []`,
+   * which fails loudly as exit 2 rather than collecting through a Stop.
+   */
+  monitoring: "running" | "stopped";
 }
 
 export type WatchTargetsResult =
@@ -71,8 +80,17 @@ interface TargetRow {
 
 export const handleGetWatchTargets = async (db: D1Database): Promise<WatchTargetsResult> => {
   try {
+    // INSIDE THE TRY: a failed read is the existing 503, never a guess in either direction.
+    const { monitoring } = await loadMonitoringState(db);
     const marketRead = await db.prepare(SELECT_MARKET).all<MarketRow>();
-    const targetsRead = await db.prepare(SELECT_TARGETS).all<TargetRow>();
+    const stopped = monitoring.state === "stopped";
+    const targets = stopped
+      ? []
+      : (await db.prepare(SELECT_TARGETS).all<TargetRow>()).results.map((row) => ({
+          targetId: row.target_id,
+          componentType: row.component_type,
+          query: row.query,
+        }));
 
     const marketRow = marketRead.results[0];
 
@@ -89,11 +107,8 @@ export const handleGetWatchTargets = async (db: D1Database): Promise<WatchTarget
                 longitude: marketRow.longitude,
                 radiusKm: marketRow.radius_km,
               },
-        targets: targetsRead.results.map((row) => ({
-          targetId: row.target_id,
-          componentType: row.component_type,
-          query: row.query,
-        })),
+        targets,
+        monitoring: monitoring.state,
       },
     };
   } catch {

@@ -12,6 +12,7 @@ import monitorSql from "../../migrations/0004_monitor.sql?raw";
 import watchTargetsSql from "../../migrations/0005_watch_targets.sql?raw";
 import collectorHealthSql from "../../migrations/0006_collector_health.sql?raw";
 import notificationsSql from "../../migrations/0007_notifications.sql?raw";
+import monitoringStateSql from "../../migrations/0008_monitoring_state.sql?raw";
 
 /**
  * Strip `--` line comments, split on `;`, trim, drop empties. The schema contains no
@@ -46,7 +47,8 @@ export interface TestDatabase {
  * monitor_lock; without 0005, every watch-list test would fail on a missing watch_targets;
  * without 0006, every collector-health test would fail on a missing collector_health and S-n1
  * would report ten tables instead of eleven; without 0007, every notification test would fail on
- * a missing notifications table.
+ * a missing notifications table; without 0008, every monitoring-controls test would fail on a
+ * missing monitoring_state and S1 would report twelve tables instead of thirteen.
  */
 export const applyMigrations = async (db: D1Database): Promise<void> => {
   for (const sql of [
@@ -57,6 +59,7 @@ export const applyMigrations = async (db: D1Database): Promise<void> => {
     watchTargetsSql,
     collectorHealthSql,
     notificationsSql,
+    monitoringStateSql,
   ]) {
     await db.batch(splitSqlStatements(sql).map((statement) => db.prepare(statement)));
   }
@@ -82,7 +85,7 @@ export const createTestDatabase = async (): Promise<TestDatabase> => {
 };
 
 /**
- * One batch of DELETEs across all eleven tables, for `beforeEach` isolation.
+ * One batch of DELETEs across every table, for `beforeEach` isolation.
  *
  * search_settings BEFORE search_revisions, and that is not style. D1 runs with
  * `PRAGMA foreign_keys = 1`, search_settings.current_revision REFERENCES
@@ -130,6 +133,13 @@ export const truncateAll = async (db: D1Database): Promise<void> => {
     db.prepare(
       `INSERT INTO monitor_lock (id, run_id, acquired_at, expires_at) VALUES (1, '', 0, 0)
        ON CONFLICT(id) DO UPDATE SET run_id = '', acquired_at = 0, expires_at = 0`,
+    ),
+    // RESET TO THE SEED, like monitor_lock and for a sharper reason: a test that stops
+    // monitoring and leaves it stopped would turn every later runMonitor test in the same file
+    // into a STOPPED run that drains nothing, and every watch-targets test into an empty list.
+    db.prepare(
+      `INSERT INTO monitoring_state (id, enabled, changed_at) VALUES (1, 1, 0)
+       ON CONFLICT(id) DO UPDATE SET enabled = 1, changed_at = 0`,
     ),
   ]);
 };

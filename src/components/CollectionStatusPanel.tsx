@@ -105,6 +105,10 @@ const BADGE_WORDS: Record<CollectionStatus["status"], string> = {
   stale: "No recent run",
   degraded: "Degraded",
   unknown: "Unknown",
+  // THE OPERATOR'S OWN STOP, and it has a writer: `POST /api/monitoring/stop` sets the row the
+  // collector and the monitoring runs both honour. That is what makes it different from the
+  // deleted panel's "Stopped", which nothing wrote (P-4 still guards that case).
+  stopped: "Stopped",
 };
 
 /** "14:38" in the viewer's own zone, from unix SECONDS. */
@@ -161,13 +165,39 @@ const alertLine = (notifications: NonNullable<CollectionStatus["notifications"]>
   }
 };
 
+export interface MonitoringNotice {
+  /** `status` for a confirmation, `alert` for a refusal or a failure. */
+  kind: "status" | "alert";
+  text: string;
+}
+
 export interface CollectionStatusPanelProps {
   /** `null` means the read itself failed or has not finished. */
   status: CollectionStatus | null;
   pending: boolean;
+  /** Start/Stop. With no handler the button is not rendered. */
+  onToggleMonitoring?: (next: "start" | "stop") => void;
+  /** A Start/Stop request is in flight: the button is disabled and its label is unchanged. */
+  monitoringPending?: boolean;
+  monitoringNotice?: MonitoringNotice | null;
 }
 
-export function CollectionStatusPanel({ status, pending }: CollectionStatusPanelProps) {
+export function CollectionStatusPanel({
+  status,
+  pending,
+  onToggleMonitoring,
+  monitoringPending = false,
+  monitoringNotice = null,
+}: CollectionStatusPanelProps) {
+  /**
+   * THE LABEL COMES FROM THE SERVER'S ROW AND NOTHING ELSE. No optimistic flip: a Stop that failed
+   * must not leave a "Start monitoring" button over a collector that is still running. With no
+   * `monitoring` on the wire (an older Worker, or a read the Worker could not make) there is no
+   * button, because there is no true label for it.
+   */
+  const monitoring = status?.monitoring ?? null;
+  const running = monitoring?.state === "running";
+
   return (
     <section className="collection-panel" aria-labelledby="collection-heading">
       <div className="panel-heading">
@@ -175,7 +205,24 @@ export function CollectionStatusPanel({ status, pending }: CollectionStatusPanel
           <p className="eyebrow">Collection</p>
           <h2 id="collection-heading">Is anything collecting?</h2>
         </div>
+        {monitoring !== null && onToggleMonitoring !== undefined && (
+          <button
+            className={running ? "secondary-button" : "primary-button"}
+            disabled={monitoringPending}
+            type="button"
+            onClick={() => onToggleMonitoring(running ? "stop" : "start")}
+          >
+            {running ? "Stop monitoring" : "Start monitoring"}
+          </button>
+        )}
       </div>
+
+      {monitoringNotice !== null &&
+        (monitoringNotice.kind === "alert" ? (
+          <p className="collection-notice" role="alert">{monitoringNotice.text}</p>
+        ) : (
+          <p className="collection-notice" role="status">{monitoringNotice.text}</p>
+        ))}
 
       {status === null ? (
         <p className="muted-copy">
@@ -202,6 +249,13 @@ export function CollectionStatusPanel({ status, pending }: CollectionStatusPanel
               </p>
             )}
           </div>
+
+          {monitoring?.state === "stopped" && (
+            <p className="collection-stopped">
+              Stopped at {clockTime(monitoring.changedAt)}. The collector skips its runs and no
+              alerts are sent until you start it.
+            </p>
+          )}
 
           {status.causes.length > 0 && (
             <ul className="collection-causes">

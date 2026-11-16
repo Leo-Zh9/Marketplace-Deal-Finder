@@ -320,6 +320,8 @@ describe("protected Worker API", () => {
       // Phase 4, additive. No webhook in this environment, so the notifications table is never
       // read (worker/notify/status.ts).
       notifications: { state: "unconfigured" },
+      // Start/Stop, additive. No DB binding, so null -- never a guessed "running".
+      monitoring: null,
     });
   });
 
@@ -387,6 +389,7 @@ describe("protected Worker API", () => {
       collector: null,
       authentication: "local-development",
       notifications: { state: "unconfigured" },
+      monitoring: null,
     });
   });
 });
@@ -802,6 +805,11 @@ describe("the ingest route's credential boundary", () => {
     // give the collector's token the operator's WRITE on the watch list.
     ["GET", "/api/watch"],
     ["PUT", "/api/watch"],
+    // X-m4: THE LAPTOP CANNOT SWITCH OFF THE ALERTS THAT REPORT ON IT. Start/Stop sit below
+    // `authenticateRequest`; routing them through `authorizeCollector` would let a leaked collector
+    // token silence monitoring.
+    ["POST", "/api/monitoring/start"],
+    ["POST", "/api/monitoring/stop"],
   ])(
     "X4: a VALID collector token buys nothing on %s %s",
     async (method, path) => {
@@ -1162,6 +1170,7 @@ describe("the watch-list route's credential boundary", () => {
     await expect(response.json()).resolves.toEqual({
       market: { location: "toronto", latitude: 43.6532, longitude: -79.3832, radiusKm: 25 },
       targets: [{ targetId: "gpu-toronto", componentType: "gpu", query: "graphics card" }],
+      monitoring: "running",
     });
   });
 
@@ -2138,6 +2147,186 @@ describe("the collector health route's credential boundary", () => {
       },
       authentication: "firebase-google",
       notifications: { state: "unconfigured" },
+      // The seed truncateAll restores: running, never changed.
+      monitoring: { state: "running", changedAt: 0 },
     });
+  });
+});
+
+/**
+ * THE DASHBOARD'S START/STOP, through `handleRequest` so the route wiring, the preflight, the DB
+ * guard and the `/api/status` override are all covered -- the handler suite (worker/api/
+ * monitoring.test.ts) is blind to every one of them.
+ */
+describe("the monitoring start/stop routes", () => {
+  const collectorToken = "index-suite-monitoring-token-5b2d8e14";
+  const startPath = "/api/monitoring/start";
+  const stopPath = "/api/monitoring/stop";
+
+  let database!: TestDatabase;
+
+  beforeAll(async () => {
+    database = await createTestDatabase();
+  }, 120_000);
+
+  afterAll(async () => {
+    await database.dispose();
+  });
+
+  beforeEach(async () => {
+    await truncateAll(database.db);
+  });
+
+  const monitoringEnvironment = (overrides: Partial<Environment> = {}): Environment =>
+    environment({ COLLECTOR_TOKEN: collectorToken, DB: database.db, ...overrides });
+
+  const post = async (path: string, env: Environment = monitoringEnvironment()) =>
+    call(path, { method: "POST", headers: { Authorization: await bearerFor(), Origin: pagesOrigin } }, env);
+
+  const status = async () =>
+    (await call(
+      "/api/status",
+      { headers: { Authorization: await bearerFor() } },
+      monitoringEnvironment(),
+    ).then((response) => response.json())) as Record<string, unknown>;
+
+  /**
+   * X-m1: THE ROUTE_METHODS ROWS, AND THEY ARE THE ONLY GUARD ON THEM. Without a row the browser's
+   * cross-origin POST is refused at the preflight while curl, the Vite proxy and every handler test
+   * still pass. Each path advertises exactly POST, and a GET preflight is refused.
+   */
+  it("X-m1: each path's preflight is 204 for POST alone", async () => {
+    expect(ROUTE_METHODS.get(startPath)).toEqual(["POST"]);
+    expect(ROUTE_METHODS.get(stopPath)).toEqual(["POST"]);
+
+    for (const path of [startPath, stopPath]) {
+      const ahead = await call(path, {
+        method: "OPTIONS",
+        headers: {
+          Origin: pagesOrigin,
+          "Access-Control-Request-Method": "POST",
+          "Access-Control-Request-Headers": "authorization, accept",
+        },
+      });
+      expect([path, ahead.status]).toEqual([path, 204]);
+      expect(ahead.headers.get("Access-Control-Allow-Methods")).toBe("POST, OPTIONS");
+      expect(ahead.headers.get("Access-Control-Allow-Origin")).toBe(pagesOrigin);
+
+      const get = await call(path, {
+        method: "OPTIONS",
+        headers: { Origin: pagesOrigin, "Access-Control-Request-Method": "GET" },
+      });
+      expect([path, get.status]).toEqual([path, 403]);
+    }
+  });
+
+  it("X-m2: a missing DB binding is 503 DATABASE_UNAVAILABLE, and GET is not routed", async () => {
+    for (const path of [startPath, stopPath]) {
+      const response = await post(path, environment());
+      expect([path, response.status]).toEqual([path, 503]);
+      await expect(response.json()).resolves.toMatchObject({ error: { code: "DATABASE_UNAVAILABLE" } });
+
+      const get = await call(
+        path,
+        { headers: { Authorization: await bearerFor(), Origin: pagesOrigin } },
+        monitoringEnvironment(),
+      );
+      expect([path, get.status]).toEqual([path, 404]);
+    }
+  });
+
+  /**
+   * X-m3: THE WHOLE LOOP. Stop over HTTP; the browser's `/api/status` reads `stopped` with no
+   * causes OVER A DEGRADED HEALTH ROW, while keeping the timestamp; the collector's watch list is
+   * empty and says why; Start with no rule is 409 with the dashboard's sentence; Start with a rule
+   * puts everything back. Kills: not wiring `applyMonitoring` into the status route (status reads
+   * degraded), and swapping the two paths' handlers (the first Stop answers running).
+   */
+  it("X-m3: stop, read, refuse an unready start, start -- over HTTP", async () => {
+    await database.db
+      .prepare(
+        `INSERT INTO collector_health
+           (id, reported_at, exit_code, complete, canary, dry_run, fixture, targets, alarms)
+         VALUES (1, ?1, 6, 0, 0, 0, 0, 2, '[]')`,
+      )
+      .bind(now - 600)
+      .run();
+    await database.db
+      .prepare("INSERT INTO watch_targets (target_id, component_type, query) VALUES ('gpu-x', 'gpu', 'gpu')")
+      .run();
+    expect(await status()).toMatchObject({ status: "degraded", monitoring: { state: "running" } });
+
+    const stopped = await post(stopPath);
+    expect(stopped.status).toBe(200);
+    expect(stopped.headers.get("Access-Control-Allow-Origin")).toBe(pagesOrigin);
+    await expect(stopped.json()).resolves.toEqual({ monitoring: { state: "stopped", changedAt: now } });
+
+    expect(await status()).toMatchObject({
+      status: "stopped",
+      causes: [],
+      reportedAt: now - 600,
+      ageMinutes: 10,
+      collector: { exitCode: 6, targets: 2 },
+      monitoring: { state: "stopped", changedAt: now },
+    });
+
+    const targets = await handleRequest(
+      new Request(`${workerOrigin}/api/watch-targets`, { headers: { "X-Collector-Token": collectorToken } }),
+      monitoringEnvironment(),
+      dependencies,
+    );
+    await expect(targets.json()).resolves.toEqual({ market: null, targets: [], monitoring: "stopped" });
+
+    const unready = await post(startPath);
+    expect(unready.status).toBe(409);
+    await expect(unready.json()).resolves.toEqual({
+      error: { code: "MONITORING_NOT_READY", message: "Save a deal rule before starting monitoring." },
+    });
+    expect(await status()).toMatchObject({ status: "stopped" });
+
+    const saved = await call(
+      "/api/settings",
+      {
+        method: "PUT",
+        body: '{"mode":"DISCOUNT","minimumDiscountPercent":19.25}',
+        headers: { Authorization: await bearerFor(), Origin: pagesOrigin, "Content-Type": "application/json" },
+      },
+      monitoringEnvironment(),
+    );
+    expect(saved.status).toBe(200);
+
+    const started = await post(startPath);
+    expect(started.status).toBe(200);
+    await expect(started.json()).resolves.toEqual({ monitoring: { state: "running", changedAt: now } });
+    expect(await status()).toMatchObject({
+      status: "degraded",
+      causes: ["exit-code:6", "incomplete"],
+      monitoring: { state: "running", changedAt: now },
+    });
+  });
+
+  /**
+   * X-m5: A FAILED FLAG READ ON `/api/status` IS `monitoring: null` AND OVERRIDES NOTHING. The row
+   * says stopped and the read of it fails, so a route that defaulted the failure to either word
+   * would show it. The health read itself succeeds here.
+   */
+  it("X-m5: a monitoring_state read that throws leaves status alone and answers null", async () => {
+    await post(stopPath);
+    const real = database.db;
+    const flagFails = {
+      prepare: (sql: string) => {
+        if (sql.includes("monitoring_state")) throw new Error("D1_ERROR: no such table");
+        return real.prepare(sql);
+      },
+      batch: real.batch.bind(real),
+    } as unknown as D1Database;
+
+    const response = await call(
+      "/api/status",
+      { headers: { Authorization: await bearerFor() } },
+      monitoringEnvironment({ DB: flagFails }),
+    );
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({ status: "unknown", monitoring: null });
   });
 });

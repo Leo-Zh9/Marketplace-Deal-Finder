@@ -102,6 +102,10 @@ interface Wire {
   /** A raw `/api/status` body, served exactly as given. Wins over `status`. */
   statusRaw?: unknown;
   statusStatus?: number;
+  /** A live `/api/status` body, read on every request. Wins over `statusRaw` and `status`. */
+  statusFn?: () => unknown;
+  /** What `POST /api/monitoring/start|stop` answers. Absent, the request is unexpected. */
+  monitoringReply?: (path: string) => Promise<{ status: number; body: unknown }>;
 }
 
 interface Call {
@@ -160,9 +164,18 @@ const stubWire = (wire: Wire = {}) => {
        * impossible to ship without also wiring the page's only notification channel.
        */
       if (path === "/api/status") {
+        if (wire.statusFn !== undefined) return reply(wire.statusFn());
         return wire.statusStatus !== undefined && wire.statusStatus !== 200
           ? reply({ error: { code: "AUTH_KEYS_UNAVAILABLE" } }, wire.statusStatus)
           : reply(wire.statusRaw ?? wire.status ?? HEALTHY_STATUS);
+      }
+      if (
+        method === "POST" &&
+        (path === "/api/monitoring/start" || path === "/api/monitoring/stop") &&
+        wire.monitoringReply !== undefined
+      ) {
+        const answer = await wire.monitoringReply(path);
+        return reply(answer.body, answer.status);
       }
       throw new Error(`unexpected request: ${method} ${String(url)}`);
     },
@@ -1434,5 +1447,147 @@ describe("the control panel", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("Start/Stop monitoring", () => {
+  const CHANGED_AT = 1_800_000_240;
+
+  /** A Worker with a monitoring row the POSTs really move, read back by every status poll. */
+  const liveMonitoring = (initial: "running" | "stopped", options: { ready?: boolean; flip?: boolean } = {}) => {
+    let state = initial;
+    let changedAt = initial === "stopped" ? CHANGED_AT : 0;
+    return {
+      statusFn: () => ({
+        ...HEALTHY_STATUS,
+        ...(state === "stopped" ? { status: "stopped", causes: [] } : {}),
+        monitoring: { state, changedAt },
+      }),
+      monitoringReply: async (path: string) => {
+        const next = path.endsWith("/start") ? "running" : "stopped";
+        if (next === "running" && options.ready === false) {
+          return {
+            status: 409,
+            body: { error: { code: "MONITORING_NOT_READY", message: "Save a deal rule before starting monitoring." } },
+          };
+        }
+        if (options.flip !== false && next !== state) {
+          state = next;
+          changedAt = CHANGED_AT + 60;
+        }
+        return { status: 200, body: { monitoring: { state: next, changedAt } } };
+      },
+    };
+  };
+
+  /**
+   * A-m1: STOP, THEN THE PAGE RE-READS AND RELABELS FROM THE SERVER. The POST is sent, a status read
+   * FOLLOWS it, and only then does the button read Start. Kills: not re-reading (the label stays
+   * "Stop monitoring" until the next 60 s poll).
+   */
+  it("A-m1: Stop posts, re-reads status at once, and the button becomes Start", async () => {
+    const user = userEvent.setup();
+    const calls = stubWire({ watch: LIVE_WATCH, settings: null, ...liveMonitoring("running") });
+    render(<App getToken={noToken} />);
+    await waitForLoad("9 of 9 searches used");
+
+    await user.click(await screen.findByRole("button", { name: "Stop monitoring" }));
+
+    expect(await screen.findByRole("button", { name: "Start monitoring" })).toBeEnabled();
+    expect(screen.getByText("Stopped")).toBeInTheDocument();
+    expect(
+      screen.getByText("Stopped. Your collector skips its next run and no alerts are sent."),
+    ).toBeInTheDocument();
+    const post = calls.findIndex((call) => call.method === "POST" && call.url === "/api/monitoring/stop");
+    expect(post).toBeGreaterThan(-1);
+    expect(calls[post].body).toBeUndefined();
+    expect(calls.slice(post + 1).some((call) => call.url === "/api/status")).toBe(true);
+  });
+
+  /**
+   * A-m2: THE LABEL IS NEVER OPTIMISTIC. The POST answers 200 but the row does not move (a second
+   * tab started it again, say), so the re-read still says running -- and so does the button.
+   * Kills: flipping the label from the click or from the POST's own answer.
+   */
+  it("A-m2: a successful POST whose re-read still says running keeps the Stop label", async () => {
+    const user = userEvent.setup();
+    stubWire({ watch: LIVE_WATCH, settings: null, ...liveMonitoring("running", { flip: false }) });
+    render(<App getToken={noToken} />);
+    await waitForLoad("9 of 9 searches used");
+
+    await user.click(await screen.findByRole("button", { name: "Stop monitoring" }));
+
+    await screen.findByText("Stopped. Your collector skips its next run and no alerts are sent.");
+    expect(screen.getByRole("button", { name: "Stop monitoring" })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "Start monitoring" })).not.toBeInTheDocument();
+  });
+
+  /**
+   * A-m3: START WITH NO DEAL RULE IS REFUSED IN THE DASHBOARD'S WORDS, AS AN ALERT, AND THE LABEL
+   * STAYS. Kills: showing the generic "status 409" sentence, and treating a refusal as success.
+   */
+  it("A-m3: a 409 on Start says to save a deal rule and leaves the Start button", async () => {
+    const user = userEvent.setup();
+    stubWire({ watch: LIVE_WATCH, settings: null, ...liveMonitoring("stopped", { ready: false }) });
+    render(<App getToken={noToken} />);
+    await waitForLoad("9 of 9 searches used");
+
+    await user.click(await screen.findByRole("button", { name: "Start monitoring" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Save a deal rule before starting monitoring.");
+    expect(screen.getByRole("button", { name: "Start monitoring" })).toBeEnabled();
+    expect(screen.queryByText(/^Started\./)).not.toBeInTheDocument();
+  });
+
+  it("A-m4: Start from stopped posts start and the button becomes Stop", async () => {
+    const user = userEvent.setup();
+    const calls = stubWire({ watch: LIVE_WATCH, settings: null, ...liveMonitoring("stopped") });
+    render(<App getToken={noToken} />);
+    await waitForLoad("9 of 9 searches used");
+
+    await user.click(await screen.findByRole("button", { name: "Start monitoring" }));
+
+    expect(await screen.findByRole("button", { name: "Stop monitoring" })).toBeEnabled();
+    expect(screen.getByText("Started. Your collector picks this up on its next run.")).toBeInTheDocument();
+    expect(calls.some((call) => call.method === "POST" && call.url === "/api/monitoring/start")).toBe(true);
+  });
+
+  /**
+   * A-m5: WHILE THE POST IS IN FLIGHT THE BUTTON IS DISABLED, so a double click cannot send two.
+   * Kills: dropping the pending flag.
+   */
+  it("A-m5: the button is disabled while the request is in flight", async () => {
+    const user = userEvent.setup();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const live = liveMonitoring("running");
+    stubWire({
+      watch: LIVE_WATCH,
+      settings: null,
+      statusFn: live.statusFn,
+      monitoringReply: async (path) => {
+        await gate;
+        return live.monitoringReply(path);
+      },
+    });
+    render(<App getToken={noToken} />);
+    await waitForLoad("9 of 9 searches used");
+
+    await user.click(await screen.findByRole("button", { name: "Stop monitoring" }));
+    expect(screen.getByRole("button", { name: "Stop monitoring" })).toBeDisabled();
+
+    release();
+    expect(await screen.findByRole("button", { name: "Start monitoring" })).toBeEnabled();
+  });
+
+  it("A-m6: a status body with no monitoring field renders no Start/Stop button", async () => {
+    stubWire({ watch: LIVE_WATCH, settings: null });
+    render(<App getToken={noToken} />);
+    await waitForLoad("9 of 9 searches used");
+    await screen.findByText("Collecting");
+
+    expect(screen.queryByRole("button", { name: /monitoring/ })).not.toBeInTheDocument();
   });
 });

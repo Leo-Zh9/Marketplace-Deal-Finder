@@ -7,6 +7,12 @@ import {
 import { authorizeCollector, type CollectorEnvironment } from "./auth/collectorToken";
 import { handlePostCollectorHealth, readCollectorHealth } from "./api/collectorHealth";
 import { handlePostListings } from "./api/listings";
+import {
+  applyMonitoring,
+  handleStartMonitoring,
+  handleStopMonitoring,
+  readMonitoring,
+} from "./api/monitoring";
 import { handleGetSettings, handlePutSettings } from "./api/settings";
 import { handleGetVerdicts } from "./api/verdicts";
 import { handleGetWatch, handlePutWatch } from "./api/watch";
@@ -64,6 +70,14 @@ export const ROUTE_METHODS = new Map<string, readonly string[]>([
    * `npm run dev` reaches the Worker through Vite's same-origin /api proxy. X-w1 is the guard.
    */
   ["/api/watch", ["GET", "PUT"]],
+  /**
+   * THE DASHBOARD'S START/STOP. Browser routes behind `authenticateRequest`, so they need rows
+   * here for the same reason `/api/watch` does: without one the browser's cross-origin POST is
+   * refused at the preflight while curl and the Vite proxy both work. Neither route reads a body;
+   * POST is a body method, so `preflightHeadersFor` offers Content-Type anyway, which is harmless.
+   */
+  ["/api/monitoring/start", ["POST"]],
+  ["/api/monitoring/stop", ["POST"]],
 ]);
 
 const BODY_METHODS = new Set(["PUT", "POST", "PATCH"]);
@@ -136,6 +150,11 @@ const errorMessages: Record<string, string> = {
   // DISTINCT FROM INGEST_STORAGE_FAILED AND SETTINGS_STORAGE_FAILED, same rule: three different
   // fixes behind one code sends an operator to the wrong one.
   COLLECTOR_HEALTH_STORAGE_FAILED: "The collector health report could not be stored.",
+  // A 409, not a 400: the request is fine, the install is not ready. Start with no deal rule would
+  // record NO_SETTINGS every 30 minutes while the page said "Started".
+  MONITORING_NOT_READY: "Save a deal rule before starting monitoring.",
+  // Distinct from every other *_STORAGE_FAILED code, by the rule those codes already state.
+  MONITORING_STORAGE_FAILED: "The monitoring state could not be read or written.",
 };
 
 type ExtraHeaders = Record<string, string>;
@@ -412,10 +431,13 @@ export const handleRequest = async (
     const health = await readCollectorHealth(environment.DB, statusNow);
     // ADDITIVE. In the inert notification states this reads nothing from D1 (worker/notify/status.ts).
     const notifications = await readNotificationsStatus(environment.DB, environment, statusNow);
+    // ADDITIVE, AND IT CANNOT 503 EITHER: a missing binding or a failed read is `monitoring: null`
+    // and the health words stand. Stopped overrides them (worker/api/monitoring.ts says why).
+    const monitoring = await readMonitoring(environment.DB);
 
     return json(
       {
-        ...health,
+        ...applyMonitoring(health, monitoring),
         authentication: authentication.identity.authenticationMethod,
         notifications,
       },
@@ -454,6 +476,29 @@ export const handleRequest = async (
     return result.ok
       ? json(result.body, result.status, cors)
       : errorResponse(result.code, result.status, cors, result.details);
+  }
+
+  /**
+   * START AND STOP. Below `authenticateRequest`, so a collector token buys nothing here (X4): the
+   * laptop must not be able to switch off the alerts that report on it. Neither handler reads the
+   * body. The DB guard is first, as on `/api/settings`.
+   */
+  if (
+    request.method === "POST" &&
+    (url.pathname === "/api/monitoring/start" || url.pathname === "/api/monitoring/stop")
+  ) {
+    const db = environment.DB;
+    if (db === undefined) return errorResponse("DATABASE_UNAVAILABLE", 503, cors);
+
+    const monitoringNow = dependencies?.now() ?? Math.floor(Date.now() / 1000);
+    const result =
+      url.pathname === "/api/monitoring/start"
+        ? await handleStartMonitoring(db, monitoringNow)
+        : await handleStopMonitoring(db, monitoringNow);
+
+    return result.ok
+      ? json(result.body, result.status, cors)
+      : errorResponse(result.code, result.status, cors);
   }
 
   /**
