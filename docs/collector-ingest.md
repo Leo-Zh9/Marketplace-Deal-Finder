@@ -779,8 +779,16 @@ different queries in the same run* is a generic feed.
 latched cause's own targets (`CANARY_TARGETS = 2`, a 78 % volume cut) and the run line reports
 `"canary":true`. Stopping instead would be **indistinguishable from a broken cron** and would be
 discovered days later, which is how this project shipped "evaluation is running" over 498 dead
-cron runs. A cause clears only when **its own cause** is re-measured clean twice
-(`CANARY_CLEAN_PROBES = 2`), and the cut — not the alarm — expires after `MAX_CANARY_RUNS = 48`
+cron runs. **One exception: a quiet `source-empty` cause engages no cut.** When one target
+comes back empty while another in the same run exits 0, that is a quiet query, not a page-marker
+change (which empties every target). The cause keeps its alarm and the page still says Degraded,
+but runs stay full. A cause clears only when **its own cause** is re-measured clean twice
+(`CANARY_CLEAN_PROBES = 2`), with two exceptions. A refusal is of the IP, so `refused:t` is also
+credited by a run in which `t` itself got a parsed empty page (exit 3), another target exited 0,
+and nothing was refused. A 403, an off-site redirect or a checkpoint page at `t` earns no such
+credit. And a cause whose question can no longer be answered is dropped without credit: a pair
+whose two rows became the same query, or whose pages both parsed but cannot clear the
+denominator floor. The cut — not the alarm — expires after `MAX_CANARY_RUNS = 48`
 so one full run per day keeps re-measuring everything. **`refused:*` never expires:** that is the
 case where Facebook has refused this IP, and staying low is the entire point.
 
