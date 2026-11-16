@@ -651,13 +651,22 @@ has "  ...so nothing latches there either"     '"alarms":[]' "$(cat /tmp/e2e-col
 # the probe IS the whole list, so `canary` is false and both targets run whether or not the cause
 # was dropped. And `canary` comes from the PERSISTED latch, decided before anything runs, so the
 # run that drops the cause is still a 2-of-3 probe; the lift shows on the run after it.
+#
+# THE PROBE IS SERVED A PAGE THAT DOES NOT PARSE (exit 4, no ids), OR THIS BLOCK STOPS WITNESSING
+# THE SAME-QUERY DROP. Since round 5 a pair whose pages both PARSED and still cannot be measured is
+# dropped by a second rule, so on the ordinary fixture deleting the same-query drop left every row
+# here green. Only the same-query rule drops a pair whose pages did not parse.
+sed 's/GroupCommerceProductItem/RenamedCommerceItem/g' \
+  collector/testing/fixtures/facebookSearchPage.html > /tmp/e2e-unparsed.html
 sql "INSERT INTO watch_targets (target_id, component_type, query) VALUES ('e2e-three', 'gpu', 'radeon');" >/dev/null
 cat > "$COLLECTOR_STATE" <<'STATE'
 {"version":1,"consecutive":{"dup-gpu":{"sourceEmpty":0,"transient":0}},
  "alarm":{"feed-overlap:dup-cpu+dup-gpu":{"runs":9,"cleanProbes":0}},"probe":0,"canaryRuns":3}
 STATE
-collect
+run_collector COLLECTOR_TARGET_DELAY_MS=0 COLLECTOR_HTML_FILE=/tmp/e2e-unparsed.html
+rm -f /tmp/e2e-unparsed.html
 is "a latched pair that is now one search is probed" 2 "$(grep -c '"kind":"target"' /tmp/e2e-collector.out)"
+has "  ...on pages that did not parse"         '"reason":"parser-blind"' "$(cat /tmp/e2e-collector.out)"
 has "  ...under the volume cut"                '"canary":true' "$(cat /tmp/e2e-collector.out)"
 has "  ...and the unanswerable cause is DROPPED" '"alarms":[]' "$(cat /tmp/e2e-collector.out)"
 is "  ...and the state file holds no alarm"    '{}' "$(python3 -c "import json;print(json.dumps(json.load(open('$COLLECTOR_STATE'))['alarm']))")"

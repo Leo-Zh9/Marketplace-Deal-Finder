@@ -629,8 +629,8 @@ export interface AdvanceResult {
  *   ---------------------|--------------------------------------------|---------------------------
  *   source-empty:t       | t ran AND t's exit is 0 or 6               | t's exit is not 3
  *   transient:t          | t ran AND t's exit is 0 or 6               | t's exit is not 5
- *   refused:t            | t ran AND (t's exit is 0 or 6, OR any      | not (exit 5 with a refusal)
- *                        |   target exited 0 and none was refused)    |
+ *   refused:t            | t ran AND (t's exit is 0 or 6, OR t's exit | not (exit 5 with a refusal)
+ *                        |   is 3, another exited 0, none refused)    |
  *   feed-overlap:a+b     | both ran, both non-empty, min >= the floor | coefficient < the fraction
  *
  * "MEASURED" IS POSITIVE EVIDENCE, NOT THE ABSENCE OF THE CAUSE'S OWN CODE. Exit 0 and exit 6
@@ -751,6 +751,21 @@ export const advanceState = (input: AdvanceInput): AdvanceResult => {
       // predicate the trip uses, so "clean" and "tripped" cannot disagree about what was
       // measurable. A probe of a pair whose page came back empty measures nothing.
       const pair = maxPairOverlap(present);
+      /**
+       * BUT A PAIR WHOSE PAGES BOTH PARSED AND STILL CANNOT BE MEASURED IS UNANSWERABLE, AND IS
+       * DROPPED THE SAME WAY AS THE SAME-QUERY CASE ABOVE. If one feed settles below the floor
+       * (or at an empty results page, exit 3), no number of probes can ever clear the cause:
+       * measured, 195 of 200 runs cut. Dropping costs one full run; if the feed is real at the
+       * floor, that run re-latches it. A page that did NOT parse (a 5xx, a block) is still
+       * "not measured" and keeps the cause.
+       */
+      const bothParsed = present.every(
+        (target) => target.ids.length > 0 || target.exitCode === EXIT_SOURCE_EMPTY,
+      );
+      if (bothParsed && (pair === null || pair.of < OVERLAP_MIN_DENOMINATOR)) {
+        unmeasurable.push(cause);
+        continue;
+      }
       if (pair === null || pair.of < OVERLAP_MIN_DENOMINATOR) continue;
       if (pair.shared / pair.of >= OVERLAP_ALARM_FRACTION) {
         value.cleanProbes = 0;
@@ -810,8 +825,16 @@ export const advanceState = (input: AdvanceInput): AdvanceResult => {
          * refused once and then quiet for good (exit 3, a niche query) never did: measured, 199
          * of 200 runs cut and the latch never cleared, since a refusal never expires. So an
          * EXIT_OK anywhere in the run credits it, provided no target in the run was refused.
+         *
+         * ONLY WHEN THE OWNER ITSELF EXITED 3. That is a parsed, empty results page: Facebook
+         * served this IP a real page. Every other owner code is how a block looks -- a 403 is
+         * `http-client-error` (exit 4), an off-site 3xx is exit 4, and a 200 checkpoint
+         * interstitial is `unrecognized-page` (exit 5). Measured without this condition: an owner
+         * answering 403 every run beside a healthy filler cleared `refused:t1` at run 2 and ran
+         * full volume into the block from run 3.
          */
-        const ipAnswered = cause.startsWith("refused:") && ipClean;
+        const ipAnswered =
+          cause.startsWith("refused:") && ipClean && target.exitCode === EXIT_SOURCE_EMPTY;
         if (!ipAnswered) continue;
       }
     }

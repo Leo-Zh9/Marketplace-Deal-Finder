@@ -60,8 +60,9 @@ const simulate = (
   watchList: readonly string[],
   runs: number,
   answer: (targetId: string, run: number) => TargetRun,
+  initial: RunState = fresh(),
 ) => {
-  let state = fresh();
+  let state = initial;
   let cut = 0;
   let requests = 0;
   for (let run = 0; run < runs; run += 1) {
@@ -530,20 +531,69 @@ describe("the collector's cross-run state", () => {
   });
 
   /**
-   * G-12c: A PROBE OF BOTH HALVES WHOSE PAGES CAME BACK TOO THIN MEASURES NOTHING. The pair's
-   * clean condition carries the same floor the trip does, so 5 ids each is no evidence either
-   * way -- crediting it would clear a feed alarm off a quiet market.
+   * G-12c: A PROBE OF BOTH HALVES WHOSE PAGES CAME BACK TOO THIN IS UNANSWERABLE, SO THE CAUSE IS
+   * DROPPED -- AND NOT CREDITED. RULING REVERSED IN REVIEW ROUND 5: this row used to keep the
+   * cause standing, which meant a feed that settled below the floor pinned the cut forever
+   * (measured, 195 of 200 runs). 5 ids each is still no evidence either way, so the drop goes
+   * through `unmeasurable`: the targets' `consecutive` counters are left exactly as they were.
    */
-  it("G-12c: a probe of both halves below the floor earns no credit", () => {
+  it("G-12c: a probe of both halves below the floor drops the cause without credit", () => {
     const result = advance({
-      state: fresh({ alarm: { "feed-overlap:a+b": { runs: 2, cleanProbes: 0 } } }),
+      state: fresh({
+        consecutive: { a: { sourceEmpty: 0, transient: 0 }, b: { sourceEmpty: 0, transient: 1 } },
+        alarm: { "feed-overlap:a+b": { runs: 2, cleanProbes: 0 } },
+      }),
       watchList: ["a", "b", "c"],
-      ran: [ran("a", 0, { ids: ids("a", 5) }), ran("b", 0, { ids: ids("b", 5) })],
+      ran: [ran("a", 0, { ids: ids("a", 5) }), ran("b", 5, { reason: "ok", ids: ids("b", 5) })],
       canary: true,
     });
 
-    expect(result.causes).toEqual(["feed-overlap:a+b"]);
-    expect(result.state.alarm["feed-overlap:a+b"].cleanProbes).toBe(0);
+    expect(result.causes).toEqual([]);
+    expect(result.state.consecutive.b).toEqual({ sourceEmpty: 0, transient: 2 });
+  });
+
+  /**
+   * G-12d: THE OTHER EDGES OF "UNANSWERABLE". One feed at the floor's edge (24 against 8), and one
+   * side a parsed EMPTY page (exit 3), are both dropped. A side whose page did NOT parse -- a 5xx,
+   * no ids -- measured nothing, so the cause stands; that row is what stops the drop being
+   * "any probe that is not clean".
+   */
+  it.each<[string, TargetRun, string[]]>([
+    ["one feed thinned to 8 ids", ran("b", 0, { ids: ids("feed", 8) }), []],
+    ["one side an empty results page", ran("b", 3), []],
+    ["one side a transient failure", ran("b", 5), ["feed-overlap:a+b"]],
+  ])("G-12d: %s leaves causes %j", (_label, other, causes) => {
+    const result = advance({
+      state: fresh({ alarm: { "feed-overlap:a+b": { runs: 9, cleanProbes: 0 } } }),
+      watchList: ["a", "b", "c"],
+      ran: [ran("a", 0, { ids: ids("feed", 24) }), other],
+      canary: true,
+    });
+
+    expect(result.causes).toEqual(causes);
+  });
+
+  /**
+   * G-12e: THE STUCK CASE, OVER 200 RUNS. The pair was latched on a real feed, then `b`'s page
+   * settled at 8 ids for good. Before the fix: 195 of 200 runs cut. After: the first probe drops
+   * it and nothing re-latches, because 8 is below the floor the trip uses too.
+   */
+  it("G-12e: a latched pair whose feed settles below the floor does not pin the cut", () => {
+    const watchList = Array.from({ length: 9 }, (_value, index) => `t${index}`);
+    const result = simulate(
+      watchList,
+      200,
+      (targetId) =>
+        targetId === "t0"
+          ? ran("t0", 0, { ids: ids("feed", 24) })
+          : targetId === "t1"
+            ? ran("t1", 0, { ids: ids("feed", 8) })
+            : ran(targetId, 0, { ids: ids(targetId, 24) }),
+      fresh({ alarm: { "feed-overlap:t0+t1": { runs: 9, cleanProbes: 0 } }, canaryRuns: 3 }),
+    );
+
+    expect(result.state.alarm).toEqual({});
+    expect(result.cut).toBe(1);
   });
 
   /**
@@ -841,6 +891,24 @@ describe("the collector's cross-run state", () => {
     // prune removes a cause naming a deleted target.
     expect(result.state.consecutive.a).toEqual({ sourceEmpty: 0, transient: 2 });
     expect(result.state.consecutive.b).toEqual({ sourceEmpty: 0, transient: 1 });
+  });
+
+  /**
+   * G-25c: THE SAME-QUERY DROP DOES NOT WAIT FOR A PARSED PAGE. Since round 5 a pair whose pages
+   * both parsed and still cannot be measured is dropped anyway (G-12c), which made G-25 unable to
+   * tell the two rules apart. They differ when the pages did NOT parse: one query is
+   * unanswerable by configuration, whatever today's fetch did, while a 5xx on two different
+   * queries measured nothing. The mutation is deleting the same-query drop.
+   */
+  it("G-25c: a latched same-query pair is dropped even when neither page parsed", () => {
+    const result = advance({
+      state: fresh({ alarm: { "feed-overlap:a+b": { runs: 9, cleanProbes: 0 } } }),
+      watchList: ["a", "b", "c"],
+      ran: [ran("a", 5, { query: "rtx" }), ran("b", 5, { query: "RTX " })],
+      canary: true,
+    });
+
+    expect(result.causes).toEqual([]);
   });
 
   /**
@@ -1318,7 +1386,8 @@ describe("the collector's cross-run state", () => {
   });
 
   /**
-   * G-26: A REFUSAL IS CREDITED BY AN EXIT 0 ANYWHERE IN THE RUN, BECAUSE A REFUSAL IS OF THE IP.
+   * G-26: A REFUSAL IS CREDITED BY AN EXIT 0 ANYWHERE IN THE RUN, BECAUSE A REFUSAL IS OF THE IP,
+   * BUT ONLY WHILE THE OWNER ITSELF GETS A PARSED EMPTY PAGE (exit 3); see G-26b's last two rows.
    *
    * The stuck case is literal: `t0` refused once and then quiet for good (exit 3). Before the
    * fix `refused:t0` waited for `t0` itself to exit 0, which never came, and a refusal never
@@ -1353,6 +1422,21 @@ describe("the collector's cross-run state", () => {
       0,
     ],
     ["it does not credit a transient cause", "transient:a", [ran("a", 2), ran("b")], 0],
+    // HOW A BLOCK LOOKS AT THE OWNER: a 403 (`http-client-error`, exit 4) and a 200 checkpoint
+    // interstitial (`unrecognized-page`, exit 5). A healthy filler beside either is not
+    // evidence the block on this IP has ended.
+    [
+      "the owner's exit 4 earns no IP-wide credit",
+      "refused:a",
+      [ran("a", 4, { reason: "http-client-error" }), ran("b")],
+      0,
+    ],
+    [
+      "the owner's exit 5 unrecognized-page earns no IP-wide credit",
+      "refused:a",
+      [ran("a", 5, { reason: "unrecognized-page" }), ran("b")],
+      0,
+    ],
   ])("G-26b: %s", (_label, cause, runs, cleanProbes) => {
     const result = advance({
       state: fresh({ alarm: { [cause]: { runs: 3, cleanProbes: 0 } } }),
