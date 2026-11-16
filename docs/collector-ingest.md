@@ -127,7 +127,7 @@ price:
 | `recorded` / `restored` | the listing entered the benchmark; `restored` means its observation had been deleted and was recreated |
 | `removed` | it used to contribute and no longer does — a re-sighting whose model key, market or price changed, or whose validity stopped being `VALID`. **No longer** a catalogued listing re-sighted by a search of another type: that used to be the dominant source of this key (see below) |
 | `none` | `UNCHANGED`: nothing about it moved |
-| `skipped-invalid` | the rule refused it: wrong component, whole system, trade-only, for parts, a wanted ad, an unknown quantity, an ambiguous `CA$0`, or a title at the token cap |
+| `skipped-invalid` | the rule refused it: wrong component, whole system, trade-only, for parts, a wanted ad, an accessory for another type's part, an unknown quantity, an ambiguous `CA$0`, or a title at the token cap |
 | `skipped-no-model` | the rule accepted it as the right component and could not name it — a real component the catalog does not list |
 | `skipped-no-price` | **newly reachable in this slice.** A listing that resolved to a catalog model and whose `priceText` did not parse. It was structurally unreachable only while `modelKey` was always null |
 
@@ -313,8 +313,8 @@ cross-type flip.
 
 **The rule, applied before rules 1–11:** if **exactly one** type is evidenced (by a marker or a
 catalog model) **and that type has a catalog model match**, the listing is classified — and
-stored — under that type. Otherwise it is classified under the envelope's type, exactly as
-before. The rules below then run under the resolved type; `normalizeListing` returns it, and the
+stored — under that type, unless the title reads as an accessory for it (below). Otherwise it is
+classified under the envelope's type, exactly as before. The rules below then run under the resolved type; `normalizeListing` returns it, and the
 ingest route stores it and hashes it into `content_hash`. Both clauses are load-bearing and each
 has a test that goes red without it: the model clause stops a single marker word retyping a
 listing (`TR-m*`), and *exactly one* stops a two-type bundle landing under whichever type is
@@ -334,16 +334,39 @@ converge on their next sighting, as a `CHANGED` re-write.
 between `VALID` with a null key and `INVALID_REFERENCE` across searches — measured over the
 132-id live sample (217 sightings from nine searches), **4 ids**: `"MSI B850 Tomahawk Max Wifi
 Motherboard Only"`, `"Ram DDR4 16gb 2x8gb 3000MHz"`, `"5-Bay Hard Drive Station"` and a Microsoft
-Surface Pro whose only marker is `SSD`. They carry no key, so **no aggregate ever moves**, but
-their stored validity — and the verdict computed from it — is whichever search saw them last, and
-each flip re-queues evaluation. **A wider, quieter version of the same thing:** 30 of the 132 ids
-have a stored row that depends on which search saw them last — the 4 above plus 26 whole machines,
-bundles and unconfirmed titles that are refused under every search but evidence no single
-catalogued type, so they fall back to the search's type and `component_type` (and so
-`content_hash`) alternates. Each such sighting is a `CHANGED` re-write and an evaluation re-queue
-with the same refusal; none carries a key. **The same sample contains no model-matched cross-type id at all**
+Surface Pro whose only marker is `SSD`. They carry no key, so **no aggregate ever moves**. Their
+stored validity is whichever search saw them last, but **evaluation is NOT re-queued by the flip**:
+`recordSightings` queues a task only on `NEW` or when the contribution changes, and a listing with
+no key has none on either side. So the verdict goes **stale relative to the stored validity** —
+it is the verdict of the first sighting, while the row may since have flipped. **A wider, quieter
+version of the same thing:** 30 of the 132 ids have a stored row that depends on which search saw
+them last — the 4 above plus 26 whole machines, bundles and unconfirmed titles that are refused
+under every search but evidence no single catalogued type, so they fall back to the search's type
+and `component_type` (and so `content_hash`) alternates. Each such sighting is a `CHANGED` row
+re-write with the same refusal and no re-queue; none carries a key. **The same sample contains no
+model-matched cross-type id at all**
 (the production log's flips came from other listings on other days), so the sample measures the
 residual, not the fix; `L16` and the two-type block of `scripts/e2e-local.sh` measure the fix.
+
+**An accessory is not moved.** An accessory search returns accessories that name the part they
+fit — `"12VHPWR cable for RTX 4090"` from a psu search evidences one type (gpu) with a catalog
+model — and the resolution alone stored each one as a `VALID` reference for that part: a
+CA$15–90 observation in the model's mean, and once 5 references exist the accessory itself a
+`DEAL`. Found on review with a cable, a waterblock, a mounting bracket, a replacement fan, a riser
+mount, thermal pads and a backplate, each from the matching search. So when the resolution would
+**change** the type and the title carries an `ACCESSORY` phrase (`cable(s)`, `adapter`,
+`bracket`, `waterblock` / `water block`, `backplate`, `riser`, `mount(ing)`, `shroud`,
+`thermal pad(s)`, `fan for`) or reads `for <catalog model>` — `for` directly before the matched
+model, never a bare `for`, because `"for sale"` is everywhere — the listing keeps the search's
+type and is refused `NEEDS_REVIEW` / `accessory` (rule 3b below). **Measured over all 217
+sightings of the live sample, before and after the refusal: 0 outcomes change** — none of them
+is an accessory the resolution would have moved.
+
+**It is cross-type ONLY, and the same-type hole stays, named.** Applied under every type it would
+refuse ordinary same-type copy — a PSU "with all cables", a card with a "support bracket" — and a
+test (`AX-c`) goes red if it is. The cost is the pre-existing hole: `"GPU support bracket RTX
+4090"` from a **gpu** search is still a `VALID` RTX 4090 reference, as it was before this change.
+It is pinned in `ACCEPTED_EXPOSURE` (`AX-r`) for the accessory corpus work in Part 2.
 
 **And one consequence for `MAXIMUM_PRICE`.** A catalogued listing found only by a search of
 another type used to be `INVALID_REFERENCE` → `NOT_DEAL`. It is now `VALID` with its model on
@@ -359,6 +382,9 @@ Not addressed here; it belongs to the later parts that gate that leg.
 1.  wanted ad         wtb, want to buy, wanted, looking for, iso, ...       -> INVALID_REFERENCE
 2.  trade only        for trade, trade only, swap, trading, ...             -> INVALID_REFERENCE
 3.  broken / parts    for parts, not working, damaged, as is, ...           -> INVALID_REFERENCE
+3b. accessory         the title proves ANOTHER type than the search's, but
+                      reads as an accessory for it (cable, bracket,
+                      backplate, ..., or `for <model>`); search's type kept -> NEEDS_REVIEW
 4.  whole system      a system brand or product line, or an uncovered whole-unit
                       token (pc, tower, build, rig, laptop, notebook,
                       desktop, ...)                                         -> INVALID_REFERENCE
@@ -479,7 +505,11 @@ live 5080 is CA$3,000. Any threshold would be a fabricated number.
   evidence, so the resolution fires on all 100. Measured on one machine at load average 7–9,
   three runs of the file alone each: `T40c` p95 4.16–4.42 ms before the change and 4.37–4.96 ms
   after (p50 3.42–3.55 → 3.69–3.88), `T40c-r` p95 4.20–4.27 ms. Read that as "no material
-  change, inside the noise of a loaded dev machine", not as a precise delta.
+  change, inside the noise of a loaded dev machine", not as a precise delta. **The accessory
+  check adds work only on the resolving path** — an `ACCESSORY` phrase scan and one more span walk
+  of the resolved type — and re-measured with it (load average 6–7, three runs): `T40c` p95
+  4.33–4.93 ms, `T40c-r` p50 3.79–4.72 and p95 4.90–5.79 ms. Still under the 8 ms invariant, with
+  less headroom on that path than before.
 
 ### The residuals, named — and the corpora they are measured from
 
