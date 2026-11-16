@@ -121,6 +121,35 @@ const agePhrase = (ageMinutes: number): string => {
   return `${Math.round(ageMinutes / 60)} hours ago`;
 };
 
+/**
+ * THE DISCORD ALERT LINE, ONE SENTENCE PER STATE. The counts are rendered for `on` and
+ * `webhook-rejected` only, because only those states carry them; an inert state that somehow
+ * arrived with counts still reads as its state alone. `sent24h` is a ROLLING 24-hour window
+ * (worker/notify/status.ts), so the sentence says "in the last 24 hours", never "today".
+ */
+const alertLine = (notifications: NonNullable<CollectionStatus["notifications"]>): string => {
+  const counts =
+    "sent24h" in notifications
+      ? `${notifications.sent24h} sent in the last 24 hours, ${notifications.deliveryUnknown} delivery unknown`
+      : null;
+  switch (notifications.state) {
+    case "unconfigured":
+      return "Discord alerts: not configured";
+    case "invalid-url":
+      return "Discord alerts: webhook URL invalid";
+    case "off":
+      return "Discord alerts: off (webhook ready)";
+    case "on":
+      return counts === null ? "Discord alerts: on (counts unavailable)" : `Discord alerts: on, ${counts}`;
+    case "webhook-rejected":
+      return counts === null
+        ? "Discord alerts: webhook rejected, replace the secret"
+        : `Discord alerts: webhook rejected, replace the secret. ${counts}`;
+    case "unreadable":
+      return "Discord alerts: status unreadable";
+  }
+};
+
 export interface CollectionStatusPanelProps {
   /** `null` means the read itself failed or has not finished. */
   status: CollectionStatus | null;
@@ -187,6 +216,14 @@ export function CollectionStatusPanel({ status, pending }: CollectionStatusPanel
               run while this is unresolved. It will go back on its own once the cause measures
               clean.
             </p>
+          )}
+
+          {/*
+            * ABSENT MEANS AN API WORKER OLDER THAN THE NOTIFICATIONS BACKEND, AND IT RENDERS
+            * NOTHING. Saying "not configured" there would be a claim the Worker never made.
+            */}
+          {status.notifications !== undefined && (
+            <p className="collection-alerts">{alertLine(status.notifications)}</p>
           )}
         </>
       )}

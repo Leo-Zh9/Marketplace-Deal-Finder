@@ -342,3 +342,64 @@ describe("the collection status panel", () => {
     expect(screen.getByText(phrase)).toBeInTheDocument();
   });
 });
+
+/**
+ * THE DISCORD ALERT LINE. Each row builds the `notifications` value the client hands the panel
+ * and asserts the exact sentence the user reads.
+ */
+describe("the Discord alert line", () => {
+  const COUNTS = { pending: 2, sent24h: 3, deliveryUnknown: 1, failed: 4, lastSentAt: 1_800_000_000 };
+
+  /**
+   * N-1: EVERY STATE HAS ITS OWN SENTENCE. The mutation is collapsing any one branch -- the
+   * likeliest is a default that reads every unknown as "not configured" -- and the row for that
+   * state fails on its exact text. `off` is the label docs/phase-4-notifications.md promises the
+   * user after `secret put`.
+   */
+  it.each<[string, NonNullable<CollectionStatus["notifications"]>, string]>([
+    ["unconfigured", { state: "unconfigured" }, "Discord alerts: not configured"],
+    ["invalid-url", { state: "invalid-url" }, "Discord alerts: webhook URL invalid"],
+    ["off", { state: "off" }, "Discord alerts: off (webhook ready)"],
+    ["on", { state: "on", ...COUNTS }, "Discord alerts: on, 3 sent in the last 24 hours, 1 delivery unknown"],
+    [
+      "webhook-rejected",
+      { state: "webhook-rejected", ...COUNTS },
+      "Discord alerts: webhook rejected, replace the secret. 3 sent in the last 24 hours, 1 delivery unknown",
+    ],
+    // The Worker's own answer when its table read fails: on, with no counts to show.
+    ["on, counts unavailable", { state: "on" }, "Discord alerts: on (counts unavailable)"],
+    ["unreadable", { state: "unreadable" }, "Discord alerts: status unreadable"],
+  ])("N-1: %s reads as its own sentence", (_state, notifications, sentence) => {
+    render(<CollectionStatusPanel status={status({ notifications })} pending={false} />);
+
+    expect(screen.getByText(sentence)).toBeInTheDocument();
+  });
+
+  /**
+   * N-2: ABSENT RENDERS NO LINE, AND THE REST OF THE PANEL IS UNTOUCHED. An API Worker older
+   * than the notifications backend sends no field. The mutation is rendering a sentence for it
+   * ("not configured", or "unreadable"): a claim that Worker never made.
+   */
+  it("N-2: an absent field renders no alert line, and the badge and timestamp still render", () => {
+    render(<CollectionStatusPanel status={status()} pending={false} />);
+
+    expect(screen.queryByText(/Discord alerts/)).not.toBeInTheDocument();
+    expect(screen.getByText("Collecting")).toBeInTheDocument();
+    expect(screen.getByText(`Last reported ${expectedClock}, 12 minutes ago.`)).toBeInTheDocument();
+  });
+
+  /**
+   * N-3: COUNTS ONLY FOR `on` AND `webhook-rejected`. The Worker sends counts for no other state;
+   * the mutation is rendering them whenever they are present, and an inert state that arrived
+   * with counts attached would then report sends from a switch that is off.
+   */
+  it.each([["unconfigured"], ["invalid-url"], ["off"]] as const)(
+    "N-3: %s with counts attached still reads as its state alone",
+    (state) => {
+      const notifications = { state, ...COUNTS } as unknown as CollectionStatus["notifications"];
+      render(<CollectionStatusPanel status={status({ notifications })} pending={false} />);
+
+      expect(screen.getByText(/^Discord alerts: /)).not.toHaveTextContent(/sent|delivery/);
+    },
+  );
+});
