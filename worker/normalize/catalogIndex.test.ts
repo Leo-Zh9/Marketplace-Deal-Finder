@@ -263,29 +263,53 @@ describe("catalog index -- exhaustive properties", () => {
       expect(
         normalizeListing({ title: model, priceCents: 6300, componentType }),
         `${componentType} | ${model}`,
-      ).toEqual({ modelKey: model, variantKey: null, validity: "VALID", reason: "matched" });
+      ).toEqual({ componentType, modelKey: model, variantKey: null, validity: "VALID", reason: "matched" });
     }
   });
 
   /**
-   * T12. Every catalog name declared as each of the eight OTHER component types. A VALID result
-   * carrying a model key would mean a listing entered another type's benchmark.
+   * T12. Every catalog name declared as each of the eight OTHER component types -- the shape
+   * Facebook produces when one listing answers searches of two types.
+   *
+   * A VALID result carrying a model key is allowed in EXACTLY ONE form: the listing was moved to
+   * the model's OWN type and keyed by a model of that type. Anything else -- a model key under
+   * the search's type, or under a third type -- means a listing entered another type's benchmark,
+   * and this is the test that says so. It is NOT loosened by the type resolution; it is the same
+   * refusal with one door named.
+   *
+   * THE COUNT IS PINNED, AND IT IS ALL OF THEM. MEASURED: all 2,688 pairs resolve, because a bare
+   * catalog name evidences exactly one type -- its own -- and matches a model there. Before the
+   * resolution every one of them was `wrong-component`, which is the VALID -> INVALID flip a
+   * listing went through each time a search of another type returned it. A rule that resolves
+   * less (a stricter evidence test, a broken model clause) moves the number down.
+   *
+   * WHAT THIS CANNOT SEE, NAMED: a rule that resolves on WEAKER evidence. Every title here
+   * carries a model, so dropping the model clause changes nothing in this test; the marker-only
+   * rows in normalizeListing.test.ts (TR-m*) are what kill that mutant.
    */
-  it("T12: none of the 2,688 cross-type pairs produces a VALID result with a model", () => {
+  it("T12: every one of the 2,688 cross-type pairs is refused or moved to the model's own type", () => {
     const pairs = WORKER_TYPES.flatMap((componentType) =>
       catalogModels(componentType).flatMap((model) =>
         WORKER_TYPES.filter((other) => other !== componentType).map(
-          (declared) => [declared, model] as const,
+          (declared) => [declared, componentType, model] as const,
         ),
       ),
     );
     expect(pairs).toHaveLength(2_688);
 
-    const leaks = pairs.filter(([declared, model]) => {
+    const leaks: string[] = [];
+    let resolved = 0;
+    for (const [declared, own, model] of pairs) {
       const result = normalizeListing({ title: model, priceCents: 6300, componentType: declared });
-      return result.validity === "VALID" && result.modelKey !== null;
-    });
-    expect(leaks.map(([declared, model]) => `${declared} <- ${model}`)).toEqual([]);
+      if (result.validity !== "VALID" || result.modelKey === null) continue;
+      if (result.componentType === own && catalogModels(own).includes(result.modelKey)) {
+        resolved += 1;
+      } else {
+        leaks.push(`${declared} <- ${model} => ${result.componentType}/${result.modelKey}`);
+      }
+    }
+    expect(leaks).toEqual([]);
+    expect(resolved).toBe(2_688);
   });
 
   /**
@@ -489,6 +513,7 @@ describe("catalog index -- exhaustive properties", () => {
     expect(tokenize(evasion)).toHaveLength(MAX_TOKENS);
 
     expect(normalizeListing({ title: evasion, priceCents: 250_000, componentType: "gpu" })).toEqual({
+      componentType: "gpu",
       modelKey: null,
       variantKey: null,
       validity: "NEEDS_REVIEW",

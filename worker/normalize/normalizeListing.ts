@@ -1,7 +1,8 @@
 /**
- * The classification rule: `(title, priceCents, componentType)` -> `{modelKey, variantKey,
- * validity, reason}`. Pure, deterministic and server-side. `./catalogIndex.ts` owns the tokens
- * and the model match; this file owns what a listing IS.
+ * The classification rule: `(title, priceCents, componentType)` -> `{componentType, modelKey,
+ * variantKey, validity, reason}`, where the returned type is the one the title proves when it
+ * proves exactly one, and the search's otherwise. Pure, deterministic and server-side.
+ * `./catalogIndex.ts` owns the tokens and the model match; this file owns what a listing IS.
  *
  * IT RUNS IN THE WORKER, NOT THE COLLECTOR, and that is a security decision. A leaked
  * `COLLECTOR_TOKEN` can already choose a title; it must not be able to choose a `model_key`.
@@ -48,6 +49,11 @@ export type NormalizationReason =
   | "title-too-long";
 
 export interface Normalization {
+  /**
+   * THE TYPE THE LISTING IS CLASSIFIED AND STORED UNDER, which is not always the type of the
+   * search that found it. See `resolveComponentType`.
+   */
+  componentType: Listing["componentType"];
   modelKey: string | null;
   variantKey: string | null;
   validity: ObservationValidity;
@@ -493,7 +499,12 @@ export const systemEvidence = (
  * `model_key IS NOT NULL => validity = 'VALID'` -- asserted in the e2e by SQL -- stops being
  * true.
  */
-const refuse = (validity: ObservationValidity, reason: NormalizationReason): Normalization => ({
+const refuse = (
+  componentType: Listing["componentType"],
+  validity: ObservationValidity,
+  reason: NormalizationReason,
+): Normalization => ({
+  componentType,
   modelKey: null,
   variantKey: null,
   validity,
@@ -515,7 +526,6 @@ export const normalizeListing = (input: {
   priceCents: number | null;
   componentType: Listing["componentType"];
 }): Normalization => {
-  const declared = input.componentType;
   const tokens = tokenize(input.title);
 
   // RULE 0, AND IT RUNS FIRST. A title at exactly MAX_TOKENS may have been truncated, and every
@@ -525,29 +535,70 @@ export const normalizeListing = (input: {
   // tokenizes to exactly 64, and under silent truncation its `gaming pc` survived only by luck
   // -- one token further out and the same title would have returned a VALID model key for a
   // whole PC. A cap that bounds CPU by hiding evidence is worse than the cost it avoids.
-  if (tokens.length === MAX_TOKENS) return refuse("NEEDS_REVIEW", "title-too-long");
+  if (tokens.length === MAX_TOKENS) {
+    return refuse(input.componentType, "NEEDS_REVIEW", "title-too-long");
+  }
 
   const values = tokenValues(tokens);
-  const models = matchCatalogModels(MODEL_INDEXES[declared], tokens);
+  // One walk per index, shared by the evidence scan, the resolution and rules 6/9-11. (Rule 4's
+  // marker coverage and rule 8 still walk the resolved type's spans themselves, as before.)
+  const modelsByType = {} as Record<Listing["componentType"], string[]>;
+  for (const type of COMPONENT_TYPES) {
+    modelsByType[type] = matchCatalogModels(MODEL_INDEXES[type], tokens);
+  }
   const evidenced = COMPONENT_TYPES.filter(
-    (type) =>
-      containsAnyPhrase(values, MARKERS[type]) ||
-      matchCatalogModels(MODEL_INDEXES[type], tokens).length > 0,
+    (type) => containsAnyPhrase(values, MARKERS[type]) || modelsByType[type].length > 0,
   );
+
+  // THE TYPE COMES FROM THE TITLE WHEN THE TITLE PROVES IT, AND FROM THE SEARCH OTHERWISE.
+  //
+  // `listings` is keyed `(source, listing_id)` with ONE `component_type`, and Facebook returns the
+  // same listing to searches of different types. Classified under the search's type, a
+  // model-matched listing flipped every run -- VALID under its own search, INVALID
+  // `wrong-component` under the other -- and each flip removed its price contribution and the
+  // next restored it. MEASURED in production (October): 167 `removed` and 170 `restored` events
+  // against 38 `recorded`, every one of them a model-matched cross-type flip.
+  //
+  // THE RULE: exactly ONE type is evidenced and that type has a catalog model match. Both clauses
+  // are load-bearing. Without the model clause a single marker word retypes a listing: `ryzen`,
+  // `ssd` and `rtx` are one-word evidence, a marker-only listing carries no key and so no
+  // contribution for a retype to protect, and the live `"Microsoft Surface Pro ... 512GB SSD"`
+  // would become a VALID storage row (TR-m4). Without EXACTLY-one, a title naming catalogued
+  // parts of two types (`"Ryzen 7 9800X3D / RTX 5080 16GB"`) would be stored under whichever type
+  // COMPONENT_TYPES lists first instead of being refused under the search's type (TR-2).
+  //
+  // THERE IS NO "the declared type is not evidenced" CLAUSE, and adding one changes nothing:
+  // when exactly one type is evidenced and it is the declared type, resolving to it IS the
+  // declared type. It would be an equivalent mutant, and this file deletes guards no mutation
+  // can kill.
+  //
+  // THE RESIDUAL, NAMED: a cross-type title evidenced by a MARKER only still flips between
+  // VALID-no-key and INVALID across searches. It never touches an aggregate (no key), but its
+  // verdict goes stale. See docs/collector-ingest.md.
+  //
+  // FROM HERE ON `declared` IS THE RESOLVED TYPE; every rule below that says "declared" means it.
+  const [only] = evidenced;
+  const declared: Listing["componentType"] =
+    evidenced.length === 1 && modelsByType[only].length > 0 ? only : input.componentType;
+  const models = modelsByType[declared];
   const foreign = evidenced.filter((type) => type !== declared);
+  const refuseAs = (validity: ObservationValidity, reason: NormalizationReason): Normalization =>
+    refuse(declared, validity, reason);
 
   // 1-3: the price is not a price for this product at all.
-  if (containsAnyPhrase(values, WANTED)) return refuse("INVALID_REFERENCE", "wanted-ad");
-  if (containsAnyPhrase(values, TRADE)) return refuse("INVALID_REFERENCE", "trade-only");
-  if (containsAnyPhrase(values, BROKEN)) return refuse("INVALID_REFERENCE", "not-working");
+  if (containsAnyPhrase(values, WANTED)) return refuseAs("INVALID_REFERENCE", "wanted-ad");
+  if (containsAnyPhrase(values, TRADE)) return refuseAs("INVALID_REFERENCE", "trade-only");
+  if (containsAnyPhrase(values, BROKEN)) return refuseAs("INVALID_REFERENCE", "not-working");
 
   // 4: THE DANGEROUS CASE. A CA$2,000 machine whose title names a real GPU must never enter that
   // GPU's average.
-  if (systemEvidence(values, tokens, declared)) return refuse("INVALID_REFERENCE", "whole-system");
+  if (systemEvidence(values, tokens, declared)) {
+    return refuseAs("INVALID_REFERENCE", "whole-system");
+  }
 
   // 5: a component of another type is evidenced. The MAJORITY case in the live data.
   if (foreign.length > 0) {
-    return refuse(
+    return refuseAs(
       "INVALID_REFERENCE",
       evidenced.includes(declared) ? "mixed-components" : "wrong-component",
     );
@@ -555,7 +606,7 @@ export const normalizeListing = (input: {
 
   // 6: two catalog models of the DECLARED type -- a bundle, and there is no way to say which
   // price belongs to which.
-  if (models.length > 1) return refuse("INVALID_REFERENCE", "multiple-models");
+  if (models.length > 1) return refuseAs("INVALID_REFERENCE", "multiple-models");
 
   // 7: more than one unit, so the price is not a unit price. Quantity is handled by REFUSING TO
   // CONTRIBUTE rather than by a `quantity` column: `recordSightings` computes its aggregates with
@@ -566,7 +617,7 @@ export const normalizeListing = (input: {
     multiplierPrefix(tokens) ||
     multiplierSuffix(tokens)
   ) {
-    return refuse("NEEDS_REVIEW", "unknown-quantity");
+    return refuseAs("NEEDS_REVIEW", "unknown-quantity");
   }
 
   // 8: CA$0 with nothing saying the ITEM is free is a placeholder, not a price. See
@@ -578,22 +629,34 @@ export const normalizeListing = (input: {
   // below exists at all. The claim that an explicitly free listing never arrives here with 0 was
   // false; worker/api/priceText.ts had it right.
   if (input.priceCents === 0 && !freeItemEvidence(values, tokens, declared)) {
-    return refuse("NEEDS_REVIEW", "ambiguous-zero-price");
+    return refuseAs("NEEDS_REVIEW", "ambiguous-zero-price");
   }
 
   // 9: nothing says this is even the declared component. `"Selling My 4070 TI"` carries no
   // rtx/gtx/geforce/radeon token and matches no catalog name -- do not guess.
   if (models.length === 0 && !evidenced.includes(declared)) {
-    return refuse("NEEDS_REVIEW", "component-unconfirmed");
+    return refuseAs("NEEDS_REVIEW", "component-unconfirmed");
   }
 
   // 10: a real, standalone, uncatalogued component. VALID with a null key: it is stored and
   // evaluated, and it cannot contribute to any benchmark. THIS IS NOT A COVERAGE METER -- see
   // docs/collector-ingest.md for the query that is.
   if (models.length === 0) {
-    return { modelKey: null, variantKey: null, validity: "VALID", reason: "model-unmatched" };
+    return {
+      componentType: declared,
+      modelKey: null,
+      variantKey: null,
+      validity: "VALID",
+      reason: "model-unmatched",
+    };
   }
 
   // 11: exactly one catalog model of the declared type, and nothing above objected.
-  return { modelKey: models[0], variantKey: null, validity: "VALID", reason: "matched" };
+  return {
+    componentType: declared,
+    modelKey: models[0],
+    variantKey: null,
+    validity: "VALID",
+    reason: "matched",
+  };
 };

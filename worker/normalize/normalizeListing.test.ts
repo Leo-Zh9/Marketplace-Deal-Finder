@@ -1,16 +1,18 @@
 // @vitest-environment node
 
 /**
- * The twelve classification rules. EVERY case asserts the whole result -- `{modelKey, variantKey,
- * validity, reason}` -- and never `validity` alone: the CA$2,000 "RTX 4070 super gaming pc |
- * Ryzen 5 7600 | ..." is caught by rule 4 AND by rule 5, so a validity-only assertion stays green
- * with either rule deleted. `reason` exists for exactly that and is stored nowhere.
+ * The twelve classification rules. EVERY case asserts the whole result -- `{componentType,
+ * modelKey, variantKey, validity, reason}` -- and never `validity` alone: the CA$2,000 "RTX 4070
+ * super gaming pc | Ryzen 5 7600 | ..." is caught by rule 4 AND by rule 5, so a validity-only
+ * assertion stays green with either rule deleted. `reason` exists for exactly that and is stored
+ * nowhere.
  *
  * FIXTURE CORRELATION. No two parameters that reach the code under test share a value: every
- * title below is distinct, every `priceCents` is distinct EXCEPT the three cases where `0` is
- * the subject, no price is 0, 1 or 100 other than those, and the declared type spans all nine.
- * So no assertion here can pass because the rule is hardwired to one component type or because a
- * price happened to equal a constant.
+ * title below is distinct EXCEPT TR-r1, which is T15r's live title under a cpu search because the
+ * same listing reaching two searches is its subject; every `priceCents` is distinct EXCEPT the
+ * three cases where `0` is the subject, no price is 0, 1 or 100 other than those, and the
+ * declared type spans all nine. So no assertion here can pass because the rule is hardwired to
+ * one component type or because a price happened to equal a constant.
  */
 
 import type { Listing } from "../storage/types";
@@ -37,6 +39,8 @@ type Case = [
   validity: ObservationValidity,
   modelKey: string | null,
   reason: NormalizationReason,
+  // The type the listing is stored under, when the title proves a different one than the search.
+  resolved?: Listing["componentType"],
 ];
 
 const CASES: Case[] = [
@@ -219,8 +223,40 @@ const RESIDUAL_CLOSED: Case[] = [
   ["T36h: the ram half of the same residual", "Corsair Vengeance LPX 16GB DDR4 desktop memory", 11800, "ram", "VALID", "Corsair Vengeance LPX 16GB DDR4", "matched"],
 ];
 
-const assertCase = ([, title, priceCents, componentType, validity, modelKey, reason]: Case): void => {
+/**
+ * THE TYPE COMES FROM THE TITLE WHEN THE TITLE PROVES IT. One listing answers searches of several
+ * types, and `listings` holds ONE `component_type` per `(source, listing_id)`; classified under
+ * the search's type, a catalogued listing was VALID on one run and `wrong-component` on the next,
+ * and every flip removed and restored its price contribution. Titles are the live sample's own,
+ * declared under a type of a search that could have returned them.
+ *
+ * TR-r: exactly one type is evidenced and it has a catalog model, so the listing moves to it.
+ * TR-m: the same shape evidenced by a MARKER only, so it stays under the search's type. These are
+ *       the killers of the model clause: without it each one moves and turns VALID.
+ * TR-2: two types evidenced, each with a model. The killer of EXACTLY-one. `validity` alone
+ *       cannot kill the mutant that resolves to the first evidenced type -- that is INVALID too
+ *       (`mixed-components` under cpu) -- so `componentType` and `reason` are both asserted.
+ *
+ * The TR-m rows are the residual, stated in docs/collector-ingest.md: across searches they still
+ * flip between VALID-no-key and INVALID. They carry no key, so no aggregate moves.
+ */
+const TYPE_RESOLUTION: Case[] = [
+  ["TR-r1: live -- a Radeon card found by a cpu search", "AMD Radeon\u2122 RX 6800 XT Phantom Gaming D 16G OC", 64100, "cpu", "VALID", "Radeon RX 6800 XT", "matched", "gpu"],
+  ["TR-r2: live -- a GeForce card found by a motherboard search", "GIGABYTE EAGLE RTX 5070 12GB VRAM", 119300, "motherboard", "VALID", "GeForce RTX 5070", "matched", "gpu"],
+  ["TR-r3: live -- a Ryzen found by a ram search", "AMD Ryzen 7 9700x CPU", 29700, "ram", "VALID", "Ryzen 7 9700X", "matched", "cpu"],
+  ["TR-r4: live -- resolution does not skip rule 4", "Gaming PC \u2013 GTX 1080 Ti 11GB | 16GB RAM", 65100, "cpu", "INVALID_REFERENCE", null, "whole-system", "gpu"],
+  ["TR-m1: live -- a RAM kit by marker only, in a gpu search", "Ram DDR4 16gb 2x8gb 3000MHz", 12100, "gpu", "INVALID_REFERENCE", null, "wrong-component"],
+  ["TR-m2: live -- a motherboard by marker only, in a cpu search", "MSI B850 Tomahawk Max Wifi Motherboard Only", 26300, "cpu", "INVALID_REFERENCE", null, "wrong-component"],
+  ["TR-m3: live -- a drive dock by marker only, in a ram search", "5-Bay Hard Drive Station", 7700, "ram", "INVALID_REFERENCE", null, "wrong-component"],
+  ["TR-m4: live -- a tablet whose only marker is ssd, in a psu search", "Microsoft Surface Pro 11th Edition \u2013 Snapdragon X Elite \u2013 16GB RAM \u2013 512GB SSD", 95300, "psu", "INVALID_REFERENCE", null, "wrong-component"],
+  // The live "Gaming PC – Ryzen 7 9800X3D / RTX 5080 16GB" with its whole-system words removed,
+  // so rule 4 cannot answer first. Both halves are catalogued -- that is what makes it a killer.
+  ["TR-2: live, trimmed -- two catalogued parts of two types, in a ram search", "Ryzen 7 9800X3D / RTX 5080 16GB", 133900, "ram", "INVALID_REFERENCE", null, "wrong-component"],
+];
+
+const assertCase = ([, title, priceCents, componentType, validity, modelKey, reason, resolved]: Case): void => {
   expect(normalizeListing({ title, priceCents, componentType })).toEqual({
+    componentType: resolved ?? componentType,
     modelKey,
     variantKey: null,
     validity,
@@ -238,6 +274,10 @@ describe("normalizeListing -- the classification rules", () => {
   });
 
   it.each(RESIDUAL_CLOSED)("%s", (...testCase) => {
+    assertCase(testCase);
+  });
+
+  it.each(TYPE_RESOLUTION)("%s", (...testCase) => {
     assertCase(testCase);
   });
 });
@@ -309,13 +349,13 @@ describe("normalizeListing -- every vocabulary element, one at a time", () => {
   ])("T21b: %s marks the listing a whole system", (phrase) => {
     expect(
       normalizeListing({ title: `NZXT H7 Flow ${phrase} case`, priceCents: 15800, componentType: "case" }),
-    ).toEqual({ modelKey: null, variantKey: null, validity: "INVALID_REFERENCE", reason: "whole-system" });
+    ).toEqual({ componentType: "case", modelKey: null, variantKey: null, validity: "INVALID_REFERENCE", reason: "whole-system" });
   });
 
   it("T21b control: the same frame with no system phrase is a case", () => {
     expect(
       normalizeListing({ title: "NZXT H7 Flow case", priceCents: 15700, componentType: "case" }),
-    ).toEqual({ modelKey: "NZXT H7 Flow", variantKey: null, validity: "VALID", reason: "matched" });
+    ).toEqual({ componentType: "case", modelKey: "NZXT H7 Flow", variantKey: null, validity: "VALID", reason: "matched" });
   });
 
   /** T21c: WHOLE_UNIT, element by element, uncovered by any gpu marker. */
@@ -325,13 +365,13 @@ describe("normalizeListing -- every vocabulary element, one at a time", () => {
   ])("T21c: the whole-unit token %s marks the listing a whole system", (token) => {
     expect(
       normalizeListing({ title: `GeForce RTX 5080 ${token}`, priceCents: 289000, componentType: "gpu" }),
-    ).toEqual({ modelKey: null, variantKey: null, validity: "INVALID_REFERENCE", reason: "whole-system" });
+    ).toEqual({ componentType: "gpu", modelKey: null, variantKey: null, validity: "INVALID_REFERENCE", reason: "whole-system" });
   });
 
   it("T21c control: an unlisted trailing word leaves the card a card", () => {
     expect(
       normalizeListing({ title: "GeForce RTX 5080 oc", priceCents: 288000, componentType: "gpu" }),
-    ).toEqual({ modelKey: "GeForce RTX 5080", variantKey: null, validity: "VALID", reason: "matched" });
+    ).toEqual({ componentType: "gpu", modelKey: "GeForce RTX 5080", variantKey: null, validity: "VALID", reason: "matched" });
   });
 
   /**
@@ -361,13 +401,13 @@ describe("normalizeListing -- every vocabulary element, one at a time", () => {
   ])("T21d: %s evidences a foreign component beside a GPU", (marker) => {
     expect(
       normalizeListing({ title: `GeForce RTX 5080 and a ${marker}`, priceCents: 301000, componentType: "gpu" }),
-    ).toEqual({ modelKey: null, variantKey: null, validity: "INVALID_REFERENCE", reason: "mixed-components" });
+    ).toEqual({ componentType: "gpu", modelKey: null, variantKey: null, validity: "INVALID_REFERENCE", reason: "mixed-components" });
   });
 
   it("T21d control: the same frame with no foreign marker is a plain GPU", () => {
     expect(
       normalizeListing({ title: "GeForce RTX 5080 and a warranty", priceCents: 302000, componentType: "gpu" }),
-    ).toEqual({ modelKey: "GeForce RTX 5080", variantKey: null, validity: "VALID", reason: "matched" });
+    ).toEqual({ componentType: "gpu", modelKey: "GeForce RTX 5080", variantKey: null, validity: "VALID", reason: "matched" });
   });
 
   /** T21e: the gpu markers, which the frame above cannot reach -- they ARE the declared type. */
@@ -376,7 +416,7 @@ describe("normalizeListing -- every vocabulary element, one at a time", () => {
     (marker) => {
       expect(
         normalizeListing({ title: `${marker} for sale`, priceCents: 45900, componentType: "gpu" }),
-      ).toEqual({ modelKey: null, variantKey: null, validity: "VALID", reason: "model-unmatched" });
+      ).toEqual({ componentType: "gpu", modelKey: null, variantKey: null, validity: "VALID", reason: "model-unmatched" });
     },
   );
 
@@ -389,25 +429,25 @@ describe("normalizeListing -- every vocabulary element, one at a time", () => {
   it("T23d: index 1 inside a MARKER phrase counts as the item", () => {
     expect(
       normalizeListing({ title: "Free graphics card - no longer needed", priceCents: 0, componentType: "gpu" }),
-    ).toEqual({ modelKey: null, variantKey: null, validity: "VALID", reason: "model-unmatched" });
+    ).toEqual({ componentType: "gpu", modelKey: null, variantKey: null, validity: "VALID", reason: "model-unmatched" });
   });
 
   it("T23d: index 1 inside a MATCHED MODEL span counts as the item", () => {
     expect(
       normalizeListing({ title: "Free Lian Li Lancool 216", priceCents: 0, componentType: "case" }),
-    ).toEqual({ modelKey: "Lian Li Lancool 216", variantKey: null, validity: "VALID", reason: "matched" });
+    ).toEqual({ componentType: "case", modelKey: "Lian Li Lancool 216", variantKey: null, validity: "VALID", reason: "matched" });
   });
 
   it("T23c control: a leading 'free' followed by the item itself still counts", () => {
     expect(
       normalizeListing({ title: "Free GeForce RTX 5080", priceCents: 0, componentType: "gpu" }),
-    ).toEqual({ modelKey: "GeForce RTX 5080", variantKey: null, validity: "VALID", reason: "matched" });
+    ).toEqual({ componentType: "gpu", modelKey: "GeForce RTX 5080", variantKey: null, validity: "VALID", reason: "matched" });
   });
 
   it("T21e control: with no gpu marker at all the rule declines to guess", () => {
     expect(
       normalizeListing({ title: "widget for sale", priceCents: 45800, componentType: "gpu" }),
-    ).toEqual({ modelKey: null, variantKey: null, validity: "NEEDS_REVIEW", reason: "component-unconfirmed" });
+    ).toEqual({ componentType: "gpu", modelKey: null, variantKey: null, validity: "NEEDS_REVIEW", reason: "component-unconfirmed" });
   });
 });
 
