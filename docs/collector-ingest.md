@@ -1140,10 +1140,14 @@ log = pathlib.Path.home() / "Library/Logs/marketplace-collector.log"
 # `if log.exists()` is not defensive padding: between `launchctl bootstrap` and the first run
 # completing there IS no log file, and that is exactly when an operator runs this. Without it the
 # first thing they see is a FileNotFoundError traceback instead of the answer.
-runs = re.findall(r'^(\S+Z) (\{"kind":"run".*\})$',
+# `stopped` lines are read too: a dashboard Stop makes every run log `{"kind":"stopped"}` and exit 0
+# with no run line, so reading run lines alone would report a deliberate pause as a dead job.
+runs = re.findall(r'^(\S+Z) (\{"kind":"(?:run|stopped)".*\})$',
                   log.read_text() if log.exists() else "", re.M)
 if not runs:
     print("UNHEALTHY: no run line yet -- is the job loaded?")
+elif json.loads(runs[-1][1])["kind"] == "stopped":
+    print(f"stopped: monitoring is stopped from the dashboard (last checked {runs[-1][0]}); press Start to resume")
 else:
     stamp, payload = runs[-1]
     line = json.loads(payload)

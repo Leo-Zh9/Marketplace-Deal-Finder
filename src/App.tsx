@@ -1,11 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
-import { CollectionStatusPanel } from "./components/CollectionStatusPanel";
+import {
+  CollectionStatusPanel,
+  type MonitoringNotice,
+} from "./components/CollectionStatusPanel";
 import { ComponentSelector } from "./components/ComponentSelector";
 import { DealRuleForm } from "./components/DealRuleForm";
 import { ListingCard } from "./components/ListingCard";
 import { LocationSelector } from "./components/LocationSelector";
 import { ModelSelector } from "./components/ModelSelector";
-import type { AuthenticatedIdentity } from "./auth/authTypes";
+import { ApiRequestError, type AuthenticatedIdentity } from "./auth/authTypes";
 import { componentById, mockLocations } from "./data/catalog";
 import { requestErrorMessage } from "./services/apiClient";
 import { marketplaceClient, settingsToDealRule } from "./services/marketplaceClient";
@@ -110,6 +113,26 @@ const locationFromWire = (
   return { ...wire, label: known?.label ?? wire.slug };
 };
 
+/**
+ * A READING IS APPLIED ONLY IF IT WAS SENT NO EARLIER THAN THE ONE ON SCREEN. Two reads can be in
+ * flight at once -- a poll and the re-read after a Start/Stop click -- and without this a slow poll
+ * sent BEFORE the click lands after the re-read and puts the old label back. Ordered by send time,
+ * ORDERED BY A SEND COUNTER, NOT THE WALL CLOCK: a clock stepped backward would otherwise drop
+ * every later reading and freeze the panel on an age that no longer grows. `fetchedAt` stays the
+ * wall-clock anchor for the age only.
+ */
+let readSequence = 0;
+const nextReadSequence = (): number => {
+  readSequence += 1;
+  return readSequence;
+};
+const newerReading =
+  (status: CollectionStatus, sentAt: number, sequence: number) =>
+  (previous: { status: CollectionStatus; fetchedAt: number; sequence: number } | null) =>
+    previous !== null && previous.sequence > sequence
+      ? previous
+      : { status, fetchedAt: sentAt, sequence };
+
 function App({ identity, onSignOut, getToken }: AppProps) {
   const [settings, setSettings] = useState<SearchSettings>(initialSettings);
   const [storedTargets, setStoredTargets] = useState<StoredTarget[]>([]);
@@ -131,9 +154,13 @@ function App({ identity, onSignOut, getToken }: AppProps) {
   const [collection, setCollection] = useState<{
     status: CollectionStatus;
     fetchedAt: number;
+    sequence: number;
   } | null>(null);
   const [collectionPending, setCollectionPending] = useState(true);
   const [statusNow, setStatusNow] = useState(() => Date.now());
+  /** A Start/Stop request is in flight. The button's LABEL never changes until the re-read. */
+  const [monitoringPending, setMonitoringPending] = useState(false);
+  const [monitoringNotice, setMonitoringNotice] = useState<MonitoringNotice | null>(null);
 
   /**
    * BOTH READS, AND SAVE STAYS DISABLED UNTIL BOTH SUCCEED. MEASURED: a 503 on load plus one click
@@ -240,13 +267,14 @@ function App({ identity, onSignOut, getToken }: AppProps) {
        * already aborted, so no two readings can overlap and no later reading can be older.
        */
       const sentAt = Date.now();
+      const sequence = nextReadSequence();
       try {
         const status = await marketplaceClient.getStatus(
           getToken,
           AbortSignal.timeout(STATUS_POLL_MS),
         );
         if (cancelled) return;
-        setCollection({ status, fetchedAt: sentAt });
+        setCollection(newerReading(status, sentAt, sequence));
       } catch {
         // THE LAST GOOD READING IS KEPT ON A FAILED POLL, deliberately. Flapping the panel to
         // "could not be read" and back on one dropped request would train the operator to ignore
@@ -311,6 +339,53 @@ function App({ identity, onSignOut, getToken }: AppProps) {
       ageMinutes,
     };
   }, [collection, statusNow]);
+
+  /**
+   * START/STOP. THE BUTTON'S NEXT LABEL COMES FROM AN IMMEDIATE RE-READ OF `/api/status`, never
+   * from the click: the write's own answer is not used to relabel anything, so the panel cannot
+   * show a state the status route would not. A failed re-read keeps the last reading, as a failed
+   * poll does, and the next poll corrects it.
+   *
+   * THE 409 IS NAMED IN THE DASHBOARD'S WORDS: Start with no saved deal rule would record
+   * NO_SETTINGS every 30 minutes, so the Worker refuses it and the page says what to do instead.
+   */
+  const toggleMonitoring = async (next: "start" | "stop") => {
+    setMonitoringPending(true);
+    setMonitoringNotice(null);
+    try {
+      // BOUNDED BY THE STATUS READS' OWN BUDGET, so a hung POST clears the pending flag instead of
+      // leaving the button disabled until reload.
+      const signal = AbortSignal.timeout(STATUS_POLL_MS);
+      if (next === "start") await marketplaceClient.startMonitoring(getToken, signal);
+      else await marketplaceClient.stopMonitoring(getToken, signal);
+
+      const sentAt = Date.now();
+      const sequence = nextReadSequence();
+      try {
+        const status = await marketplaceClient.getStatus(getToken, AbortSignal.timeout(STATUS_POLL_MS));
+        setCollection(newerReading(status, sentAt, sequence));
+      } catch {
+        // Kept, as on a failed poll.
+      }
+      setMonitoringNotice({
+        kind: "status",
+        text:
+          next === "start"
+            ? "Started. Your collector picks this up on its next run."
+            : "Stopped. Your collector skips its next run and no alerts are sent.",
+      });
+    } catch (error: unknown) {
+      setMonitoringNotice({
+        kind: "alert",
+        text:
+          error instanceof ApiRequestError && error.code === "MONITORING_NOT_READY"
+            ? "Save a deal rule before starting monitoring."
+            : (requestErrorMessage(error) ?? "Could not change monitoring. Try again."),
+      });
+    } finally {
+      setMonitoringPending(false);
+    }
+  };
 
   const selectedComponents = useMemo(
     () => settings.components.map((component) => componentById[component]),
@@ -858,7 +933,13 @@ function App({ identity, onSignOut, getToken }: AppProps) {
             * no listings.
             */}
           <aside className="results-column" id="preview-results">
-            <CollectionStatusPanel status={displayedCollection} pending={collectionPending} />
+            <CollectionStatusPanel
+              status={displayedCollection}
+              pending={collectionPending}
+              onToggleMonitoring={(next) => void toggleMonitoring(next)}
+              monitoringPending={monitoringPending}
+              monitoringNotice={monitoringNotice}
+            />
 
             <section className="results-panel" aria-live="polite" aria-busy={pendingAction === "preview"}>
               <div className="results-heading">

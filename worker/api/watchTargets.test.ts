@@ -7,6 +7,7 @@ import {
   fingerprint as fingerprintOf,
   seedEvaluationCorpus as seedCorpus,
 } from "../testing/evaluationFingerprint";
+import { handleStopMonitoring } from "./monitoring";
 import { handleGetWatchTargets } from "./watchTargets";
 
 let database!: TestDatabase;
@@ -145,6 +146,7 @@ describe("GET /api/watch-targets", () => {
           { targetId: "gpu-toronto", componentType: "gpu", query: "graphics card" },
           { targetId: "ram-toronto", componentType: "ram", query: "ddr5 ram" },
         ],
+        monitoring: "running",
       },
     });
   });
@@ -177,6 +179,7 @@ describe("GET /api/watch-targets", () => {
       body: {
         market: { location: "toronto", latitude: 43.6532, longitude: -79.3832, radiusKm: 25 },
         targets: [],
+        monitoring: "running",
       },
     });
   });
@@ -195,7 +198,60 @@ describe("GET /api/watch-targets", () => {
       body: {
         market: null,
         targets: [{ targetId: "gpu-toronto", componentType: "gpu", query: "graphics card" }],
+        monitoring: "running",
       },
+    });
+  });
+
+  /**
+   * W-m1: STOPPED HANDS THE COLLECTOR AN EMPTY LIST AND THE WORD THAT EXPLAINS IT. Paired on one
+   * fixture: W-2's shape (targets present, `monitoring: "running"`) is the positive half, and here
+   * the same two targets are withheld. Kills: ignoring the flag (the targets come back and the
+   * collector searches through a Stop), and dropping the field (the collector reads an empty list
+   * and exits 2 with degraded health).
+   */
+  it("W-m1: a stopped install answers targets:[] with monitoring:stopped, market kept", async () => {
+    await seedMarket();
+    await seedTarget("cpu-toronto", "cpu", "cpu");
+    await seedTarget("gpu-toronto", "gpu", "graphics card");
+
+    await expect(handleGetWatchTargets(database.db)).resolves.toMatchObject({
+      body: { targets: [{ targetId: "cpu-toronto" }, { targetId: "gpu-toronto" }], monitoring: "running" },
+    });
+
+    await handleStopMonitoring(database.db, 1_800_000_000);
+
+    await expect(handleGetWatchTargets(database.db)).resolves.toEqual({
+      ok: true,
+      status: 200,
+      body: {
+        market: { location: "toronto", latitude: 43.6532, longitude: -79.3832, radiusKm: 25 },
+        targets: [],
+        monitoring: "stopped",
+      },
+    });
+  });
+
+  /**
+   * W-m2: A FAILED FLAG READ IS THE EXISTING 503, NOT A GUESS. Only `monitoring_state` throws here;
+   * the market and the targets read fine. Kills: catching the flag read and defaulting to
+   * running (a broken row would then never be able to stop anything, and nobody would be told).
+   */
+  it("W-m2: a monitoring_state read that throws is 503 WATCH_TARGETS_STORAGE_FAILED", async () => {
+    await seedMarket();
+    await seedTarget("gpu-toronto", "gpu", "graphics card");
+    const real = database.db;
+    const flagFails = {
+      prepare: (sql: string) => {
+        if (sql.includes("monitoring_state")) throw new Error("D1_ERROR: no such table: monitoring_state");
+        return real.prepare(sql);
+      },
+    } as unknown as D1Database;
+
+    await expect(handleGetWatchTargets(flagFails)).resolves.toEqual({
+      ok: false,
+      status: 503,
+      code: "WATCH_TARGETS_STORAGE_FAILED",
     });
   });
 });

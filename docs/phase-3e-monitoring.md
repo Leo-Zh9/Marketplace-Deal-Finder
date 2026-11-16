@@ -77,6 +77,55 @@ bootstrapping their own revision 0, leaves every task it touched `COMPLETE` at t
 revision — ineligible under all four claim tiers, carrying a verdict computed from settings
 nobody chose, and unrecoverable without a manual revision bump.
 
+## Monitoring controls (Start / Stop)
+
+The dashboard's collection panel has one button: **Stop monitoring** while running, **Start
+monitoring** while stopped. Its label comes from `/api/status` and nothing else; after a click the
+page re-reads status at once. The state is one row, `monitoring_state` (migration 0008), seeded
+running, and an absent row also reads as running.
+
+**What Stop pauses, and nothing else:**
+
+- **The collector.** `GET /api/watch-targets` answers `{market, targets: [], monitoring: "stopped"}`.
+  The collector logs one `{"kind":"stopped"}` line and exits 0. It runs no search, posts no health
+  report and writes no guard state. launchd keeps firing it every 30 minutes.
+- **The monitoring run.** The flag is read inside the `load-settings` step, before the settings
+  check. The run records **`STOPPED`**, skips discovery, the drain and the notify step, and
+  finalizes and releases like `NO_SETTINGS`. Stop is checked first, so a stopped install with no
+  rule reads `STOPPED`. It writes no `console.warn`, because it is the operator's choice and not a
+  fault.
+- **`/api/status`.** It reads `status: "stopped"` with `causes: []`. `reportedAt`, `ageMinutes`
+  and `collector` stay, so the page still says when the last run was. It also carries a new
+  `monitoring: {state, changedAt}` field. That field is `null` when the read fails or there is
+  no DB binding, and then nothing is overridden.
+
+The cleanup cron, ingest, `/api/watch` and the `notifications` rows are untouched. PENDING alerts
+stay PENDING. They go out on the first run after Start only if the stop lasted less than the
+~7 h freshness window (`NOTIFY_FRESH_SECONDS`). After a longer stop, recheck finds the listing
+too old and cancels them. A run already in flight when Stop is pressed finishes its drain, but
+its notify step reads the flag again (only when notifications are on) and sends nothing. **Start refuses with 409 `MONITORING_NOT_READY`** when no deal rule is saved,
+and leaves the row unchanged. Start does not trigger a run: the collector and the cron pick it up
+on their next fire. Start checks only the deal rule because the market and the targets are
+already covered: 0005 seeds them, `PUT /api/watch` guards every edit, and the collector reports a
+broken list loudly as exit 2.
+
+**Cost:** one more row read per monitoring run, inside `load-settings` and counted in
+`rows_read` (runMonitor.test.ts R16 moved from 9 to 10). That is 48 rows a day.
+
+**Stop is not the 3am kill switch.** It needs a deployed Worker that knows about the row. The
+`monitor_lock` HOLD under *Reversibility* below needs nothing but D1 and still works when the
+Worker or the dashboard is the thing that is broken. The same applies the other way: to pause
+from the terminal without the dashboard, run
+`UPDATE monitoring_state SET enabled = 0, changed_at = unixepoch() WHERE id = 1`.
+
+**Deploy order, and the rollback trap.** Ship in this order: `npm run db:migrate` (0008) → the
+Worker → the dashboard → `git pull` on the collector's machine. An old collector ignores the
+field. It sees an empty list and exits 2, which is loud, never silent collection through a Stop.
+**Before you roll back the Worker or the dashboard, press Start** (or run
+`UPDATE monitoring_state SET enabled = 1 WHERE id = 1`). An old dashboard rejects the word
+`"stopped"`, shows "could not be read", and has no Start button. An old Worker ignores the row,
+so the install would quietly resume while the row still said stopped.
+
 ## The drain
 
 **Sources are discovered from `evaluation_tasks` itself**, which is self-bootstrapping: a source
@@ -209,8 +258,8 @@ SELECT SUM(evaluation_error_count) AS decide_failures FROM monitor_runs;
 SELECT source, listing_id, lease_token FROM evaluation_tasks WHERE status = 'PROCESSING';
 ```
 
-Every non-`OK` run also writes one `console.warn` line, as does any run whose source list was
-truncated.
+Every run that is neither `OK` nor `STOPPED` also writes one `console.warn` line, as does any run
+whose source list was truncated.
 
 ### The deferred `(market_key, model_key, variant_key)` index
 
@@ -226,6 +275,9 @@ The number that decides it is `CleanupRun.usage.rowsRead` measured against a rea
 ## Deploy runbook
 
 **Order matters, and getting it wrong fails silently once every 30 minutes.**
+
+(This runbook is the original 3E-b deploy. For the Start/Stop controls added later, see
+*Monitoring controls* above for the order: migrate 0008 → Worker → dashboard → collector.)
 
 ```bash
 # 1. Offline first: catches a Workflow class that is not exported from worker/index.ts,

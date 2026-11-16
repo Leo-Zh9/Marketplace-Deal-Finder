@@ -599,3 +599,97 @@ describe("the notifications field of /api/status", () => {
     expect((await marketplaceClient.getStatus(noToken)).notifications).toEqual(expected);
   });
 });
+
+describe("Start/Stop and the monitoring field of /api/status", () => {
+  const BODY = {
+    status: "ok",
+    causes: [],
+    reportedAt: 1_800_000_000,
+    ageMinutes: 3,
+    collector: null,
+    authentication: "firebase-google",
+  };
+
+  /**
+   * C-m1: THE WORD "stopped" IS READABLE, AND THE VALID FIELD PASSES THROUGH. Kills: leaving
+   * "stopped" out of STATUS_WORDS (every stopped install reads "could not be read", with no Start
+   * button to undo it).
+   */
+  it("C-m1: a stopped body passes through with its monitoring field", async () => {
+    const stopped = {
+      ...BODY,
+      status: "stopped",
+      monitoring: { state: "stopped", changedAt: 1_800_000_060 },
+    };
+    stubJson(stopped);
+
+    expect(await marketplaceClient.getStatus(noToken)).toEqual(stopped);
+  });
+
+  /**
+   * C-m2: ABSENT STAYS ABSENT, NULL STAYS NULL, MALFORMED BECOMES ABSENT -- and the poll succeeds
+   * in all three. Kills: folding the field into `isCollectionStatus` (a bad field blanks the
+   * panel), and passing a malformed one through (the button would be labelled from a guess).
+   */
+  it.each<[string, unknown, boolean, unknown]>([
+    ["null", null, true, null],
+    ["an unknown state", { state: "paused", changedAt: 1 }, false, undefined],
+    ["a string changedAt", { state: "stopped", changedAt: "now" }, false, undefined],
+    ["a bare string", "stopped", false, undefined],
+  ])("C-m2: a monitoring field of %s", async (_label, monitoring, kept, expected) => {
+    stubJson({ ...BODY, monitoring });
+
+    const status = await marketplaceClient.getStatus(noToken);
+
+    expect("monitoring" in status).toBe(kept);
+    expect(status.monitoring).toEqual(expected);
+    expect(status.status).toBe("ok");
+  });
+
+  it("C-m2b: an older Worker's body has no monitoring key", async () => {
+    stubJson(BODY);
+    expect("monitoring" in (await marketplaceClient.getStatus(noToken))).toBe(false);
+  });
+
+  /**
+   * C-m3: START AND STOP ARE BODILESS POSTS TO THEIR OWN PATHS, WITH THE TOKEN. No Content-Type,
+   * so the preflight asks for nothing the route does not need. Kills: swapping the two paths.
+   */
+  it.each([
+    ["startMonitoring", "/api/monitoring/start", "running"],
+    ["stopMonitoring", "/api/monitoring/stop", "stopped"],
+  ] as const)("C-m3: %s POSTs to %s", async (method, path, state) => {
+    const fetchMock = stubJson({ monitoring: { state, changedAt: 1_800_000_120 } });
+
+    await expect(marketplaceClient[method](async () => "a-firebase-id-token")).resolves.toEqual({
+      state,
+      changedAt: 1_800_000_120,
+    });
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe(path);
+    expect(init?.method).toBe("POST");
+    expect(init?.body).toBeUndefined();
+    const headers = new Headers(init?.headers);
+    expect(headers.get("Content-Type")).toBeNull();
+    expect(headers.get("Authorization")).toBe("Bearer a-firebase-id-token");
+  });
+
+  /** C-m3b: the caller's abort signal reaches the POST. Kills: dropping it in `postMonitoring`. */
+  it.each(["startMonitoring", "stopMonitoring"] as const)("C-m3b: %s forwards its signal", async (method) => {
+    const fetchMock = stubJson({ monitoring: { state: "running", changedAt: 0 } });
+    const controller = new AbortController();
+
+    await marketplaceClient[method](noToken, controller.signal);
+
+    expect(fetchMock.mock.calls[0][1]?.signal).toBe(controller.signal);
+  });
+
+  it("C-m4: a 200 whose body is not a monitoring state is refused, not trusted", async () => {
+    stubJson({ monitoring: { state: "maybe", changedAt: 0 } });
+
+    await expect(marketplaceClient.stopMonitoring(noToken)).rejects.toThrow(
+      "The monitoring state came back in a shape this page cannot read.",
+    );
+  });
+});

@@ -105,7 +105,8 @@ export interface PreviewResult {
  * exactly what the old panel was deleted for.
  */
 export interface CollectionStatus {
-  status: "ok" | "stale" | "degraded" | "unknown";
+  /** `stopped` is the operator's own Stop, and it outranks every health word. */
+  status: "ok" | "stale" | "degraded" | "unknown" | "stopped";
   /** Whichever `degraded` clauses fired, as a set. Empty on `ok`, `stale` and `unknown`. */
   causes: string[];
   /** Unix SECONDS, the SERVER's clock. 0 when nothing has reported. */
@@ -129,6 +130,19 @@ export interface CollectionStatus {
    * field costs the alert line and never the panel. See `marketplaceClient.getStatus`.
    */
   notifications?: NotificationsStatus | { state: "unreadable" };
+  /**
+   * START/STOP, migrations/0008. ABSENT on an API Worker older than the controls, and the page
+   * then renders no Start/Stop button at all -- it cannot know which one to show. `null` is the
+   * Worker saying its read failed, which renders no button either. The button's label comes from
+   * this field and nothing else, never from what the user last clicked.
+   */
+  monitoring?: MonitoringState | null;
+}
+
+export interface MonitoringState {
+  state: "running" | "stopped";
+  /** Unix SECONDS of the last real change; 0 means never changed. */
+  changedAt: number;
 }
 
 /** The counts `/api/status` carries for `on` and `webhook-rejected` only. */

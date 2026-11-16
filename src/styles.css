@@ -1372,7 +1372,7 @@ input[aria-invalid="true"] {
    only) went red, which is the only thing in the repository that would have noticed.
 
    `collection-badge--${status}` IS A TEMPLATE LITERAL, so styles.test.ts checks only the static
-   prefix `collection-badge` and is BLIND to the four generated endings. They are written out in
+   prefix `collection-badge` and is BLIND to the five generated endings. They are written out in
    full below for the reason the `.status-badge--not_deal` comment records: when the
    EvaluationStatus union was renamed, the generated selector stopped matching anything and the
    commonest badge on the page rendered with no pill at all, and nothing in the repository
@@ -1392,6 +1392,15 @@ input[aria-invalid="true"] {
   border-top: 3px solid var(--blue-600);
   border-radius: 14px;
   box-shadow: 0 8px 24px rgba(28, 42, 67, 0.07);
+}
+
+/* The Start/Stop button sits at the right of the heading, and wraps under it on a phone. */
+.collection-panel .panel-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
 }
 
 .collection-status {
@@ -1432,6 +1441,20 @@ input[aria-invalid="true"] {
 .collection-badge--unknown {
   color: var(--muted);
   background: #eef1f5;
+}
+
+/* STYLED LIKE `unknown`, NOT AS A WARNING: a stop the operator pressed is not a fault, and amber
+   beside it would teach them to read past the amber that is one. */
+.collection-badge--stopped {
+  color: var(--muted);
+  background: #eef1f5;
+}
+
+.collection-stopped,
+.collection-notice {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 0.76rem;
 }
 
 .collection-timestamp {

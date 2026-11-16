@@ -9,6 +9,7 @@ import { verdictsQuery, type StoredTarget, type WatchSaveBody } from "./watchSel
 import type {
   CollectionStatus,
   ComponentType,
+  MonitoringState,
   DealRule,
   Listing,
   NotificationsStatus,
@@ -20,7 +21,12 @@ export type { StoredTarget, WatchSaveBody } from "./watchSelection";
 
 type GetToken = (forceRefresh: boolean) => Promise<string | null>;
 
-const STATUS_WORDS: readonly string[] = ["ok", "stale", "degraded", "unknown"];
+/**
+ * `stopped` IS HERE BECAUSE THE CHECK IS STRICT, and an old dashboard is exactly what proves it: a
+ * page built before Start/Stop rejects the word and shows "could not be read" -- with no Start
+ * button to undo it. docs/phase-3e-monitoring.md says to Start before rolling the dashboard back.
+ */
+const STATUS_WORDS: readonly string[] = ["ok", "stale", "degraded", "unknown", "stopped"];
 
 /**
  * THE STATUS BODY IS CHECKED, NOT CAST, BECAUSE THE PAGE AND THE API DEPLOY SEPARATELY. The
@@ -90,6 +96,36 @@ const withCheckedNotifications = (status: CollectionStatus): CollectionStatus =>
   return { ...status, notifications: checkNotifications(status.notifications) ?? { state: "unreadable" } };
 };
 
+/**
+ * `monitoring` IS CHECKED APART FROM THE BODY, LIKE `notifications`, and a bad one costs only the
+ * button. Absent stays absent (an older Worker); `null` stays null (the Worker's read failed); a
+ * valid value comes back REBUILT from its checked fields; anything else becomes absent, so no
+ * button renders rather than one whose label was guessed.
+ */
+const checkMonitoring = (value: unknown): MonitoringState | null | undefined => {
+  if (value === null) return null;
+  if (typeof value !== "object") return undefined;
+  const { state, changedAt } = value as Record<string, unknown>;
+  if (state !== "running" && state !== "stopped") return undefined;
+  if (!isCount(changedAt)) return undefined;
+  return { state, changedAt };
+};
+
+const withCheckedMonitoring = (status: CollectionStatus): CollectionStatus => {
+  if (!("monitoring" in status)) return status;
+  const monitoring = checkMonitoring(status.monitoring);
+  if (monitoring !== undefined) return { ...status, monitoring };
+  const rest = { ...status };
+  delete rest.monitoring;
+  return rest;
+};
+
+const isMonitoringBody = (body: unknown): body is { monitoring: MonitoringState } => {
+  if (typeof body !== "object" || body === null) return false;
+  const monitoring = checkMonitoring((body as Record<string, unknown>).monitoring);
+  return monitoring !== null && monitoring !== undefined;
+};
+
 /** `search_revisions`' three columns, which are exactly `PUT /api/settings`' ACCEPTED_FIELDS. */
 export type DealMode = "DISCOUNT" | "MAXIMUM_PRICE" | "BOTH";
 
@@ -124,6 +160,12 @@ export interface MarketplaceClient {
    * failed status read must cost nothing but the badge. A-2 is the guard.
    */
   getStatus(getToken: GetToken, signal?: AbortSignal): Promise<CollectionStatus>;
+  /**
+   * START/STOP. No body. A 409 `MONITORING_NOT_READY` from Start surfaces as an `ApiRequestError`
+   * carrying that code, which App turns into "Save a deal rule before starting monitoring."
+   */
+  startMonitoring(getToken: GetToken, signal?: AbortSignal): Promise<MonitoringState>;
+  stopMonitoring(getToken: GetToken, signal?: AbortSignal): Promise<MonitoringState>;
 }
 
 interface VerdictsResponse {
@@ -194,6 +236,22 @@ export const settingsToDealRule = (
   };
 };
 
+/**
+ * `signal` IS FORWARDED FOR THE SAME REASON `getStatus` FORWARDS ONE: App bounds the POST with the
+ * status reads' own budget, so a hung request cannot leave the button disabled forever.
+ */
+const postMonitoring = async (
+  path: string,
+  getToken: GetToken,
+  signal?: AbortSignal,
+): Promise<MonitoringState> => {
+  const body = await requestJsonWithAuth<unknown>(path, getToken, { method: "POST", signal });
+  if (!isMonitoringBody(body)) {
+    throw new ApiRequestError("The monitoring state came back in a shape this page cannot read.", "unexpected");
+  }
+  return { state: body.monitoring.state, changedAt: body.monitoring.changedAt };
+};
+
 export const marketplaceClient: MarketplaceClient = {
   /**
    * THE FILTER RUNS ON THE SERVER NOW, AND THE CLIENT-SIDE ONE IS DELETED. That deletion is what
@@ -250,6 +308,14 @@ export const marketplaceClient: MarketplaceClient = {
     if (!isCollectionStatus(body)) {
       throw new ApiRequestError("The collector's status came back in a shape this page cannot read.", "unexpected");
     }
-    return withCheckedNotifications(body);
+    return withCheckedMonitoring(withCheckedNotifications(body));
+  },
+
+  startMonitoring(getToken, signal) {
+    return postMonitoring("/api/monitoring/start", getToken, signal);
+  },
+
+  stopMonitoring(getToken, signal) {
+    return postMonitoring("/api/monitoring/stop", getToken, signal);
   },
 };

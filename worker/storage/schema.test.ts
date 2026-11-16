@@ -7,6 +7,7 @@ import monitorSql from "../../migrations/0004_monitor.sql?raw";
 import watchSql from "../../migrations/0005_watch_targets.sql?raw";
 import healthSql from "../../migrations/0006_collector_health.sql?raw";
 import notificationsSql from "../../migrations/0007_notifications.sql?raw";
+import monitoringStateSql from "../../migrations/0008_monitoring_state.sql?raw";
 import { COMPONENT_TYPES } from "../api/listings";
 
 /**
@@ -71,8 +72,9 @@ describe("0001_initial_storage.sql", () => {
   // worker/testing/d1.ts leaves ten tables here and every row of
   // worker/api/collectorHealth.test.ts failing with `no such table: collector_health` -- so the
   // two failures together say which edit was missed.
-  // 0007 adds exactly the one notifications table (S-p1 below pins its shape).
-  it("creates exactly the twelve tables 0001 through 0007 define", async () => {
+  // 0007 adds exactly the one notifications table (S-p1 below pins its shape), and 0008 exactly
+  // the one monitoring_state singleton (S-m1 below).
+  it("creates exactly the thirteen tables 0001 through 0008 define", async () => {
     // The filter is required: after the migration sqlite_master also holds D1's internal
     // _cf_METADATA and four sqlite_autoindex_* entries for the composite primary keys.
     const { results } = await database.db
@@ -88,6 +90,7 @@ describe("0001_initial_storage.sql", () => {
       "model_stats",
       "monitor_lock",
       "monitor_runs",
+      "monitoring_state",
       "notifications",
       "price_observations",
       "search_revisions",
@@ -928,6 +931,78 @@ describe("0007_notifications.sql", () => {
     expect(statements[0]).toMatch(/^CREATE TABLE notifications /);
     expect(statements[0]).not.toMatch(/WITHOUT\s+ROWID/i);
     expect(statements[1]).toMatch(/^CREATE INDEX notifications_due ON notifications \(status, next_attempt_at\)$/);
+    for (const statement of statements) {
+      expect(statement).not.toMatch(/\b(DROP|ALTER|UPDATE|DELETE)\b/);
+    }
+  });
+});
+
+/**
+ * The Start/Stop slice's additive migration. Every behavioural row below is REFUSED, so the
+ * shipped seed S-m4 reads is left as it was found -- the same reason the 0006 block can share
+ * `database`, which `truncateAll` never touches.
+ */
+describe("0008_monitoring_state.sql", () => {
+  /** S-m1. THE CHECKS, EXHAUSTIVELY -- a presence pin, like S2b, S7b and S-n3. */
+  it("S-m1: declares exactly these three CHECK constraints, and no others", () => {
+    expect(extractChecks(splitSqlStatements(monitoringStateSql).join("\n"))).toEqual([
+      "id = 1",
+      "enabled IN (0, 1)",
+      "typeof(changed_at) = 'integer' AND changed_at >= 0",
+    ]);
+  });
+
+  it("S-m2: carries exactly its three columns, in order, all NOT NULL, id the key", async () => {
+    const { results } = await database.db
+      .prepare("SELECT name, `notnull`, pk FROM pragma_table_info('monitoring_state')")
+      .all<{ name: string; notnull: number; pk: number }>();
+
+    expect(results).toEqual([
+      { name: "id", notnull: 1, pk: 1 },
+      { name: "enabled", notnull: 1, pk: 0 },
+      { name: "changed_at", notnull: 1, pk: 0 },
+    ]);
+  });
+
+  /**
+   * S-m3. THE CHECKS, BEHAVIOURALLY. S-m1 is a presence pin; these are the values each one exists
+   * to refuse. A second row would give "is monitoring on?" two answers, `enabled = 2` would read
+   * as running by accident rather than by rule, and a REAL `changed_at` is the affinity trap 0005
+   * and 0006 record.
+   */
+  it.each<[string, string]>([
+    ["a second row", "INSERT INTO monitoring_state (id, enabled, changed_at) VALUES (2, 1, 0)"],
+    ["an OMITTED id, which auto-assigns 2", "INSERT INTO monitoring_state (enabled, changed_at) VALUES (1, 0)"],
+    ["moving the existing row", "UPDATE monitoring_state SET id = 2 WHERE id = 1"],
+    ["enabled = 2", "UPDATE monitoring_state SET enabled = 2 WHERE id = 1"],
+    ["enabled = 'yes'", "UPDATE monitoring_state SET enabled = 'yes' WHERE id = 1"],
+    ["a REAL changed_at", "UPDATE monitoring_state SET changed_at = 1800000000.5 WHERE id = 1"],
+    ["a negative changed_at", "UPDATE monitoring_state SET changed_at = -1 WHERE id = 1"],
+  ])("S-m3: %s is refused", async (_label, statement) => {
+    await expect(database.db.prepare(statement).run()).rejects.toThrow(/CHECK constraint failed/);
+  });
+
+  /**
+   * S-m4. THE SHIPPED SEED IS RUNNING. Applying 0008 to the live install must change nothing about
+   * collection; a seed of 0 would stop it on deploy, silently, until someone pressed Start.
+   * `truncateAll` restores this row, so this untouched database is the only place the migration's
+   * own values are read.
+   */
+  it("S-m4: the shipped seed is one running row that was never changed", async () => {
+    const { results } = await database.db
+      .prepare("SELECT * FROM monitoring_state")
+      .all<Record<string, unknown>>();
+
+    expect(results).toEqual([{ id: 1, enabled: 1, changed_at: 0 }]);
+  });
+
+  /** S-m5. The FILE: a destructive statement would still leave the right table on a fresh DB. */
+  it("S-m5: is one CREATE TABLE and one seed INSERT, and nothing destructive", () => {
+    const statements = splitSqlStatements(monitoringStateSql);
+
+    expect(statements).toHaveLength(2);
+    expect(statements[0]).toMatch(/^CREATE TABLE monitoring_state /);
+    expect(statements[1]).toMatch(/^INSERT INTO monitoring_state /);
     for (const statement of statements) {
       expect(statement).not.toMatch(/\b(DROP|ALTER|UPDATE|DELETE)\b/);
     }

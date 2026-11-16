@@ -29,6 +29,9 @@ import {
   completionStatement,
 } from "../evaluation/evaluateBatch";
 import { EVALUATION_BATCH_SIZE } from "../evaluation/types";
+import { handleStartMonitoring, handleStopMonitoring } from "../api/monitoring";
+import { zeroCounts } from "../notify/runNotify";
+import { loadCurrentSettings } from "../search/settings";
 import { createTestDatabase, truncateAll, type TestDatabase } from "../testing/d1";
 import { COLLECTION_STEPS, type CollectionOutcome, type CollectionStep } from "./collection";
 import { acquireMonitorLock, MONITOR_LOCK_SECONDS } from "./monitorLock";
@@ -1044,8 +1047,9 @@ describe("runMonitor", () => {
     // nothing else holds its totals.
     //
     // These are the run's OWN statements on top of what the two collection steps reported:
-    // acquire-lock, load-settings, discover-sources, the previous-run read, and the finalize
-    // batch's insert + prune + release. MEASURED, and the same discipline as the cost table in
+    // acquire-lock, load-settings (the settings join AND the monitoring_state read added with
+    // the Start/Stop controls -- 9 -> 10, measured), discover-sources, the previous-run read, and
+    // the finalize batch's insert + prune + release. MEASURED, and the same discipline as the cost table in
     // docs/phase-3e-monitoring.md. If a statement is added or removed this number MUST move --
     // editing it back to green is the wrong fix.
     //
@@ -1053,7 +1057,7 @@ describe("runMonitor", () => {
     // finalize batch costs 3r/3w while monitor_runs is below the retention window and 5r/4w once
     // the prune starts deleting. A second runMonitor call in this test, or a missing beforeEach
     // truncate, moves it by 2/1. Loud, not silent -- but the fix is the fixture, not the number.
-    const OWN_ROWS_READ = 9;
+    const OWN_ROWS_READ = 10;
     const OWN_ROWS_WRITTEN = 4;
     expect({ read: run.usage.rowsRead, written: run.usage.rowsWritten }).toEqual({
       read: ALPHA[5] + BRAVO[5] + OWN_ROWS_READ,
@@ -1420,5 +1424,223 @@ describe("runMonitor -- the notify step", () => {
     expect(await lockRow()).toEqual({ run_id: "", acquired_at: T, expires_at: 0 });
     // The drain's work is untouched by the notify failure.
     expect(await taskStatuses()).toEqual([{ status: "COMPLETE", n: 2 }]);
+  });
+});
+
+/**
+ * THE DASHBOARD'S STOP (migrations/0008). A stopped run is read inside `load-settings` and
+ * finalizes like NO_SETTINGS: no discovery, no drain, no notify, one STOPPED row, the lock
+ * released, and no console.warn -- it is the operator's choice, not a fault.
+ */
+describe("runMonitor -- the Stop flag", () => {
+  const ON = {
+    DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/43/run-monitor-stop",
+    NOTIFICATIONS: "on",
+    APP_ENV: "production",
+  };
+
+  const snapshot = async () => ({
+    tasks: (await db.prepare("SELECT * FROM evaluation_tasks ORDER BY source, listing_id").all()).results,
+    notifications: (await db.prepare("SELECT * FROM notifications ORDER BY source, listing_id").all()).results,
+  });
+
+  const watchEverything = () =>
+    db
+      .prepare(
+        "INSERT INTO watch_targets (target_id, component_type, query) VALUES ('gpu-all', 'gpu', 'graphics card')",
+      )
+      .run();
+
+  /**
+   * R-s1. PAIRED ON ONE FIXTURE: two DEAL-bound tasks and live notifications. Stopped, the run
+   * touches neither table and never calls the webhook; started again, the SAME fixture drains both
+   * tasks and posts both alerts -- so the stopped half cannot pass by an inert fixture. Kills:
+   * dropping the stopped early-return (the drain and the posts happen), and checking the flag
+   * AFTER the drain.
+   */
+  it("R-s1: a stopped run drains nothing, posts nothing, records STOPPED and releases", async () => {
+    await maximumPriceSettings();
+    await watchEverything();
+    await seed("alpha", 2);
+    await handleStopMonitoring(db, T);
+    const posts: string[] = [];
+    const notifyFetch = async (url: string) => {
+      posts.push(url);
+      return new Response('{"id":"1"}', { status: 200 });
+    };
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const before = await snapshot();
+    const recorder = recording();
+    const stopped = await runMonitor(db, recorder.stepper, { now: T }, "run-stopped", { notifyFetch }, ON);
+
+    expect(recorder.names).toEqual(["acquire-lock", "load-settings", "finalize"]);
+    expect({
+      status: stopped.status,
+      batches: stopped.batches,
+      claimedCount: stopped.claimedCount,
+      notify: stopped.notify,
+      stepsUsed: stopped.stepsUsed,
+    }).toEqual({ status: "STOPPED", batches: 0, claimedCount: 0, notify: null, stepsUsed: 3 });
+    expect(await snapshot()).toEqual(before);
+    expect(posts).toEqual([]);
+    expect((await runRows()).map((row) => row.status)).toEqual(["STOPPED"]);
+    expect(await lockRow()).toEqual({ run_id: "", acquired_at: T, expires_at: 0 });
+    // The operator's own choice: no warning line, 48 times a day.
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+
+    await handleStartMonitoring(db, T);
+    const started = await runMonitor(db, recording().stepper, { now: T }, "run-started", { notifyFetch }, ON);
+
+    expect({ status: started.status, claimedCount: started.claimedCount }).toEqual({
+      status: "OK",
+      claimedCount: 2,
+    });
+    expect(await taskStatuses()).toEqual([{ status: "COMPLETE", n: 2 }]);
+    expect(posts).toHaveLength(2);
+    expect((await snapshot()).notifications).toHaveLength(2);
+  });
+
+  /**
+   * R-s2. STOPPED IS CHECKED BEFORE THE SETTINGS. A stopped install with no deal rule reads
+   * STOPPED, the thing to undo first; the same database started reads NO_SETTINGS. Kills: swapping
+   * the two checks (the first half reads NO_SETTINGS).
+   */
+  it("R-s2: stopped with no settings is STOPPED; running with no settings is NO_SETTINGS", async () => {
+    await seed("alpha", 3);
+    await handleStopMonitoring(db, T);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const stopped = await runMonitor(db, recording().stepper, { now: T }, "run-stopped-unset");
+    await db.prepare("UPDATE monitoring_state SET enabled = 1 WHERE id = 1").run();
+    const running = await runMonitor(db, recording().stepper, { now: T }, "run-running-unset");
+
+    expect([stopped.status, running.status]).toEqual(["STOPPED", "NO_SETTINGS"]);
+    expect((await runRows()).map((row) => row.status)).toEqual(["STOPPED", "NO_SETTINGS"]);
+    expect(await taskStatuses()).toEqual([{ status: "PENDING", n: 3 }]);
+    // Only the NO_SETTINGS run warns.
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toContain("NO_SETTINGS");
+    warn.mockRestore();
+  });
+
+  /**
+   * R-s4. STOP PRESSED MID-RUN SENDS NOTHING. The flag reads running at `load-settings`, the drain
+   * judges two DEALs, and Stop lands just before `notify`: the notify step re-reads it and posts
+   * nothing. Paired: Start, and the next run posts both, so the stopped half cannot pass on an
+   * inert fixture. Kills: dropping the re-read (two posts in the first run).
+   */
+  it("R-s4: a Stop that lands between the drain and notify sends no alert", async () => {
+    await maximumPriceSettings();
+    await watchEverything();
+    await seed("alpha", 2);
+    const posts: string[] = [];
+    const notifyFetch = async (url: string) => {
+      posts.push(url);
+      return new Response('{"id":"1"}', { status: 200 });
+    };
+    const recorder = recording({
+      before: async (name) => {
+        if (name === "notify") await handleStopMonitoring(db, T);
+      },
+    });
+
+    const run = await runMonitor(db, recorder.stepper, { now: T }, "run-stop-mid", { notifyFetch }, ON);
+
+    expect(recorder.names).toEqual(["acquire-lock", "load-settings", "discover-sources", "drain-0", "notify", "finalize"]);
+    expect(run.status).toBe("OK");
+    expect(run.claimedCount).toBe(2);
+    expect(run.notify).toMatchObject({ state: "on", enqueued: 0, sent: 0 });
+    expect(posts).toEqual([]);
+    expect((await snapshot()).notifications).toEqual([]);
+
+    await handleStartMonitoring(db, T);
+    await runMonitor(db, recording().stepper, { now: T }, "run-after-start", { notifyFetch }, ON);
+    expect(posts).toHaveLength(2);
+  });
+
+  /**
+   * R-s5. THE NOTIFY STEP'S FLAG READ IS COUNTED, AND ONLY WHEN NOTIFICATIONS ARE ON. Two runs on
+   * one empty fixture, the log cleared between them so finalize costs the same: inert notify, then
+   * ON with Stop landing before notify (so the step reads the flag and stops there). They differ by
+   * exactly the one row. Kills: not spending the read (difference 0).
+   */
+  it("R-s5: the notify step's flag read adds exactly one row read", async () => {
+    await maximumPriceSettings();
+    const inert = await runMonitor(db, recording().stepper, { now: T }, "run-inert");
+    await db.prepare("DELETE FROM monitor_runs").run();
+
+    const stoppedMid = await runMonitor(
+      db,
+      recording({
+        before: async (name) => {
+          if (name === "notify") await handleStopMonitoring(db, T);
+        },
+      }).stepper,
+      { now: T },
+      "run-on-stopped",
+      {},
+      ON,
+    );
+
+    expect(stoppedMid.usage.rowsRead - inert.usage.rowsRead).toBe(1);
+    expect(stoppedMid.usage.rowsWritten - inert.usage.rowsWritten).toBe(0);
+  });
+
+  /**
+   * R-s3. A `load-settings` result memoized BEFORE this field existed -- an instance replayed across
+   * the deploy -- has no `stopped`, and it reads as running, the state it was recorded in. The row
+   * says stopped here, so a reader that treated the missing field as stopped (or re-read the row)
+   * would show it. Kills: `loaded.stopped !== false`.
+   */
+  it("R-s3: a memoized load-settings result without the field reads as running", async () => {
+    await maximumPriceSettings();
+    await seed("alpha", 2);
+    await handleStopMonitoring(db, T);
+    const inner = recording();
+    const replayed: MonitorStepper = {
+      do: (name, config, callback) =>
+        name === "load-settings"
+          ? (loadCurrentSettings(db) as unknown as ReturnType<typeof callback>)
+          : inner.stepper.do(name, config, callback),
+    };
+
+    const run = await runMonitor(db, replayed, { now: T }, "run-replayed");
+
+    expect({ status: run.status, claimedCount: run.claimedCount }).toEqual({
+      status: "OK",
+      claimedCount: 2,
+    });
+  });
+
+  /**
+   * R-s6. A `notify` result memoized BEFORE the step returned `{counts, usage}` -- a bare
+   * NotifyCounts replayed across the deploy -- is read as the counts it is, spends nothing, and
+   * does not degrade the run. Kills: dropping the old-shape branch (run.notify null) or the `in`
+   * guard (a throw recorded as DEGRADED).
+   */
+  it("R-s6: a memoized bare NotifyCounts notify result is read as the counts", async () => {
+    await maximumPriceSettings();
+    await seed("alpha", 2);
+    const bare = { ...zeroCounts("on"), sent: 3, enqueued: 3 };
+    const baseline = recording();
+    const reference = await runMonitor(db, baseline.stepper, { now: T }, "run-reference");
+    await truncateAll(db);
+    await maximumPriceSettings();
+    await seed("alpha", 2);
+    const inner = recording();
+    const replayed: MonitorStepper = {
+      do: (name, config, callback) =>
+        name === "notify"
+          ? (Promise.resolve(bare) as unknown as ReturnType<typeof callback>)
+          : inner.stepper.do(name, config, callback),
+    };
+
+    const run = await runMonitor(db, replayed, { now: T }, "run-replayed-notify");
+
+    expect(run.status).toBe("OK");
+    expect(run.notify).toEqual(bare);
+    expect(run.usage).toEqual(reference.usage);
   });
 });

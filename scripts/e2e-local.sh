@@ -85,6 +85,13 @@ if [ "${1:-}" = "--serve" ]; then
   for _ in $(seq 1 40); do $CURL -sf -o /dev/null "$BASE/api/status" --max-time 2 && break; sleep 1; done
 fi
 
+# MONITORING STARTS RUNNING ON EVERY RUN OF THIS GATE. A previous run killed inside the Start/Stop
+# section would leave the local row stopped, and then every collector run below would log
+# `kind:stopped`, exit 0 and collect nothing -- 20-odd assertions going red for a reason none of
+# them names. An UPSERT, so it also works on a database whose seed row was deleted.
+sql "INSERT INTO monitoring_state (id, enabled, changed_at) VALUES (1, 1, 0)
+     ON CONFLICT(id) DO UPDATE SET enabled = 1;" >/dev/null
+
 echo "== auth and CORS =="
 is "loopback dev identity is accepted"        200 "$(code -H "Origin: $ORIGIN" "$BASE/api/status")"
 is "an evil origin is refused"                403 "$(code -H "Origin: $EVIL" "$BASE/api/settings")"
@@ -118,6 +125,12 @@ is "GET is ALLOWED on /api/watch"             204 "$(pf /api/watch GET)"
 is "  ...and so is PUT"                       204 "$(pf /api/watch PUT)"
 is "  ...with content-type on the PUT"        204 "$(pf /api/watch PUT content-type)"
 is "  ...while DELETE is refused"             403 "$(pf /api/watch DELETE)"
+# START/STOP ARE BROWSER ROUTES, so their ROUTE_METHODS rows must exist -- the same measured trap as
+# /api/watch: without a row every unit test and every curl below passes while the dashboard's
+# cross-origin POST is refused at the preflight in production.
+is "POST is ALLOWED on /api/monitoring/start" 204 "$(pf /api/monitoring/start POST)"
+is "  ...and on /api/monitoring/stop"         204 "$(pf /api/monitoring/stop POST)"
+is "  ...while GET is refused there"          403 "$(pf /api/monitoring/stop GET)"
 
 echo "== settings write path =="
 sql "DELETE FROM search_settings; DELETE FROM search_revisions;" >/dev/null
@@ -1079,6 +1092,52 @@ is "  ...and its listings reached D1"         4 "$(val "SELECT COUNT(*) FROM lis
 # coordinates, and a form that wrote a market the collector did not use would be invisible here
 # without this row.
 is "  ...in the market the form wrote"        '43.6532,-79.3832|25km' "$(val 'SELECT DISTINCT market_key FROM listings')"
+
+echo "== Start/Stop: the dashboard pauses the collector and the monitor =="
+# THE WHOLE CONTROL OVER HTTP, AGAINST THE REAL COLLECTOR AND A REAL MONITORING RUN. Settings are
+# EMPTY here -- the NO_SETTINGS control near the top deleted the pointer and nothing has re-saved
+# one -- which is exactly what makes Start's 409 reachable, and what makes the STOPPED run below
+# prove that Stop is checked BEFORE the missing rule.
+mon() { code -X POST -H "Origin: $ORIGIN" "$BASE/api/monitoring/$1"; }
+is "Start with no deal rule is refused"       409 "$(mon start)"
+has "  ...as MONITORING_NOT_READY"             '"code":"MONITORING_NOT_READY"' "$(body)"
+is "  ...and the row is untouched"            1 "$(val 'SELECT enabled FROM monitoring_state WHERE id = 1')"
+is "Stop is accepted"                         200 "$(mon stop)"
+has "  ...answering stopped"                  '"state":"stopped"' "$(body)"
+is "  ...and the row reached D1"              0 "$(val 'SELECT enabled FROM monitoring_state WHERE id = 1')"
+is "the collector's watch list still answers" 200 "$(wt -H "X-Collector-Token: $COLLECTOR_TOKEN")"
+has "  ...with no targets, and saying why"    '"targets":[],"monitoring":"stopped"' "$(body)"
+# THE HEALTH ROW IS SET TO A SENTINEL FIRST: a stopped run must not post health, and "reported_at is
+# unchanged" is only measurable against a value no real report can write.
+ingest_tables
+sql "UPDATE collector_health SET reported_at = 1 WHERE id = 1" >/dev/null
+collect
+is "a stopped collector run exits 0"          0 "$COLLECTOR_EXIT"
+has "  ...logging kind:stopped"               '"kind":"stopped"' "$(cat /tmp/e2e-collector.out)"
+is "  ...searching nothing"                   0 "$(val 'SELECT COUNT(*) FROM listings')"
+is "  ...and posting no health report"        1 "$(val 'SELECT reported_at FROM collector_health WHERE id = 1')"
+is "/api/status answers"                      200 "$(code -H "Origin: $ORIGIN" "$BASE/api/status")"
+has "  ...reading stopped"                    '"status":"stopped"' "$(body)"
+has "  ...with no causes"                     '"causes":[]' "$(body)"
+sql "DELETE FROM monitor_runs" >/dev/null; sql "DELETE FROM monitor_lock" >/dev/null
+fire '*/30 * * * *'
+until_val 'SELECT COUNT(*) FROM monitor_runs' 1
+is "a monitoring run records STOPPED"         STOPPED "$(val 'SELECT status FROM monitor_runs ORDER BY run_seq DESC LIMIT 1')"
+# DISCOUNT, NOT MAXIMUM_PRICE: see the CA$0 note at the top of the collector section. Both tables
+# are cleared first, as the settings section does -- the NO_SETTINGS control deleted only the
+# pointer, and a first save over old revisions collides on revision 0.
+sql "DELETE FROM search_settings; DELETE FROM search_revisions;" >/dev/null
+is "a DISCOUNT rule is saved"                 200 "$(put '{"mode":"DISCOUNT","minimumDiscountPercent":20,"maximumPriceCents":null}')"
+is "Start is accepted now"                    200 "$(mon start)"
+has "  ...answering running"                  '"state":"running"' "$(body)"
+ingest_tables
+collect
+is "the started collector run exits 0"        0 "$COLLECTOR_EXIT"
+has "  ...for its one target"                 '"targets":1,"complete":true,"exitCode":0' "$(cat /tmp/e2e-collector.out)"
+atleast "  ...and listings reached D1 again"  1 "$(val 'SELECT COUNT(*) FROM listings')"
+is "/api/status answers again"                200 "$(code -H "Origin: $ORIGIN" "$BASE/api/status")"
+has "  ...with monitoring running"            '"monitoring":{"state":"running"' "$(body)"
+is "  ...and no longer stopped"               0 "$(grep -c '"status":"stopped"' /tmp/e2e.body)"
 
 echo "== Discord notifications: inert by default, then on against a local stub =="
 # PHASE 4. A fake Discord (scripts/e2e-discord-stub.mjs) on 127.0.0.1:$STUB_PORT records every

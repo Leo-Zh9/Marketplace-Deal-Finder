@@ -104,13 +104,16 @@ They are granted **per path**, from one table in `worker/index.ts`:
 | `/api/settings` | `GET`, `PUT` | `GET, PUT, OPTIONS` | `Authorization, Accept, Content-Type` |
 | `/api/verdicts` | `GET` | `GET, OPTIONS` | `Authorization, Accept` |
 | `/api/watch` | `GET`, `PUT` | `GET, PUT, OPTIONS` | `Authorization, Accept, Content-Type` |
+| `/api/monitoring/start` | `POST` | `POST, OPTIONS` | `Authorization, Accept, Content-Type` |
+| `/api/monitoring/stop` | `POST` | `POST, OPTIONS` | `Authorization, Accept, Content-Type` |
 
 `Content-Type` is offered to a path **if and only if that path declares a body-bearing method**
 (`PUT`/`POST`/`PATCH`) — not "if it has more than one method". The table's rows cannot tell those
-two rules apart: there are now **two** write rows (`/api/settings` and `/api/watch`) and three
-read-only ones, and both candidate rules still agree on every one of them. (An earlier version of
+two rules apart: there are now **four** write rows (`/api/settings`, `/api/watch` and the two
+`/api/monitoring/*` rows) and three read-only ones, and both candidate rules still agree on every one of them. (An earlier version of
 this paragraph said "every row but `/api/settings` is read-only", which the control-panel slice made
-false.) So `preflightHeadersFor` is exported and tested directly over method sets the table does not
+false.) The two Start/Stop rows are single-method `POST` and are offered `Content-Type` although
+neither route reads a body: the rule follows the method, not the handler. So `preflightHeadersFor` is exported and tested directly over method sets the table does not
 contain (`["GET","HEAD"]`, `["GET","OPTIONS"]`, `["POST"]`, …).
 
 `/api/verdicts` was added by the read-path slice and `/api/watch` by the control-panel slice; both

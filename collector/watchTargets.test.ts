@@ -47,6 +47,8 @@ describe("reading the watch list from the Worker", () => {
       ok: true,
       market: body.market,
       targets: body.targets,
+      // ABSENT ON THE WIRE (a Worker older than Start/Stop) IS RUNNING.
+      monitoring: "running",
     });
 
     expect(calls).toHaveLength(1);
@@ -248,6 +250,49 @@ describe("reading the watch list from the Worker", () => {
       ok: true,
       market: null,
       targets: [],
+      monitoring: "running",
+    });
+  });
+
+  /**
+   * C-m1: THE STOP WORD IS PASSED THROUGH, BOTH WORDS. Kills: dropping the field (the collector
+   * then sees an empty list and exits 2 with degraded health every 30 minutes of a Stop).
+   */
+  it.each<["running" | "stopped", unknown[]]>([
+    ["stopped", []],
+    ["running", body.targets],
+  ])("C-m1: monitoring:%s on the wire is passed through", async (word, targets) => {
+    const fake = (async () =>
+      jsonResponse(200, { market: body.market, targets, monitoring: word })) as unknown as typeof fetch;
+
+    await expect(fetchWatchTargets({ apiBase, token }, fake)).resolves.toEqual({
+      ok: true,
+      market: body.market,
+      targets,
+      monitoring: word,
+    });
+  });
+
+  /**
+   * C-m2: ANY OTHER WORD IS A CONTRACT ERROR, NOT A GUESS. Reading "paused" as running collects
+   * through a Stop; reading it as stopped stops silently. Kills: defaulting unknown words to
+   * either.
+   */
+  it.each<[string, unknown]>([
+    ["an unknown word", "paused"],
+    ["a boolean", false],
+    ["null", null],
+    ["a cased spelling", "Stopped"],
+  ])("C-m2: monitoring as %s is bad-shape", async (_label, monitoring) => {
+    const fake = (async () =>
+      jsonResponse(200, { market: body.market, targets: [], monitoring })) as unknown as typeof fetch;
+
+    await expect(fetchWatchTargets({ apiBase, token }, fake)).resolves.toEqual({
+      ok: false,
+      status: 200,
+      code: null,
+      reason: "bad-shape",
+      retryable: false,
     });
   });
 
