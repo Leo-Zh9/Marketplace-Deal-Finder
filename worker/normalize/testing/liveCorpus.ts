@@ -72,7 +72,7 @@ export const LIVE_CORPUS: readonly LiveCorpusEntry[] = [
   { title: "Timetec 8GB DDR3L 1600MHz Laptop RAM Module", priceText: "CA$15", searchedAs: ["cpu"], label: notComponent("laptop memory, not a desktop part") },
   { title: "Gaming PC – GTX 1080 Ti 11GB | 16GB RAM", priceText: "CA$650", searchedAs: ["cpu"], label: notComponent("a whole machine") },
   { title: "Full set or individual part", priceText: "CA$450", searchedAs: ["cpu"], label: notComponent("the title does not say what it is") },
-  { title: "DeepCool Tesseract Mid-Tower ATX PC Case (No Side Panels / Open-Air Test Bench) – Downsview", priceText: "CA$10", searchedAs: ["cpu"], label: uncatalogued("case") },
+  { title: "DeepCool Tesseract Mid-Tower ATX PC Case (No Side Panels / Open-Air Test Bench)", priceText: "CA$10", searchedAs: ["cpu"], label: uncatalogued("case") },
   { title: "Dell OptiPlex 5060 SFF PCs (2 Available) - Intel Core i7-8700 / 16GB RAM / 256GB SSD / Windows 11", priceText: "CA$190", searchedAs: ["cpu"], label: notComponent("a whole machine") },
   { title: "ASUS Motherboard CPU Combo with case included", priceText: "CA$80", searchedAs: ["cpu"], label: notComponent("a bundle of parts") },
   { title: "G.SKILL Ripjaws V 16GB (2x8GB) DDR4-3600 RAM", priceText: "CA$150", searchedAs: ["cpu"], label: component("ram", "G.Skill Ripjaws V 16GB DDR4") },
