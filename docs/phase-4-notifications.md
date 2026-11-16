@@ -130,6 +130,8 @@ re-check uses word for word):
   still re-arms. A `first_seen_at` gate was measured to break that path (mutation R6 turns N8 red).
   A settings change re-judges every task, so deals under a new rule do alert. The cost: a row
   cancelled as stale or un-watched does not re-arm once its judgment is more than a day old. The
+  same holds for a DEAL judged while its type was not watched: if the user starts watching that
+  type more than a day later, it never alerts, which matches "new deals from now on". The
   re-check does not apply this gate, so a row that waits longer than a day (for example, during a
   webhook outage) is still sent (N7d).
 - No non-CANCELLED row exists for that listing. The `NOT EXISTS` runs before `LIMIT 20`, so already
@@ -300,8 +302,9 @@ The dashboard's Collection panel should then read **"Discord alerts: off (webhoo
 
 1. **Preview what the first runs would send.** This query is read-only. It is the enqueue predicate
    with the watch-list selection left out, so the count is an upper bound. `25200` is
-   `NOTIFY_FRESH_SECONDS` and `86400` is `NOTIFY_RECENT_EVALUATION_SECONDS`. Run it in
-   `/Users/leozhang/Marketplace-Deal-Finder`:
+   `NOTIFY_FRESH_SECONDS` and `86400` is `NOTIFY_RECENT_EVALUATION_SECONDS`. It reads the
+   `notifications` table, so it fails with "no such table" until migration 0007 is applied. Run it
+   in `/Users/leozhang/Marketplace-Deal-Finder`:
 
    ```sh
    npx wrangler d1 execute marketplace-deal-finder-db --remote --command "SELECT COUNT(*) AS would_enqueue FROM listings l JOIN evaluation_tasks t ON t.source = l.source AND t.listing_id = l.listing_id JOIN search_settings ss ON ss.id = 1 WHERE l.validity = 'VALID' AND l.model_key IS NOT NULL AND t.status = 'COMPLETE' AND t.verdict = 'DEAL' AND t.evaluated_revision = ss.current_revision AND l.last_seen_at >= CAST(strftime('%s','now') AS INTEGER) - 25200 AND t.evaluated_at >= CAST(strftime('%s','now') AS INTEGER) - 86400 AND NOT EXISTS (SELECT 1 FROM notifications n WHERE n.source = l.source AND n.listing_id = l.listing_id AND n.status <> 'CANCELLED')"
