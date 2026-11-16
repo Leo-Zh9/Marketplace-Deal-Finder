@@ -11,6 +11,7 @@ import type {
   ComponentType,
   DealRule,
   Listing,
+  NotificationsStatus,
   PreviewResult,
   SearchSettings,
 } from "../types";
@@ -42,6 +43,43 @@ const isCollectionStatus = (body: unknown): body is CollectionStatus => {
   if (typeof fields.collector !== "object" || fields.collector === undefined) return false;
   const collector = fields.collector as Record<string, unknown>;
   return typeof collector.canary === "boolean" && typeof collector.targets === "number";
+};
+
+const COUNT_FIELDS = ["pending", "sent24h", "deliveryUnknown", "failed"] as const;
+
+const isCount = (value: unknown): value is number =>
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+
+/**
+ * `notifications` IS CHECKED SEPARATELY FROM THE REST OF THE BODY, AND A BAD ONE IS NOT A FAILED
+ * POLL. It is one line of the panel, so it must not be able to cost the whole panel -- #20's F1
+ * lesson, one level down. The three inert states carry nothing else worth checking. `on` and
+ * `webhook-rejected` must carry ALL the counts or (for `on` only, the Worker's answer when its
+ * table read fails) NONE: a half-present set would render a number the Worker did not send.
+ */
+const isNotificationsStatus = (value: unknown): value is NotificationsStatus => {
+  if (typeof value !== "object" || value === null) return false;
+  const fields = value as Record<string, unknown>;
+  if (fields.state === "unconfigured" || fields.state === "invalid-url" || fields.state === "off") {
+    return true;
+  }
+  if (fields.state !== "on" && fields.state !== "webhook-rejected") return false;
+  if (![...COUNT_FIELDS, "lastSentAt"].some((field) => field in fields)) return fields.state === "on";
+  return (
+    COUNT_FIELDS.every((field) => isCount(fields[field])) &&
+    (fields.lastSentAt === null || isCount(fields.lastSentAt))
+  );
+};
+
+/**
+ * ABSENT STAYS ABSENT: an API Worker older than the notifications backend sends no field, and the
+ * page renders as it did before it existed. PRESENT AND MALFORMED becomes `{state: "unreadable"}`,
+ * which the panel names in words. Valid passes through untouched.
+ */
+const withCheckedNotifications = (status: CollectionStatus): CollectionStatus => {
+  if (status.notifications === undefined) return status;
+  if (isNotificationsStatus(status.notifications)) return status;
+  return { ...status, notifications: { state: "unreadable" } };
 };
 
 /** `search_revisions`' three columns, which are exactly `PUT /api/settings`' ACCEPTED_FIELDS. */
@@ -204,6 +242,6 @@ export const marketplaceClient: MarketplaceClient = {
     if (!isCollectionStatus(body)) {
       throw new ApiRequestError("The collector's status came back in a shape this page cannot read.", "unexpected");
     }
-    return body;
+    return withCheckedNotifications(body);
   },
 };

@@ -1082,6 +1082,79 @@ describe("the control panel", () => {
   });
 
   /**
+   * A-n1: THE EXACT `/api/status` BODY AN API WORKER OLDER THAN THE NOTIFICATIONS BACKEND SENDS
+   * -- master's `{...health, authentication}`, no `notifications` key -- RENDERS AS IT DID. A
+   * rollback can leave the API older than the page. The mutation is treating the absent field as
+   * malformed: every such page would then read "Discord alerts: status unreadable".
+   */
+  it("A-n1: the pre-notifications Worker's status body renders no alert line", async () => {
+    stubWire({
+      watch: LIVE_WATCH,
+      settings: null,
+      statusRaw: {
+        status: "ok",
+        causes: [],
+        reportedAt: 1_800_000_000,
+        ageMinutes: 12,
+        collector: {
+          exitCode: 0,
+          complete: true,
+          canary: false,
+          dryRun: false,
+          fixture: false,
+          targets: 9,
+          alarms: [],
+        },
+        authentication: "firebase-google",
+      },
+    });
+    render(<App getToken={noToken} />);
+    await waitForLoad("9 of 9 searches used");
+
+    expect(await screen.findByText("Collecting")).toBeInTheDocument();
+    expect(screen.queryByText(/Discord alerts/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save searches" })).toBeEnabled();
+  });
+
+  /**
+   * A-n2: A MALFORMED `notifications` COSTS THE ALERT LINE AND NOTHING ELSE, through the real
+   * client. The mutation is folding the field into `isCollectionStatus`, whose failure shape is
+   * the whole panel reading "could not be read" over a healthy collector.
+   */
+  it("A-n2: a malformed notifications field reads as unreadable, and the panel still renders", async () => {
+    stubWire({
+      watch: LIVE_WATCH,
+      settings: null,
+      statusRaw: { ...HEALTHY_STATUS, notifications: { state: "on", sent24h: "lots" } },
+    });
+    render(<App getToken={noToken} />);
+    await waitForLoad("9 of 9 searches used");
+
+    expect(await screen.findByText("Discord alerts: status unreadable")).toBeInTheDocument();
+    expect(screen.getByText("Collecting")).toBeInTheDocument();
+    expect(screen.queryByText(/status could not be read/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  /** A-n3: THE LINK. A real `on` body reaches the page with its counts. */
+  it("A-n3: an on body reaches the page with its counts", async () => {
+    stubWire({
+      watch: LIVE_WATCH,
+      settings: null,
+      statusRaw: {
+        ...HEALTHY_STATUS,
+        notifications: { state: "on", pending: 0, sent24h: 5, deliveryUnknown: 0, failed: 0, lastSentAt: 1_799_999_000 },
+      },
+    });
+    render(<App getToken={noToken} />);
+    await waitForLoad("9 of 9 searches used");
+
+    expect(
+      await screen.findByText("Discord alerts: on, 5 sent in the last 24 hours, 0 delivery unknown"),
+    ).toBeInTheDocument();
+  });
+
+  /**
    * A-5: THE PAGE POLLS, AND A STATE CHANGE WHILE THE TAB IS OPEN REACHES THE BADGE.
    *
    * THE MUTATION IS DELETING THE `setInterval` -- i.e. the shipped one-shot read -- and the

@@ -504,3 +504,74 @@ describe("the kept searches", () => {
     });
   });
 });
+
+/**
+ * `notifications` (worker/notify/status.ts), checked on its own. A bad value costs the alert line,
+ * never the poll: `getStatus` still resolves, so the rest of the panel renders.
+ */
+describe("the notifications field of /api/status", () => {
+  const BODY = {
+    status: "ok",
+    causes: [],
+    reportedAt: 1_800_000_000,
+    ageMinutes: 3,
+    collector: null,
+    authentication: "firebase-google",
+  };
+  const COUNTS = { pending: 0, sent24h: 3, deliveryUnknown: 1, failed: 0, lastSentAt: 1_799_990_000 };
+
+  /** C-n1: every shape the Worker really sends passes through untouched. */
+  it.each<[string, unknown]>([
+    ["unconfigured", { state: "unconfigured" }],
+    ["invalid-url", { state: "invalid-url" }],
+    ["off", { state: "off" }],
+    ["on with counts", { state: "on", ...COUNTS }],
+    ["on with nothing sent yet", { state: "on", ...COUNTS, sent24h: 0, lastSentAt: null }],
+    ["webhook-rejected with counts", { state: "webhook-rejected", ...COUNTS }],
+    // The Worker's answer when its table read fails. The mutation is requiring counts for `on`.
+    ["on without counts", { state: "on" }],
+  ])("C-n1: passes %s through unchanged", async (_label, notifications) => {
+    stubJson({ ...BODY, notifications });
+
+    expect(await marketplaceClient.getStatus(noToken)).toEqual({ ...BODY, notifications });
+  });
+
+  /**
+   * C-n2: THE EXACT BODY AN API WORKER OLDER THAN #27 SENDS -- no `notifications` key at all --
+   * comes back with no key, not with an invented state. The mutation is treating absent as
+   * malformed, which would put "status unreadable" on every page served by an older Worker.
+   */
+  it("C-n2: an older Worker's body comes back with no notifications key", async () => {
+    stubJson(BODY);
+
+    const status = await marketplaceClient.getStatus(noToken);
+
+    expect(status).toEqual(BODY);
+    expect("notifications" in status).toBe(false);
+  });
+
+  /**
+   * C-n3: A PRESENT BUT MALFORMED FIELD IS `unreadable`, AND THE POLL STILL SUCCEEDS. The two
+   * mutations are returning the field unchecked (the panel would print a number the Worker never
+   * sent, or nothing at all) and folding the check into `isCollectionStatus` (a bad alert field
+   * would blank the whole panel to "could not be read" -- #20's F1 one level down).
+   */
+  it.each<[string, unknown]>([
+    ["null", null],
+    ["a number", 42],
+    ["an unknown state", { state: "maybe" }],
+    ["no state", { sent24h: 3 }],
+    ["a count that is a string", { state: "on", ...COUNTS, sent24h: "3" }],
+    ["a negative count", { state: "on", ...COUNTS, deliveryUnknown: -1 }],
+    ["a fractional count", { state: "on", ...COUNTS, failed: 0.5 }],
+    ["half the counts", { state: "on", sent24h: 3, deliveryUnknown: 1 }],
+    ["a lastSentAt that is a string", { state: "on", ...COUNTS, lastSentAt: "yesterday" }],
+    ["a rejected webhook without its counts", { state: "webhook-rejected" }],
+  ])("C-n3: reads %s as unreadable without failing the poll", async (_label, notifications) => {
+    stubJson({ ...BODY, notifications });
+
+    const status = await marketplaceClient.getStatus(noToken);
+
+    expect(status).toEqual({ ...BODY, notifications: { state: "unreadable" } });
+  });
+});

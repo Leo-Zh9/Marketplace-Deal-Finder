@@ -1448,6 +1448,14 @@ input[aria-invalid="true"] {
   line-height: 1.5;
 }
 
+/* The Discord alert line reads like the timestamp: muted, small, one sentence. No new colour --
+   a rejected webhook says what to do in words, as every cause above does. */
+.collection-alerts {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 0.76rem;
+}
+
 .collection-reduced {
   padding: 10px 12px;
   margin: 12px 0 0;
