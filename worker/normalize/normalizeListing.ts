@@ -23,6 +23,7 @@ import {
   matchCatalogModels,
   matchCatalogSpans,
   phraseSpans,
+  phraseTokens,
   tokenValues,
   tokenize,
   type Token,
@@ -496,7 +497,7 @@ const markerCoverage = (
   const covered = new Set<number>();
   const modelSpans = matchCatalogSpans(MODEL_INDEXES[declared], tokens);
   for (const phrase of MARKERS[declared]) {
-    for (const [from, to] of phraseSpans(values, tokenValues(tokenize(phrase)))) {
+    for (const [from, to] of phraseSpans(values, phraseTokens(phrase))) {
       const trailsAModel = modelSpans.some((span) => from >= span.end);
       for (let index = from; index < to; index += 1) {
         if (COVERED_ONLY_WHEN_TRAILING.has(values[index]) && !trailsAModel) continue;

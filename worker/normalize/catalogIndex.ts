@@ -103,7 +103,24 @@ export const phraseSpans = (
  * punctuation inside a phrase carry no meaning: `"i 9"`, `"i9"` and `"i-9"` are one phrase.
  */
 export const containsPhrase = (values: readonly string[], phrase: string): boolean =>
-  phraseSpans(values, tokenValues(tokenize(phrase))).length > 0;
+  phraseSpans(values, phraseTokens(phrase)).length > 0;
+
+const PHRASE_TOKENS = new Map<string, readonly string[]>();
+
+/**
+ * A vocabulary phrase's token values, tokenized ONCE per isolate. The vocabularies are fixed
+ * module constants, so this cache is bounded by their size (~150 phrases); a phrase used to be
+ * re-tokenized on every check of every listing -- about a hundred times per title. Pure
+ * performance: the tokens are exactly `tokenValues(tokenize(phrase))`, by construction.
+ */
+export const phraseTokens = (phrase: string): readonly string[] => {
+  let cached = PHRASE_TOKENS.get(phrase);
+  if (cached === undefined) {
+    cached = tokenValues(tokenize(phrase));
+    PHRASE_TOKENS.set(phrase, cached);
+  }
+  return cached;
+};
 
 /**
  * Vendor prefixes a seller drops freely: `"RTX 5080"` is the same card as `"GeForce RTX 5080"`.
