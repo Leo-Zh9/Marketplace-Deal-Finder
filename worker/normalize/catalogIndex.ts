@@ -385,9 +385,11 @@ const walkFrom = (
 
   while (position < tokens.length) {
     let next = node.children.get(tokens[position].value);
-    // The `gb` test is the cheap first term of `kitSpecLength`, hoisted: this branch runs on the
-    // last step of EVERY walk, and almost none of them follow a capacity.
-    if (next === undefined && tokens[position - 1]?.value === "gb") {
+    // A PERFORMANCE TEST, NOT A CORRECTNESS ONE, and behaviourally inert (`kitSpecLength` refuses
+    // the same cases): this branch runs on the last step of EVERY walk -- nine indexes x every
+    // start position -- and nearly all of them end at the root, where no capacity was walked.
+    // MEASURED on T40c-r's batch: without it the rule cost ~0.28 ms more per 100 listings.
+    if (next === undefined && node !== index && tokens[position - 1].value === "gb") {
       // A skip that leads nowhere leaves `position` past the last complete name, so G1 refuses:
       // `"GeForce RTX 5060 Ti 16GB (2x8GB)"` is a miss. Only a name that ENDS at its capacity can
       // reach that, no such title is a kit, and a miss is safe -- so there is no guard for it.
