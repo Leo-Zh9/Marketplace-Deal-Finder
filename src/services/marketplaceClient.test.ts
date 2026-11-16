@@ -493,6 +493,8 @@ describe("the kept searches", () => {
     ["the old stub body", { status: "ok", phase: 2, authentication: "firebase-google" }],
     ["an unknown status word", { status: "fine", causes: [], reportedAt: 0, ageMinutes: 0, collector: null }],
     ["a collector without its counts", { status: "ok", causes: [], reportedAt: 0, ageMinutes: 0, collector: {} }],
+    // EVERY OTHER FIELD VALID, so the `causes` check is the only thing that can refuse it.
+    ["a body with no causes", { status: "ok", reportedAt: 0, ageMinutes: 0, collector: null }],
   ])("refuses %s as unreadable", async (_label, body) => {
     stubJson(body);
 
