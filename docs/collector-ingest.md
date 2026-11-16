@@ -614,11 +614,15 @@ live 5080 is CA$3,000. Any threshold would be a fabricated number.
   3.38–3.73 ms, three runs each, with the two Part 2 match rules in place. Under the whole
   parallel suite the same tests had read 6.3–7.1 ms p95 before it.
   **PR 2.3 runs the accessory scan on every listing, not only a resolving one**, so `T40c` (a
-  batch that does not resolve) now pays it too; the `for <model>` check reuses the span walk the
-  evidence scan already makes, so it costs no extra walk. The file alone, three runs each, same
-  machine: before, at load average 10.0–10.4, `T40c` p95 2.78–3.04 ms and `T40c-r` p95
-  3.39–3.49 ms; after, at load average 9.1–9.4, `T40c` p95 3.26–3.47 ms and `T40c-r` p95
-  3.14–3.28 ms. Inside the 7 ms working ceiling, the 8 ms budget and the Workers Free 10 ms limit.
+  batch that does not resolve) now pays it too. Written as a span scan per phrase it cost about
+  +0.4 ms p50 per 100 listings; it is now one allocation-free pass over the title against the
+  phrases indexed by first token, and the `for <model>` check reuses the span walk the evidence
+  scan already makes. Interleaved with master, the file alone, three runs each, load average
+  6.6–7.0: master `T40c` p95 2.83–3.29 ms and `T40c-r` p95 3.28–3.75 ms; PR 2.3 `T40c` p95
+  2.85–3.09 ms and `T40c-r` p95 2.53–2.67 ms. Inside the 7 ms working ceiling, the 8 ms budget
+  and the Workers Free 10 ms limit. **Do not `Object.freeze` the phrase cache**: measured, it
+  took `T40c` to p50 ~4.0 ms file-alone and past 8 ms p95 under the full parallel suite (see
+  `phraseTokens`).
 
 ### The residuals, named — and the corpora they are measured from
 
