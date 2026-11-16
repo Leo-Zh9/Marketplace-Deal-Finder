@@ -121,9 +121,10 @@ describe("live corpus -- the floor (recall), pinned on master 404677e and raised
 
   /**
    * 9 of 13 ON MASTER 404677e. PART 2 RAISES IT ONE RULE AT A TIME, each move deliberate:
-   * +1 the inner `MAG` sub-brand (`MSI B850 Tomahawk ...`).
+   * +1 the inner `MAG` sub-brand (`MSI B850 Tomahawk ...`), +1 the two-module kit-spec skip
+   * (`G.SKILL Ripjaws V 16GB (2x8GB) ...`).
    */
-  it("counts: 36 standalone components, 13 of them catalogued, 10 of 13 keyed under every search", () => {
+  it("counts: 36 standalone components, 13 of them catalogued, 11 of 13 keyed under every search", () => {
     expect({
       titles: LIVE_CORPUS.length,
       standaloneComponents: components.length,
@@ -135,8 +136,8 @@ describe("live corpus -- the floor (recall), pinned on master 404677e and raised
       titles: 141,
       standaloneComponents: 36,
       catalogued: 13,
-      recalledUnderEverySearch: 10,
-      keyedUnderSomeSearch: 10,
+      recalledUnderEverySearch: 11,
+      keyedUnderSomeSearch: 11,
     });
   });
 
@@ -144,7 +145,7 @@ describe("live corpus -- the floor (recall), pinned on master 404677e and raised
    * THE MISSES, BY TITLE, WITH WHAT EACH ONE NEEDS. This list is the recall work queue; a
    * change that closes one moves it here on purpose.
    */
-  it("misses exactly these three catalogued titles", () => {
+  it("misses exactly these two catalogued titles", () => {
     expect(
       catalogued
         .filter((entry) => !recalledEverywhere.includes(entry))
@@ -154,8 +155,6 @@ describe("live corpus -- the floor (recall), pinned on master 404677e and raised
       [
         // No `gtx`: series words are not droppable, so `1050 ti` alone is not the catalog name.
         "1050TI GPU",
-        // The kit spec `(2x8GB)` sits between `16GB` and `DDR4`, so the name is not contiguous.
-        "G.SKILL Ripjaws V 16GB (2x8GB) DDR4-3600 RAM",
         // The seller wrote RTX for a GTX card; the series word is not droppable, by design.
         "Gigabyte GeForce RTX 1650 4GB",
       ].sort(),

@@ -203,6 +203,36 @@ describe("catalog index -- every vocabulary element, one at a time", () => {
   });
 
   /**
+   * T14c. THE KIT-SPEC SKIP, both directions. Only a two-module kit whose modules multiply out to
+   * the named capacity is stepped over; a four-module kit is a different pool and stays a miss.
+   * The count map is the evidence that the skip can only ever fire inside a RAM name: it is the
+   * number of catalog names, per type, that CONTINUE after a `<digits> gb` capacity.
+   */
+  it("T14c: a 2-module kit spec after the capacity is skipped, and nothing else is", () => {
+    const continuesAfterGb: Partial<Record<Listing["componentType"], number>> = {};
+    for (const componentType of WORKER_TYPES) {
+      for (const model of catalogModels(componentType)) {
+        const values = tokenValues(tokenize(model));
+        const continues = values.some(
+          (value, index) => value === "gb" && /^[0-9]+$/.test(values[index - 1] ?? "") && index < values.length - 1,
+        );
+        if (continues) continuesAfterGb[componentType] = (continuesAfterGb[componentType] ?? 0) + 1;
+      }
+    }
+    expect(continuesAfterGb).toEqual({ ram: 26 });
+
+    expect(match("ram", "G.SKILL Ripjaws V 16GB (2x8GB) DDR4-3600 RAM")).toBe("G.Skill Ripjaws V 16GB DDR4");
+    expect(match("ram", "Corsair Vengeance LPX 32GB 2x16GB DDR4")).toBe("Corsair Vengeance LPX 32GB DDR4");
+    // NOT SKIPPED: four modules (a different pool), and a spec that does not multiply out.
+    expect(match("ram", "Corsair Vengeance LPX 32GB (4x8GB) DDR4")).toBeNull();
+    expect(match("ram", "Corsair Vengeance RGB 64GB (4x16GB) DDR5")).toBeNull();
+    expect(match("ram", "Corsair Vengeance LPX 32GB (2x8GB) DDR4")).toBeNull();
+    expect(match("ram", "Corsair Vengeance LPX 32GB (2x32GB) DDR4")).toBeNull();
+    // The spec must sit right AFTER the capacity: a leading spec is not a spec of anything.
+    expect(match("ram", "Corsair Vengeance LPX (2x16GB) 32GB DDR4")).toBeNull();
+  });
+
+  /**
    * T20. SUFFIX_WORDS, element by element: each one, following an otherwise-complete model name,
    * must refuse the match. The control is what stops this being satisfiable by a matcher that
    * refuses EVERY trailing word.

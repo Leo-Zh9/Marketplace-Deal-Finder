@@ -120,6 +120,13 @@ const CASES: Case[] = [
   ["T44 (rule 7): a 2x16GB kit is ONE kit -- regression only", "Corsair Vengeance 32GB DDR5 (2x16GB)", 18900, "ram", "VALID", "Corsair Vengeance 32GB DDR5", "matched"],
   ["T45 (rule 7): 'SN850X 2TB' is a model, not a count -- regression only", "WD Black SN850X 2TB nvme ssd", 21900, "storage", "VALID", "WD Black SN850X 2TB", "matched"],
   ["T46 (rule 7): a LEADING kit spec is still one kit -- SOLE killer of the letter test", "2x16GB Corsair Vengeance 32GB DDR5", 19900, "ram", "VALID", "Corsair Vengeance 32GB DDR5", "matched"],
+  // The kit spec INSIDE the name (catalogIndex.ts `kitSpecLength`): stepped over for two modules
+  // that multiply out to the capacity, and for nothing else. The four-module rows are PINNED
+  // misses: a 4x8GB kit is a different pool from the 2x16GB kit the catalog name means.
+  ["KS1: live -- a 2x8GB spec between the capacity and DDR4", "G.SKILL Ripjaws V 16GB (2x8GB) DDR4-3600 RAM", 15100, "ram", "VALID", "G.Skill Ripjaws V 16GB DDR4", "matched"],
+  ["KS2: a 4x8GB kit under a 32GB name is not keyed", "Corsair Vengeance LPX 32GB (4x8GB) DDR4", 15300, "ram", "VALID", null, "model-unmatched"],
+  ["KS3: a 4x16GB kit under a 64GB name is not keyed", "Corsair Vengeance RGB 64GB (4x16GB) DDR5", 26900, "ram", "VALID", null, "model-unmatched"],
+  ["KS4: a spec that does not multiply out is not keyed", "Kingston Fury Beast 32GB (2x8GB) DDR4", 34900, "ram", "VALID", null, "model-unmatched"],
   // F2: the INFLATING direction -- N units at one price makes a genuine listing look like a deal.
   ["F2a (rule 7): the count word 'two'", "Two GeForce RTX 5080 cards", 403000, "gpu", "NEEDS_REVIEW", null, "unknown-quantity"],
   ["F2b (rule 7): a TRAILING multiplier", "GeForce RTX 5080 x2", 401000, "gpu", "NEEDS_REVIEW", null, "unknown-quantity"],

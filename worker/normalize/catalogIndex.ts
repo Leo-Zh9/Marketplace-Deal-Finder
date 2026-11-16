@@ -273,6 +273,51 @@ export interface ModelIndex {
   model: string | null;
 }
 
+const DIGITS = /^[0-9]+$/;
+
+/**
+ * A RAM KIT SPEC sitting between a catalog name's capacity and the rest of it:
+ * `"G.SKILL Ripjaws V 16GB (2x8GB) DDR4-3600 RAM"` is the live title, and the catalog name is
+ * `G.Skill Ripjaws V 16GB DDR4`. The parentheses are separators to the tokenizer, so the title
+ * reads `16 gb 2 x 8 gb ddr 4`, and without this the name is not contiguous and nothing matches.
+ *
+ * Returns 4 -- the tokens `N x M gb` to step over -- ONLY when the two tokens just walked are a
+ * capacity `C gb`, `N` is 2, and `N x M` equals `C`. Otherwise 0.
+ *
+ * N = 2 ONLY, AND THAT IS A POOL DECISION, NOT A TOKENIZER ONE. A four-module kit of the same total
+ * (`"Corsair Vengeance LPX 32GB (4x8GB) DDR4"`) is a different product from the two-module kit the
+ * catalog name means -- different board compatibility, different price -- so it stays unmatched.
+ * And a spec that does not multiply out (`16GB (2x16GB)`) is a title that contradicts itself, which
+ * is refused the same way. Both are misses, never wrong keys.
+ *
+ * IT IS NOT SCOPED TO THE RAM INDEX, AND THAT IS MEASURED RATHER THAN CARELESS. A skip can only
+ * produce a match when the catalog name CONTINUES after `C gb`, and today only the 26 RAM names
+ * do (every GPU and storage name with a GB capacity ENDS there), so a ram-only flag would be an
+ * equivalent mutant. T14c pins that count map per type, so the day a non-RAM name continues past a GB
+ * capacity, the scope question comes back to a human.
+ */
+const kitSpecLength = (tokens: readonly Token[], position: number, start: number): number => {
+  if (position - 2 < start) return 0;
+  const capacity = tokens[position - 2];
+  const unit = tokens[position - 1];
+  const count = tokens[position];
+  const times = tokens[position + 1];
+  const size = tokens[position + 2];
+  const sizeUnit = tokens[position + 3];
+  if (
+    unit.value !== "gb" ||
+    !DIGITS.test(capacity.value) ||
+    count?.value !== "2" ||
+    times?.value !== "x" ||
+    size === undefined ||
+    !DIGITS.test(size.value) ||
+    sizeUnit?.value !== "gb"
+  ) {
+    return 0;
+  }
+  return 2 * Number(size.value) === Number(capacity.value) ? 4 : 0;
+};
+
 /**
  * Insert each model's full token sequence plus every suffix obtained by dropping leading
  * OPTIONAL_LEADING tokens. MEASURED: 336 models produce 423 cores -- the names themselves plus
@@ -333,27 +378,35 @@ const walkFrom = (
   start: number,
 ): { model: string; depth: number } | null => {
   let node = index;
-  let depth = 0;
-  let terminalDepth = -1;
+  // `position` is the next TITLE token; it runs ahead of the trie depth only by a skipped kit spec.
+  let position = start;
+  let terminalEnd = -1;
   let terminalModel: string | null = null;
 
-  while (start + depth < tokens.length) {
-    const next = node.children.get(tokens[start + depth].value);
+  while (position < tokens.length) {
+    let next = node.children.get(tokens[position].value);
+    if (next === undefined) {
+      // A skip that leads nowhere leaves `position` past the last complete name, so G1 refuses:
+      // `"GeForce RTX 5060 Ti 16GB (2x8GB)"` is a miss. Only a name that ENDS at its capacity can
+      // reach that, no such title is a kit, and a miss is safe -- so there is no guard for it.
+      position += kitSpecLength(tokens, position, start);
+      next = position < tokens.length ? node.children.get(tokens[position].value) : undefined;
+    }
     if (next === undefined) break;
     node = next;
-    depth += 1;
+    position += 1;
     if (node.model !== null) {
-      terminalDepth = depth;
+      terminalEnd = position;
       terminalModel = node.model;
     }
   }
 
   if (terminalModel === null) return null;
-  if (terminalDepth < depth) return null;
-  if (!tokens[start + terminalDepth - 1].endsRun) return null;
-  const after = tokens[start + terminalDepth];
+  if (terminalEnd < position) return null;
+  if (!tokens[terminalEnd - 1].endsRun) return null;
+  const after = tokens[terminalEnd];
   if (after !== undefined && SUFFIX_WORDS.has(after.value)) return null;
-  return { model: terminalModel, depth: terminalDepth };
+  return { model: terminalModel, depth: terminalEnd - start };
 };
 
 /**
