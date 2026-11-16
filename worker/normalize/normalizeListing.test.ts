@@ -107,8 +107,12 @@ const CASES: Case[] = [
   ["T31 (rule 7): an explicit lot", "Lot of 3 RTX 5060 graphics cards", 120000, "gpu", "NEEDS_REVIEW", null, "unknown-quantity"],
   // `combo`: a board MODEL plus a CPU, no board MARKER, so rule 5 cannot see the board. Both were
   // VALID with the chip's key before `combo` joined MULTIPLE; the control below stays a CPU.
-  ["CB1 (rule 7): an Intel board-and-cpu combo", "MSI PRO Z690-A i7 12700K combo", 52100, "cpu", "NEEDS_REVIEW", null, "unknown-quantity"],
-  ["CB2 (rule 7): an AMD board-and-cpu combo", "ASUS TUF B650-Plus and Ryzen 7 7700X combo", 52300, "cpu", "NEEDS_REVIEW", null, "unknown-quantity"],
+  // CB1/CB2 NOW ANSWER AT RULE 5: their `Z690` and `B650` are chipsets, which evidence the board
+  // (CHIPSETS). CB1b/CB2b keep `combo` pinned with board names that carry no chipset.
+  ["CB1 (rule 5): an Intel board-and-cpu combo, board seen by its chipset", "MSI PRO Z690-A i7 12700K combo", 52100, "cpu", "INVALID_REFERENCE", null, "mixed-components"],
+  ["CB2 (rule 5): an AMD board-and-cpu combo, board seen by its chipset", "ASUS TUF B650-Plus and Ryzen 7 7700X combo", 52300, "cpu", "INVALID_REFERENCE", null, "mixed-components"],
+  ["CB1b (rule 7): an Intel board-and-cpu combo with no chipset named", "Gigabyte Aorus Elite i7 12700K combo", 52150, "cpu", "NEEDS_REVIEW", null, "unknown-quantity"],
+  ["CB2b (rule 7): an AMD board-and-cpu combo with no chipset named", "ASUS TUF Gaming Plus and Ryzen 7 7700X combo", 52350, "cpu", "NEEDS_REVIEW", null, "unknown-quantity"],
   ["CB-c: the same chip alone is still the chip", "i7 12700K", 52500, "cpu", "VALID", "Core i7-12700K", "matched"],
   ["T32 (rule 7): a numbered multi-pack", "Arctic P12 PWM PST 5 Pack", 3900, "case_fan", "NEEDS_REVIEW", null, "unknown-quantity"],
   ["T32b (rule 7): A FAN PACK REALLY IS A PACK", "Arctic P12 Max fan pack", 4900, "case_fan", "NEEDS_REVIEW", null, "unknown-quantity"],
@@ -357,6 +361,30 @@ const ACCESSORY_LIVE: Case[] = [
   ["AX-o live: an uncatalogued board sold open box", "ASUS PRIME Z270-A ATX Motherboard \u2013 New, Never Used, Open Box", 12500, "motherboard", "VALID", null, "model-unmatched"],
 ];
 
+/**
+ * THE PRODUCTION REPLAY, 1,408 STORED LISTINGS AT MASTER 907d3d8. It found two wrong keys and one
+ * fail-safe loss, and each row here is the listing's own title.
+ *
+ * RP-w: `"Buying RTX4090"` -- a wanted ad keyed as a VALID GeForce RTX 4090. `buying` is in WANTED
+ *       now. Under every search: it resolves to gpu and is refused there, never keyed.
+ * RP-b: `"X570 Aorus Master + Ryzen 9 5950x"` -- an uncatalogued board plus a CPU, keyed as a
+ *       VALID Ryzen 9 5950X at the bundle's price. The chipset now evidences the board.
+ * RP-s: Corsair's own RM1000x title, refused `accessory` for `"PCIe 5.1 Support"`. `support` is
+ *       out of ACCESSORY on this measurement, so the PSU keys again.
+ */
+const REPLAY_WANTED = "Buying RTX4090";
+const REPLAY_BUNDLE = "X570 Aorus Master + Ryzen 9 5950x";
+
+const REPLAY_FIXES: Case[] = [
+  ["RP-s: Corsair's official RM1000x title, `PCIe 5.1 Support`", "CORSAIR RM1000x Fully Modular Low-Noise ATX Power Supply \u2013 ATX 3.1 Compliant \u2013 PCIe 5.1 Support \u2013 Cy", 18700, "psu", "VALID", "Corsair RM1000x", "matched"],
+  // THE CONTROL FOR `buying`: bare `buy` is sale phrasing and is NOT a wanted word.
+  ["RP-w control: `buy now` is a sale", "Buy now GeForce RTX 5080 graphics card", 128700, "gpu", "VALID", "GeForce RTX 5080", "matched"],
+  // THE CONTROLS FOR CHIPSETS: each shares letters-and-digits with a chipset and must still key.
+  ["RP-b control: an Intel Arc B580 is a card, not a chipset", "Intel Arc B580 12GB", 33700, "gpu", "VALID", "Intel Arc B580", "matched"],
+  ["RP-b control: the NZXT H510 is a case, not a chipset", "NZXT H510 Elite case", 15750, "case", "VALID", "NZXT H510 Elite", "matched"],
+  ["RP-b control: a catalogued board names its chipset and still keys", "MSI MAG B850 Tomahawk MAX WiFi", 31700, "motherboard", "VALID", "MSI MAG B850 Tomahawk MAX WiFi", "matched"],
+];
+
 const assertCase = ([, title, priceCents, componentType, validity, modelKey, reason, resolved]: Case): void => {
   expect(normalizeListing({ title, priceCents, componentType })).toEqual({
     componentType: resolved ?? componentType,
@@ -386,6 +414,31 @@ describe("normalizeListing -- the classification rules", () => {
 
   it.each(ACCESSORY_LIVE)("%s", (...testCase) => {
     assertCase(testCase);
+  });
+
+  it.each(REPLAY_FIXES)("%s", (...testCase) => {
+    assertCase(testCase);
+  });
+
+  it.each(NINE_SEARCHES)("RP-w: the replay's wanted ad is refused under a %s search", (searched) => {
+    expect(normalizeListing({ title: REPLAY_WANTED, priceCents: 250000, componentType: searched })).toEqual({
+      componentType: "gpu",
+      modelKey: null,
+      variantKey: null,
+      validity: "INVALID_REFERENCE",
+      reason: "wanted-ad",
+    });
+  });
+
+  it.each(NINE_SEARCHES)("RP-b: the replay's board-and-cpu bundle is keyed under no search (%s)", (searched) => {
+    const result = normalizeListing({ title: REPLAY_BUNDLE, priceCents: 70000, componentType: searched });
+    expect(result).toEqual({
+      componentType: searched,
+      modelKey: null,
+      variantKey: null,
+      validity: "INVALID_REFERENCE",
+      reason: searched === "cpu" || searched === "motherboard" ? "mixed-components" : "wrong-component",
+    });
   });
 
   it.each(ACCESSORY_EVERYWHERE.flatMap(([name, title, priceCents]) =>
@@ -453,6 +506,9 @@ describe("normalizeListing -- every vocabulary element, one at a time", () => {
     ["looking for", "wanted-ad"],
     ["in search of", "wanted-ad"],
     ["iso", "wanted-ad"],
+    ["buying", "wanted-ad"],
+    ["looking to buy", "wanted-ad"],
+    ["we buy", "wanted-ad"],
     ["for trade", "trade-only"],
     ["trade only", "trade-only"],
     ["trade for", "trade-only"],
@@ -539,6 +595,17 @@ describe("normalizeListing -- every vocabulary element, one at a time", () => {
     ["cpu cooler", "cpu_cooler"], ["heatsink", "cpu_cooler"], ["aio cooler", "cpu_cooler"],
     ["air cooler", "cpu_cooler"], ["liquid cooler", "cpu_cooler"],
     ["motherboard", "motherboard"], ["mobo", "motherboard"], ["mainboard", "motherboard"],
+    // CHIPSETS, literal copy. `h510` is absent on purpose (the NZXT H510 case line), and so are
+    // `b570` / `b580` (Intel Arc cards) -- see CHIPSETS.
+    ["a320", "motherboard"], ["a520", "motherboard"], ["b350", "motherboard"], ["b450", "motherboard"],
+    ["b550", "motherboard"], ["b650", "motherboard"], ["b840", "motherboard"], ["b850", "motherboard"],
+    ["x370", "motherboard"], ["x470", "motherboard"], ["x570", "motherboard"], ["x670", "motherboard"],
+    ["x870", "motherboard"], ["h310", "motherboard"], ["h410", "motherboard"], ["h610", "motherboard"],
+    ["h770", "motherboard"], ["b360", "motherboard"], ["b460", "motherboard"], ["b560", "motherboard"],
+    ["b660", "motherboard"], ["b760", "motherboard"], ["b860", "motherboard"], ["z370", "motherboard"],
+    ["z390", "motherboard"], ["z490", "motherboard"], ["z590", "motherboard"], ["z690", "motherboard"],
+    ["z790", "motherboard"], ["z890", "motherboard"], ["h370", "motherboard"], ["h470", "motherboard"],
+    ["h570", "motherboard"], ["h670", "motherboard"],
     ["ddr 3", "ram"], ["ddr 4", "ram"], ["ddr 5", "ram"], ["dimm", "ram"], ["sodimm", "ram"],
     ["memory kit", "ram"],
     ["ssd", "storage"], ["hdd", "storage"], ["nvme", "storage"], ["hard drive", "storage"],
@@ -601,7 +668,6 @@ describe("normalizeListing -- every vocabulary element, one at a time", () => {
     ["cable"], ["cables"], ["adapter"], ["bracket"], ["waterblock"], ["water block"],
     ["backplate"], ["riser"], ["mount"], ["mounting"], ["shroud"], ["thermal pad"],
     ["thermal pads"], ["fan"], ["fans"], ["replacement"], ["box"], ["holder"], ["stand"],
-    ["support"],
   ].flatMap(([phrase]) => (["cpu", "gpu"] as const).map((searched) => [phrase, searched] as const)))(
     "T21f: %s is an accessory under a %s search",
     (phrase, searched) => {

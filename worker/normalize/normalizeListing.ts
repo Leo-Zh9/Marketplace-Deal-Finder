@@ -62,8 +62,25 @@ export interface Normalization {
   reason: NormalizationReason;
 }
 
-/** A listing offering to BUY, not to sell. Its price is a wish, not a market reference. */
-export const WANTED = ["wtb", "want to buy", "wanted", "looking for", "in search of", "iso"];
+/**
+ * A listing offering to BUY, not to sell. Its price is a wish, not a market reference.
+ *
+ * `buying`, `looking to buy` AND `we buy` CAME FROM THE PRODUCTION REPLAY: `"Buying RTX4090"` was
+ * keyed as a VALID GeForce RTX 4090 once the type resolution let a cpu search reach it, and
+ * `"WE BUY DDR4 & DDR5 RAM"` is a standing buyer ad. Bare `buy` is NOT here and must not be:
+ * `"buy now"` and `"buy it"` are sale phrasing.
+ */
+export const WANTED = [
+  "wtb",
+  "want to buy",
+  "wanted",
+  "looking for",
+  "in search of",
+  "iso",
+  "buying",
+  "looking to buy",
+  "we buy",
+];
 
 /** No money changes hands, so whatever number is attached is not a price. */
 export const TRADE = ["for trade", "trade only", "trade for", "will trade", "swap", "trading"];
@@ -299,6 +316,13 @@ export const MULTI_UNIT = new Set(["pack"]);
  *
  * `empty box` and `fan for` are NOT listed because `box` and `fan` cover them, and a phrase no
  * mutation can kill is deleted here, not kept.
+ *
+ * `support` WAS REMOVED ON THE PRODUCTION REPLAY, which is the measurement the exemption rule
+ * asks for. Over 1,408 stored listings it was the ONLY accessory word in three titles: two were
+ * real PSUs keyed today (Corsair's own `"RM1000x ... ATX 3.1 Compliant - PCIe 5.1 Support"` and
+ * the RM850x twin), and the third, a Jeep tailgate `"Power Lift Support"`, carries no key either
+ * way. No accessory was caught by `support` alone; `"GPU support bracket RTX 4090"` (AX-r) is
+ * still refused by `bracket`.
  */
 export const ACCESSORY = [
   "cable",
@@ -320,7 +344,6 @@ export const ACCESSORY = [
   "box",
   "holder",
   "stand",
-  "support",
 ];
 
 /**
@@ -464,6 +487,34 @@ export const multiplierSuffix = (tokens: readonly Token[]): boolean => {
   );
 };
 
+/**
+ * MOTHERBOARD CHIPSETS, AS MOTHERBOARD EVIDENCE. From the production replay: `"X570 Aorus Master +
+ * Ryzen 9 5950x"` names a board the catalog does not list, so only cpu was evidenced and the
+ * bundle resolved to a VALID Ryzen 9 5950X at a board-plus-CPU price -- the inflating direction.
+ * With the chipset as evidence the title evidences two types and rule 5 refuses it.
+ *
+ * AN EXPLICIT LIST, NOT A PATTERN. A chipset tokenizes as letter + digits (`X570` -> `x 570`,
+ * `x570-e` -> `x 570 e`), the same shape as half the catalog. MEASURED against all 336 catalog
+ * names of every type, and LEFT OUT on that measurement:
+ *   `H510`  -- the NZXT H510 case line (`NZXT H510`, `H510 Flow`, `H510 Elite`, `H510i`).
+ *   `B570`, `B580` -- Intel Arc graphics cards, not chipsets; never on this list.
+ * The `E` variants (`B650E`, `X670E`, `X870E`) are NOT listed: `b 650` already matches inside
+ * `b 650 e`, so an `E` entry could never change a result, and this file deletes what no mutation
+ * can kill. Corsair's `H100i` / `H150i` coolers share no sequence with any entry.
+ *
+ * THE COST, NAMED: a catalogued CPU whose title states compatibility (`"Ryzen 7 7800X3D, works
+ * with B650"`) now evidences a board and is refused `mixed-components`. A lost reference, never
+ * a wrong one.
+ */
+export const CHIPSETS = [
+  // AMD
+  "a320", "a520", "b350", "b450", "b550", "b650", "b840", "b850",
+  "x370", "x470", "x570", "x670", "x870",
+  // Intel
+  "h310", "h410", "h610", "h770", "b360", "b460", "b560", "b660", "b760", "b860",
+  "z370", "z390", "z490", "z590", "z690", "z790", "z890", "h370", "h470", "h570", "h670",
+];
+
 export const MARKERS: Record<Listing["componentType"], readonly string[]> = {
   cpu: [
     // Covers the whole-unit token `desktop` for a cpu listing; see WHOLE_UNIT.
@@ -481,7 +532,7 @@ export const MARKERS: Record<Listing["componentType"], readonly string[]> = {
     "athlon",
   ],
   cpu_cooler: ["cpu cooler", "heatsink", "aio cooler", "air cooler", "liquid cooler"],
-  motherboard: ["motherboard", "mobo", "mainboard"],
+  motherboard: ["motherboard", "mobo", "mainboard", ...CHIPSETS],
   // `desktop memory` covers the whole-unit token `desktop` for a ram listing; see WHOLE_UNIT.
   ram: ["ddr 3", "ddr 4", "ddr 5", "dimm", "sodimm", "memory kit", "desktop memory"],
   storage: ["ssd", "hdd", "nvme", "hard drive", "m 2 drive", "solid state"],
