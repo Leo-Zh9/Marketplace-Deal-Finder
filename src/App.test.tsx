@@ -1195,6 +1195,11 @@ describe("the control panel", () => {
    * THE MUTATION IS MOVING THE STAMP BACK AFTER THE AWAIT. Every `/api/status` response here
    * takes ten minutes of (fake) time, so the server's 12 minutes plus the ten in flight is 22 --
    * and under the mutation it renders 12.
+   *
+   * THE TEN MINUTES IS A MAGNIFIER, NOT A LIVE SCENARIO. vitest's fake timers do not drive
+   * `AbortSignal.timeout` (measured: still not aborted after 11 fake minutes), so this read never
+   * meets the shipped 60 s timeout. In production a ten-minute read aborts, and the error the
+   * stamp prevents is under 60 s: at most one displayed minute.
    */
   it("A-8: ten minutes in flight shows 22 minutes, not 12", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });

@@ -443,7 +443,9 @@ export const maxPairOverlap = (ran: readonly TargetRun[]): PairOverlap | null =>
       // never be re-measured clean: a permanent 78 % cut explained to the operator as a generic
       // feed. The real fault is two watch rows that should be one, and nothing here can say so.
       // `""` is excluded because an unvalidated row has no query to compare and two broken rows
-      // are not the same search. NORMALISED, not byte-compared -- see `searchText`.
+      // are not the same search. Belt-and-braces: `runTargets` cannot reach it, because an
+      // unvalidated target has no ids (skipped below) and `parseTarget` rejects an empty query.
+      // NORMALISED, not byte-compared -- see `searchText`.
       const leftQuery = searchText(a.query);
       if (leftQuery !== "" && leftQuery === searchText(b.query)) continue;
       const left = new Set(a.ids);

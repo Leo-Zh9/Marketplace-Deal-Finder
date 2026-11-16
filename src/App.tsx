@@ -221,11 +221,17 @@ function App({ identity, onSignOut, getToken }: AppProps) {
        *
        * `ageMinutes` is the Worker's answer to "how old was this row WHEN I READ IT", so it is
        * anchored to the moment the request was SENT. Stamping after the await attributes it to
-       * the moment the response ARRIVED and silently discards the latency: MEASURED against the
-       * real component, a response that took ten minutes rendered "20 minutes ago" when the true
-       * age was ~30. That is the page reading healthier than the truth, which is the one
-       * direction this panel must never fail in -- and it is exactly the hazard the derivation's
-       * own comment names, arriving through latency instead of clock skew.
+       * the moment the response ARRIVED and silently discards the latency. That is the page
+       * reading healthier than the truth, which is the one direction this panel must never fail
+       * in -- and it is exactly the hazard the derivation's own comment names, arriving through
+       * latency instead of clock skew.
+       *
+       * THE REACHABLE ERROR IS SMALL. The timeout below aborts any read slower than
+       * STATUS_POLL_MS (60 s), so the latency this stamp stops discarding is under a minute:
+       * at most one displayed minute, since `agePhrase` renders whole minutes. A-8's ten
+       * minutes in flight is reachable only in the test, because vitest's fake timers do not
+       * drive `AbortSignal.timeout`. The stamp still matters: it keeps attribution monotonic,
+       * so a reading is never credited to a later moment than it belongs to.
        *
        * `AbortSignal.timeout(STATUS_POLL_MS)` BOUNDS THE MAGNITUDE AND CLOSES THE OUT-OF-ORDER
        * VARIANT IN ONE LINE. Unbounded, the error above has no ceiling; and two polls in flight

@@ -740,7 +740,13 @@ describe("the collector's cross-run state", () => {
    * G-24b: AN EMPTY QUERY IS "NO QUERY", AND WHITESPACE IS EMPTY. `trim()` runs BEFORE the
    * emptiness test, which is the same decision `worker/api/watch.ts`'s own `trim() !== ""` guard
    * already makes. Two rows with nothing to compare are not "the same search", so the pair is
-   * still measured -- otherwise two unvalidated rows would silently disable the detector.
+   * still measured.
+   *
+   * SCOPE: THIS PINS `advanceState`, NOT A PRODUCTION PATH. Through `runTargets` the exclusion is
+   * belt-and-braces: a target that failed validation has no `listingIds`, so its `ids` are empty
+   * and `maxPairOverlap` already skips the pair; and a validated target always has a non-empty
+   * trimmed query, because `parseTarget` requires one. Only a direct `advanceState` call, which
+   * is what these rows make, reaches the guard with two empty queries.
    */
   it.each<[string, string, string]>([
     ["two empty queries", "", ""],
@@ -812,6 +818,11 @@ describe("the collector's cross-run state", () => {
    * G-25b: AND IT IS NOT A BACK DOOR. A latched pair whose queries are still DIFFERENT is dropped
    * only by the ordinary clean-probe route, so this row is what stops the fix from being "any
    * feed cause clears on the next probe".
+   *
+   * WHAT IT PINS, EXACTLY: that the drop condition contains the equality test at all. Removing
+   * it (drop every feed cause on its next probe) turns this row red. It does NOT pin `every`
+   * over "any two equal": `raise` only writes `feed-overlap:<a>+<b>`, so a cause always names
+   * two targets, and at two the forms are logically identical. No test can tell them apart.
    */
   it("G-25b: a latched pair with different queries still needs real clean probes", () => {
     const state = fresh({ alarm: { "feed-overlap:a+b": { runs: 9, cleanProbes: 0 } } });
