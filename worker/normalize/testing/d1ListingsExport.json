@@ -42,6 +42,14 @@
         "model_key": null
       },
       {
+        "listing_id": "fx-type",
+        "title": "Gaming PC – GTX 1080 Ti 11GB | 16GB RAM",
+        "price_cents": 65000,
+        "component_type": "cpu",
+        "validity": "INVALID_REFERENCE",
+        "model_key": null
+      },
+      {
         "listing_id": "fx-unmatched",
         "title": "MSI PRO Z790-A MAX WIFI MOTHERBOARD",
         "price_cents": 20000,
@@ -90,7 +98,7 @@
       "last_row_id": 0,
       "changed_db": false,
       "size_after": 0,
-      "rows_read": 10,
+      "rows_read": 11,
       "rows_written": 0
     }
   }

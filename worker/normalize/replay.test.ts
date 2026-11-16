@@ -19,6 +19,7 @@ describe("replay -- parsing wrangler's --json output", () => {
       "fx-lose",
       "fx-change",
       "fx-validity",
+      "fx-type",
       "fx-unmatched",
       "fx-quantity",
       "fx-no-price",
@@ -28,7 +29,7 @@ describe("replay -- parsing wrangler's --json output", () => {
   });
 
   it("tolerates the banner lines wrangler prints without --json", () => {
-    expect(parseD1Export(`🌀 Executing on remote database\n${FIXTURE}`)).toHaveLength(10);
+    expect(parseD1Export(`🌀 Executing on remote database\n${FIXTURE}`)).toHaveLength(11);
   });
 
   it("refuses a failed statement, a non-export and a SELECT with the wrong columns", () => {
@@ -47,7 +48,7 @@ describe("replay -- the report", () => {
   const report = replay(parseD1Export(FIXTURE));
 
   it("lists a row whose type is outside the nine instead of replaying it", () => {
-    expect(report.rows).toBe(10);
+    expect(report.rows).toBe(11);
     expect(report.skipped).toEqual([{ listingId: "fx-skipped", componentType: "gpuu" }]);
   });
 
@@ -57,7 +58,7 @@ describe("replay -- the report", () => {
       matched: 3,
       "model-unmatched": 2,
       "unknown-quantity": 1,
-      "whole-system": 1,
+      "whole-system": 2,
     });
   });
 
@@ -76,6 +77,7 @@ describe("replay -- the report", () => {
       ["gains key", "fx-gain", null, "GeForce RTX 5070 Ti", "gpu"],
       ["changes key", "fx-change", "GeForce RTX 3080 Ti", "GeForce RTX 3080", "gpu"],
       ["loses key", "fx-lose", "GeForce RTX 3070", null, "gpu"],
+      ["changes validity or type", "fx-type", null, null, "gpu"],
       ["changes validity or type", "fx-validity", null, null, "storage"],
     ]);
   });
