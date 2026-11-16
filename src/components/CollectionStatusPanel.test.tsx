@@ -529,8 +529,21 @@ describe("the Start/Stop control", () => {
     expect(screen.getByRole("button", { name: "Stop monitoring" })).toBeDisabled();
   });
 
-  it("P-m5: a refusal is an alert and a confirmation is a status", () => {
+  /**
+   * P-m5: ONE ALERT REGION AND ONE STATUS REGION, BOTH IN THE DOCUMENT BEFORE ANY NOTICE, AND THE
+   * SAME TWO NODES CARRY EVERY LATER TEXT. Kills: mounting a region together with its text (it is
+   * absent before the notice, and a new node after it), which many screen readers never announce.
+   */
+  it("P-m5: the live regions exist before a notice, and only their text changes", () => {
     const { rerender } = render(
+      <CollectionStatusPanel status={stopped} pending={false} onToggleMonitoring={vi.fn()} />,
+    );
+    const alertRegion = screen.getByRole("alert");
+    const statusRegion = screen.getByRole("status");
+    expect(alertRegion).toHaveTextContent("");
+    expect(statusRegion).toHaveTextContent("");
+
+    rerender(
       <CollectionStatusPanel
         status={stopped}
         pending={false}
@@ -538,7 +551,8 @@ describe("the Start/Stop control", () => {
         monitoringNotice={{ kind: "alert", text: "Save a deal rule before starting monitoring." }}
       />,
     );
-    expect(screen.getByRole("alert")).toHaveTextContent("Save a deal rule before starting monitoring.");
+    expect(screen.getByRole("alert")).toBe(alertRegion);
+    expect(alertRegion).toHaveTextContent("Save a deal rule before starting monitoring.");
 
     rerender(
       <CollectionStatusPanel
@@ -548,7 +562,33 @@ describe("the Start/Stop control", () => {
         monitoringNotice={{ kind: "status", text: "Started. Your collector picks this up on its next run." }}
       />,
     );
-    expect(screen.getByRole("status")).toHaveTextContent("Started. Your collector picks this up on its next run.");
-    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toBe(statusRegion);
+    expect(statusRegion).toHaveTextContent("Started. Your collector picks this up on its next run.");
+    expect(alertRegion).toHaveTextContent("");
+  });
+
+  /**
+   * P-m6: A STOPPED INSTALL WITH A LATCHED CANARY DOES NOT CLAIM REDUCED RUNS. Paired: the same
+   * collector row while running does show the sentence. Kills: dropping the stopped guard.
+   */
+  it("P-m6: the reduced-coverage sentence is hidden while stopped", () => {
+    const canary = { ...status().collector!, canary: true, complete: false };
+    const { unmount } = render(
+      <CollectionStatusPanel
+        status={status({ status: "degraded", causes: ["canary"], collector: canary, monitoring: { state: "running", changedAt: 0 } })}
+        pending={false}
+      />,
+    );
+    expect(screen.getByText(/Collection is reduced to 2 of 9 searches/)).toBeInTheDocument();
+    unmount();
+
+    render(
+      <CollectionStatusPanel
+        status={status({ status: "stopped", causes: [], collector: canary, monitoring: { state: "stopped", changedAt } })}
+        pending={false}
+      />,
+    );
+    expect(screen.getByText("Stopped")).toBeInTheDocument();
+    expect(screen.queryByText(/Collection is reduced/)).not.toBeInTheDocument();
   });
 });

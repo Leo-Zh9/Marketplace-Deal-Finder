@@ -100,10 +100,14 @@ running, and an absent row also reads as running.
   no DB binding, and then nothing is overridden.
 
 The cleanup cron, ingest, `/api/watch` and the `notifications` rows are untouched. PENDING alerts
-stay PENDING and go out on the first run after Start. A run already in flight when Stop is
-pressed finishes. **Start refuses with 409 `MONITORING_NOT_READY`** when no deal rule is saved,
+stay PENDING. They go out on the first run after Start only if the stop lasted less than the
+~7 h freshness window (`NOTIFY_FRESH_SECONDS`). After a longer stop, recheck finds the listing
+too old and cancels them. A run already in flight when Stop is pressed finishes its drain, but
+its notify step reads the flag again (only when notifications are on) and sends nothing. **Start refuses with 409 `MONITORING_NOT_READY`** when no deal rule is saved,
 and leaves the row unchanged. Start does not trigger a run: the collector and the cron pick it up
-on their next fire.
+on their next fire. Start checks only the deal rule because the market and the targets are
+already covered: 0005 seeds them, `PUT /api/watch` guards every edit, and the collector reports a
+broken list loudly as exit 2.
 
 **Cost:** one more row read per monitoring run, inside `load-settings` and counted in
 `rows_read` (runMonitor.test.ts R16 moved from 9 to 10). That is 48 rows a day.

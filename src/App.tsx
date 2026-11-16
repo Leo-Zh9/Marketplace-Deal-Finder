@@ -113,6 +113,17 @@ const locationFromWire = (
   return { ...wire, label: known?.label ?? wire.slug };
 };
 
+/**
+ * A READING IS APPLIED ONLY IF IT WAS SENT NO EARLIER THAN THE ONE ON SCREEN. Two reads can be in
+ * flight at once -- a poll and the re-read after a Start/Stop click -- and without this a slow poll
+ * sent BEFORE the click lands after the re-read and puts the old label back. Ordered by send time,
+ * the same anchor `fetchedAt` already uses for the age.
+ */
+const newerReading =
+  (status: CollectionStatus, sentAt: number) =>
+  (previous: { status: CollectionStatus; fetchedAt: number } | null) =>
+    previous !== null && previous.fetchedAt > sentAt ? previous : { status, fetchedAt: sentAt };
+
 function App({ identity, onSignOut, getToken }: AppProps) {
   const [settings, setSettings] = useState<SearchSettings>(initialSettings);
   const [storedTargets, setStoredTargets] = useState<StoredTarget[]>([]);
@@ -252,7 +263,7 @@ function App({ identity, onSignOut, getToken }: AppProps) {
           AbortSignal.timeout(STATUS_POLL_MS),
         );
         if (cancelled) return;
-        setCollection({ status, fetchedAt: sentAt });
+        setCollection(newerReading(status, sentAt));
       } catch {
         // THE LAST GOOD READING IS KEPT ON A FAILED POLL, deliberately. Flapping the panel to
         // "could not be read" and back on one dropped request would train the operator to ignore
@@ -331,13 +342,16 @@ function App({ identity, onSignOut, getToken }: AppProps) {
     setMonitoringPending(true);
     setMonitoringNotice(null);
     try {
-      if (next === "start") await marketplaceClient.startMonitoring(getToken);
-      else await marketplaceClient.stopMonitoring(getToken);
+      // BOUNDED BY THE STATUS READS' OWN BUDGET, so a hung POST clears the pending flag instead of
+      // leaving the button disabled until reload.
+      const signal = AbortSignal.timeout(STATUS_POLL_MS);
+      if (next === "start") await marketplaceClient.startMonitoring(getToken, signal);
+      else await marketplaceClient.stopMonitoring(getToken, signal);
 
       const sentAt = Date.now();
       try {
         const status = await marketplaceClient.getStatus(getToken, AbortSignal.timeout(STATUS_POLL_MS));
-        setCollection({ status, fetchedAt: sentAt });
+        setCollection(newerReading(status, sentAt));
       } catch {
         // Kept, as on a failed poll.
       }

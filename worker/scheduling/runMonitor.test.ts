@@ -1525,6 +1525,69 @@ describe("runMonitor -- the Stop flag", () => {
   });
 
   /**
+   * R-s4. STOP PRESSED MID-RUN SENDS NOTHING. The flag reads running at `load-settings`, the drain
+   * judges two DEALs, and Stop lands just before `notify`: the notify step re-reads it and posts
+   * nothing. Paired: Start, and the next run posts both, so the stopped half cannot pass on an
+   * inert fixture. Kills: dropping the re-read (two posts in the first run).
+   */
+  it("R-s4: a Stop that lands between the drain and notify sends no alert", async () => {
+    await maximumPriceSettings();
+    await watchEverything();
+    await seed("alpha", 2);
+    const posts: string[] = [];
+    const notifyFetch = async (url: string) => {
+      posts.push(url);
+      return new Response('{"id":"1"}', { status: 200 });
+    };
+    const recorder = recording({
+      before: async (name) => {
+        if (name === "notify") await handleStopMonitoring(db, T);
+      },
+    });
+
+    const run = await runMonitor(db, recorder.stepper, { now: T }, "run-stop-mid", { notifyFetch }, ON);
+
+    expect(recorder.names).toEqual(["acquire-lock", "load-settings", "discover-sources", "drain-0", "notify", "finalize"]);
+    expect(run.status).toBe("OK");
+    expect(run.claimedCount).toBe(2);
+    expect(run.notify).toMatchObject({ state: "on", enqueued: 0, sent: 0 });
+    expect(posts).toEqual([]);
+    expect((await snapshot()).notifications).toEqual([]);
+
+    await handleStartMonitoring(db, T);
+    await runMonitor(db, recording().stepper, { now: T }, "run-after-start", { notifyFetch }, ON);
+    expect(posts).toHaveLength(2);
+  });
+
+  /**
+   * R-s5. THE NOTIFY STEP'S FLAG READ IS COUNTED, AND ONLY WHEN NOTIFICATIONS ARE ON. Two runs on
+   * one empty fixture, the log cleared between them so finalize costs the same: inert notify, then
+   * ON with Stop landing before notify (so the step reads the flag and stops there). They differ by
+   * exactly the one row. Kills: not spending the read (difference 0).
+   */
+  it("R-s5: the notify step's flag read adds exactly one row read", async () => {
+    await maximumPriceSettings();
+    const inert = await runMonitor(db, recording().stepper, { now: T }, "run-inert");
+    await db.prepare("DELETE FROM monitor_runs").run();
+
+    const stoppedMid = await runMonitor(
+      db,
+      recording({
+        before: async (name) => {
+          if (name === "notify") await handleStopMonitoring(db, T);
+        },
+      }).stepper,
+      { now: T },
+      "run-on-stopped",
+      {},
+      ON,
+    );
+
+    expect(stoppedMid.usage.rowsRead - inert.usage.rowsRead).toBe(1);
+    expect(stoppedMid.usage.rowsWritten - inert.usage.rowsWritten).toBe(0);
+  });
+
+  /**
    * R-s3. A `load-settings` result memoized BEFORE this field existed -- an instance replayed across
    * the deploy -- has no `stopped`, and it reads as running, the state it was recorded in. The row
    * says stopped here, so a reader that treated the missing field as stopped (or re-read the row)

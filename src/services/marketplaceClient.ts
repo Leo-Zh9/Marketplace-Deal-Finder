@@ -164,8 +164,8 @@ export interface MarketplaceClient {
    * START/STOP. No body. A 409 `MONITORING_NOT_READY` from Start surfaces as an `ApiRequestError`
    * carrying that code, which App turns into "Save a deal rule before starting monitoring."
    */
-  startMonitoring(getToken: GetToken): Promise<MonitoringState>;
-  stopMonitoring(getToken: GetToken): Promise<MonitoringState>;
+  startMonitoring(getToken: GetToken, signal?: AbortSignal): Promise<MonitoringState>;
+  stopMonitoring(getToken: GetToken, signal?: AbortSignal): Promise<MonitoringState>;
 }
 
 interface VerdictsResponse {
@@ -236,8 +236,16 @@ export const settingsToDealRule = (
   };
 };
 
-const postMonitoring = async (path: string, getToken: GetToken): Promise<MonitoringState> => {
-  const body = await requestJsonWithAuth<unknown>(path, getToken, { method: "POST" });
+/**
+ * `signal` IS FORWARDED FOR THE SAME REASON `getStatus` FORWARDS ONE: App bounds the POST with the
+ * status reads' own budget, so a hung request cannot leave the button disabled forever.
+ */
+const postMonitoring = async (
+  path: string,
+  getToken: GetToken,
+  signal?: AbortSignal,
+): Promise<MonitoringState> => {
+  const body = await requestJsonWithAuth<unknown>(path, getToken, { method: "POST", signal });
   if (!isMonitoringBody(body)) {
     throw new ApiRequestError("The monitoring state came back in a shape this page cannot read.", "unexpected");
   }
@@ -303,11 +311,11 @@ export const marketplaceClient: MarketplaceClient = {
     return withCheckedMonitoring(withCheckedNotifications(body));
   },
 
-  startMonitoring(getToken) {
-    return postMonitoring("/api/monitoring/start", getToken);
+  startMonitoring(getToken, signal) {
+    return postMonitoring("/api/monitoring/start", getToken, signal);
   },
 
-  stopMonitoring(getToken) {
-    return postMonitoring("/api/monitoring/stop", getToken);
+  stopMonitoring(getToken, signal) {
+    return postMonitoring("/api/monitoring/stop", getToken, signal);
   },
 };

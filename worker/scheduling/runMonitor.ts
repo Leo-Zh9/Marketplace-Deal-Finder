@@ -22,9 +22,9 @@
 import { loadMonitoringState } from "../api/monitoring";
 import { evaluateBatch } from "../evaluation/evaluateBatch";
 import { EVALUATION_BATCH_SIZE, type EvaluationSettings } from "../evaluation/types";
-import type { NotifyEnvironment } from "../notify/config";
+import { resolveNotifyConfig, type NotifyEnvironment } from "../notify/config";
 import type { NotifyFetch } from "../notify/deliver";
-import { runNotify, type NotifyCounts } from "../notify/runNotify";
+import { runNotify, zeroCounts, type NotifyCounts } from "../notify/runNotify";
 import { loadCurrentSettings } from "../search/settings";
 import type { D1Usage } from "../storage/types";
 import { COLLECTION_STEPS, type CollectionStep } from "./collection";
@@ -705,17 +705,44 @@ export const runMonitor = async (
   //    Retry-safe without the lock: see worker/notify/runNotify.ts. Every row is claimed before
   //    its fetch and `params.now` is frozen, so the step's one retry cannot claim or sweep a row
   //    the first execution left SENDING. In the inert states the body makes no D1 query at all.
+  //
+  //    A STOP PRESSED WHILE THIS RUN WAS DRAINING SENDS NOTHING. `load-settings` read the flag
+  //    minutes ago; alerting after the operator pressed Stop is the one thing Stop promises not to
+  //    do. So the body re-reads it -- inside the step, so it is memoized with the result -- but only
+  //    when notifications are ON: an inert step still makes no D1 query, which keeps R16's pin. The
+  //    read is spent like every other statement. Stopped returns zero counts; PENDING rows stay
+  //    PENDING for the first run after Start.
+  //
+  //    A step result memoized by a Worker older than this shape is a bare NotifyCounts with no
+  //    `counts` key; it is read as the counts it is, with no usage.
   if (run.status !== "LOCK_LOST") {
     try {
-      run.notify = await runStep("notify", async () =>
-        runNotify(db, {
-          environment: notifyEnvironment,
-          now: params.now,
-          fetch: options.notifyFetch ?? globalFetch,
-          leaseTokenPrefix: `${runId}:notify`,
-          timeoutMs: options.notifyTimeoutMs,
-        }),
+      const outcome: { counts: NotifyCounts; usage: D1Usage } | NotifyCounts = await runStep(
+        "notify",
+        async () => {
+          const usage: D1Usage = { rowsRead: 0, rowsWritten: 0 };
+          if (resolveNotifyConfig(notifyEnvironment).state === "on") {
+            const state = await loadMonitoringState(db);
+            usage.rowsRead += state.usage.rowsRead;
+            usage.rowsWritten += state.usage.rowsWritten;
+            if (state.monitoring.state === "stopped") return { counts: zeroCounts("on"), usage };
+          }
+          const counts = await runNotify(db, {
+            environment: notifyEnvironment,
+            now: params.now,
+            fetch: options.notifyFetch ?? globalFetch,
+            leaseTokenPrefix: `${runId}:notify`,
+            timeoutMs: options.notifyTimeoutMs,
+          });
+          return { counts, usage };
+        },
       );
+      if ("counts" in outcome) {
+        run.notify = outcome.counts;
+        spend(outcome.usage);
+      } else {
+        run.notify = outcome;
+      }
     } catch (error) {
       run.stepFailures += 1;
       recordError(`notify: ${String(error)}`);

@@ -78,7 +78,7 @@ export interface NotifyInput {
   timeoutMs?: number;
 }
 
-const zero = (state: NotifyCounts["state"]): NotifyCounts => ({
+export const zeroCounts = (state: NotifyCounts["state"]): NotifyCounts => ({
   state,
   swept: 0,
   enqueued: 0,
@@ -108,7 +108,7 @@ export const countsLine = (counts: NotifyCounts): string =>
 export const runNotify = async (db: D1Database, input: NotifyInput): Promise<NotifyCounts> => {
   const config = resolveNotifyConfig(input.environment);
   if (config.state !== "on") {
-    const inert = zero(config.state);
+    const inert = zeroCounts(config.state);
     console.log(countsLine(inert));
     return inert;
   }
@@ -116,7 +116,7 @@ export const runNotify = async (db: D1Database, input: NotifyInput): Promise<Not
   const { now } = input;
   const maxSends = input.maxSends ?? MAX_SENDS_PER_STEP;
   const leaseSeconds = input.leaseSeconds ?? NOTIFY_LEASE_SECONDS;
-  const counts = zero("on");
+  const counts = zeroCounts("on");
 
   counts.swept = await sweepExpiredLeases(db, now);
   const selection = await readSelection(db);

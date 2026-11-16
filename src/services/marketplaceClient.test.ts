@@ -675,6 +675,16 @@ describe("Start/Stop and the monitoring field of /api/status", () => {
     expect(headers.get("Authorization")).toBe("Bearer a-firebase-id-token");
   });
 
+  /** C-m3b: the caller's abort signal reaches the POST. Kills: dropping it in `postMonitoring`. */
+  it.each(["startMonitoring", "stopMonitoring"] as const)("C-m3b: %s forwards its signal", async (method) => {
+    const fetchMock = stubJson({ monitoring: { state: "running", changedAt: 0 } });
+    const controller = new AbortController();
+
+    await marketplaceClient[method](noToken, controller.signal);
+
+    expect(fetchMock.mock.calls[0][1]?.signal).toBe(controller.signal);
+  });
+
   it("C-m4: a 200 whose body is not a monitoring state is refused, not trusted", async () => {
     stubJson({ monitoring: { state: "maybe", changedAt: 0 } });
 

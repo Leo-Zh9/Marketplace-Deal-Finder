@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App from "./App";
 import type { AuthenticatedIdentity } from "./auth/authTypes";
@@ -104,8 +104,10 @@ interface Wire {
   statusStatus?: number;
   /** A live `/api/status` body, read on every request. Wins over `statusRaw` and `status`. */
   statusFn?: () => unknown;
+  /** Awaited AFTER `statusFn` built the body, so a held read answers with what was true when sent. */
+  statusHold?: (callIndex: number) => Promise<void>;
   /** What `POST /api/monitoring/start|stop` answers. Absent, the request is unexpected. */
-  monitoringReply?: (path: string) => Promise<{ status: number; body: unknown }>;
+  monitoringReply?: (path: string, signal?: AbortSignal) => Promise<{ status: number; body: unknown }>;
 }
 
 interface Call {
@@ -164,7 +166,12 @@ const stubWire = (wire: Wire = {}) => {
        * impossible to ship without also wiring the page's only notification channel.
        */
       if (path === "/api/status") {
-        if (wire.statusFn !== undefined) return reply(wire.statusFn());
+        if (wire.statusFn !== undefined) {
+          const body = wire.statusFn();
+          const callIndex = calls.filter((call) => call.url === "/api/status").length - 1;
+          await wire.statusHold?.(callIndex);
+          return reply(body);
+        }
         return wire.statusStatus !== undefined && wire.statusStatus !== 200
           ? reply({ error: { code: "AUTH_KEYS_UNAVAILABLE" } }, wire.statusStatus)
           : reply(wire.statusRaw ?? wire.status ?? HEALTHY_STATUS);
@@ -174,7 +181,7 @@ const stubWire = (wire: Wire = {}) => {
         (path === "/api/monitoring/start" || path === "/api/monitoring/stop") &&
         wire.monitoringReply !== undefined
       ) {
-        const answer = await wire.monitoringReply(path);
+        const answer = await wire.monitoringReply(path, init?.signal ?? undefined);
         return reply(answer.body, answer.status);
       }
       throw new Error(`unexpected request: ${method} ${String(url)}`);
@@ -1589,5 +1596,84 @@ describe("Start/Stop monitoring", () => {
     await screen.findByText("Collecting");
 
     expect(screen.queryByRole("button", { name: /monitoring/ })).not.toBeInTheDocument();
+  });
+
+  /**
+   * A-m7: A SLOW POLL SENT BEFORE THE CLICK CANNOT PUT THE OLD LABEL BACK. Read #1 (mount) says
+   * running. Read #2 (the 60 s poll) is sent while still running and HELD. Stop is clicked; the
+   * re-read (#3) says stopped and lands first. Then #2 is released with its old "running" body.
+   * Kills: applying a reading regardless of when it was sent (the button reverts to Stop).
+   */
+  it("A-m7: a poll sent before the click and landing after the re-read is ignored", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const live = liveMonitoring("running");
+      stubWire({
+        watch: LIVE_WATCH,
+        settings: null,
+        ...live,
+        statusHold: (callIndex) => (callIndex === 1 ? held : Promise.resolve()),
+      });
+      render(<App getToken={noToken} />);
+      const stop = await screen.findByRole("button", { name: "Stop monitoring" });
+
+      await vi.advanceTimersByTimeAsync(61_000);
+      fireEvent.click(stop);
+      expect(await screen.findByRole("button", { name: "Start monitoring" })).toBeEnabled();
+
+      release();
+      await vi.advanceTimersByTimeAsync(10);
+      expect(screen.getByRole("button", { name: "Start monitoring" })).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Stop monitoring" })).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /**
+   * A-m8: A HUNG POST TIMES OUT AND THE BUTTON COMES BACK. `AbortSignal.timeout` is replaced so the
+   * test can fire the timeout itself (fake timers do not drive it); the POST's signal is the
+   * status reads' 60 s budget. Kills: sending the POST with no signal (the button stays disabled
+   * forever).
+   */
+  it("A-m8: a POST that never answers is aborted at the status budget and clears pending", async () => {
+    const user = userEvent.setup();
+    const timeouts: Array<{ ms: number; controller: AbortController }> = [];
+    vi.spyOn(AbortSignal, "timeout").mockImplementation((ms: number) => {
+      const controller = new AbortController();
+      timeouts.push({ ms, controller });
+      return controller.signal;
+    });
+    try {
+      const live = liveMonitoring("running");
+      stubWire({
+        watch: LIVE_WATCH,
+        settings: null,
+        statusFn: live.statusFn,
+        monitoringReply: (_path, signal) =>
+          new Promise((_resolve, reject) => {
+            signal?.addEventListener("abort", () => reject(new DOMException("timed out", "TimeoutError")));
+          }),
+      });
+      render(<App getToken={noToken} />);
+      await waitForLoad("9 of 9 searches used");
+
+      const before = timeouts.length;
+      await user.click(await screen.findByRole("button", { name: "Stop monitoring" }));
+      expect(screen.getByRole("button", { name: "Stop monitoring" })).toBeDisabled();
+
+      const post = timeouts[before];
+      expect(post?.ms).toBe(60_000);
+      post.controller.abort();
+
+      expect(await screen.findByText("Could not connect to the application service.")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Stop monitoring" })).toBeEnabled();
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 });

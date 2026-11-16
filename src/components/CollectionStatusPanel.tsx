@@ -217,12 +217,23 @@ export function CollectionStatusPanel({
         )}
       </div>
 
-      {monitoringNotice !== null &&
-        (monitoringNotice.kind === "alert" ? (
-          <p className="collection-notice" role="alert">{monitoringNotice.text}</p>
-        ) : (
-          <p className="collection-notice" role="status">{monitoringNotice.text}</p>
-        ))}
+      {/*
+        * TWO LIVE REGIONS, MOUNTED WITH THE BUTTON AND BEFORE ANY CLICK, AND ONLY THEIR TEXT
+        * CHANGES. A region inserted together with its text is often not announced at all, because
+        * the screen reader starts watching it after the change. A refusal goes in the alert region,
+        * a confirmation in the polite one. With no button there is nothing to announce, so no
+        * regions either -- and the page's other alert/status regions stay the only ones.
+        */}
+      {monitoring !== null && onToggleMonitoring !== undefined && (
+        <>
+          <p className="collection-notice" role="alert">
+            {monitoringNotice?.kind === "alert" ? monitoringNotice.text : ""}
+          </p>
+          <p className="collection-notice" role="status">
+            {monitoringNotice?.kind === "status" ? monitoringNotice.text : ""}
+          </p>
+        </>
+      )}
 
       {status === null ? (
         <p className="muted-copy">
@@ -275,7 +286,11 @@ export function CollectionStatusPanel({
             * the run was FULL (the bounded expiry does exactly that once a day), and claiming a
             * reduction that did not happen is the same class of lie as the deleted panel's.
             */}
-          {status.collector?.canary === true && (
+          {/*
+            * NOT WHILE STOPPED: nothing runs, so "reduced to 2 of 9 per run" describes runs that
+            * are not happening.
+            */}
+          {status.collector?.canary === true && status.status !== "stopped" && (
             <p className="collection-reduced">
               Collection is reduced to {CANARY_TARGETS} of {status.collector.targets} searches per
               run while this is unresolved. It will go back on its own once the cause measures
