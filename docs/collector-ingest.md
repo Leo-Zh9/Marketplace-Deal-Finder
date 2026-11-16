@@ -173,6 +173,36 @@ resolution depends on the title alone when it fires and returns its input when i
 plus a script, not a production code change, and it is the instrument whoever answers the catalog
 question should use.
 
+**The script exists: `scripts/replay-normalization.ts`.** Offline, plain `node`, no network:
+
+```sh
+npx wrangler d1 execute marketplace-deal-finder-db --remote --json \
+  --command "SELECT listing_id,title,price_cents,component_type,validity,model_key FROM listings" \
+  > listings.json
+node scripts/replay-normalization.ts listings.json
+```
+
+It runs every row through **the checked-out commit's** `normalizeListing` under its stored
+`component_type` and prints (a) the per-reason breakdown, (b) yield — distinct `listing_id`s
+carrying a model key, stored versus this commit, (c) every row whose key, validity or type this
+commit would change, with its title, so **every gained key is hand-checked before a rule change
+ships**, and (d) the unkeyed components (`model-unmatched`, `component-unconfirmed`,
+`unknown-quantity`) to hand-label into catalog candidates. A row whose stored type is outside the
+nine is listed, not replayed. The logic lives in `worker/normalize/replay.ts`; the script is
+covered by `npm run check` through `scripts/replay-normalization.test.ts`, which runs it as a real
+`node` process over a committed export (`worker/normalize/testing/d1ListingsExport.json`).
+
+**And the yield measured against labels: `worker/normalize/liveCorpus.test.ts`.** The replay
+says what a commit WOULD change; it cannot say whether a key is RIGHT, because production rows
+carry no labels. The live corpus can: 141 real titles from two pulls of the nine production
+searches, each hand-labelled as one catalogued component (with its model), one uncatalogued
+component, or not a standalone component, and each run under every search that returned it.
+Two hard gates — **0 wrong keys** (a keyed title carries its label's model and type under every
+search) and **no non-component keyed** — and a pinned floor: on master `404677e`, **36**
+standalone components, **13** catalogued, **9 of 13** keyed under every search, with the four
+misses named in the test. A rule change that should raise yield moves that floor on purpose; one
+that lowers it, or keys anything wrongly, goes red.
+
 ### Status codes
 
 | code | status | means |
