@@ -19,6 +19,7 @@ import { MINIMUM_REFERENCE_COUNT } from "../evaluation/types";
 import { CATALOG_COMPONENT_ID, STORAGE_COMPONENT_ID } from "../normalize/catalogIndex";
 import { componentById } from "../../src/data/catalog";
 import type { ComponentType } from "../../src/types";
+import { marketKey } from "../storage/marketKey";
 
 export const VERDICT_PAGE_SIZE = 50;
 
@@ -187,12 +188,52 @@ export const SELECTION_PREDICATE = `l.component_type IN (SELECT value FROM json_
     OR (l.component_type || '/' || COALESCE(l.model_key, '')) IN (SELECT value FROM json_each(?3))`;
 
 /**
+ * THE SAVED MARKET, AND WHY THE READ NEEDS IT. Nothing deletes from `listings` (the read-cost
+ * note above measures it), so after a SAVED location or radius change the rows collected in the
+ * old market stay in the table forever -- and without this term they stay on the page, DEALs
+ * first. Every listing
+ * carries the `market_key` the collector ran in, built by `marketKey()` from the lat/lon/radius it
+ * echoed from `watch_market`; so `marketKey(watch_market row)` computed HERE, IN JS, is the exact
+ * string those rows carry.
+ *
+ * NEVER BUILD THE KEY IN SQL. `printf('%.4f')` rounds differently from `Math.round(x * 1e4)` and
+ * keeps a negative zero that `marketKey()` collapses (marketKey.ts:16-31), so an SQL-built key
+ * would silently disagree with the stored one on exactly the edge values.
+ *
+ * EXPORTED FOR THE NOTIFY STEP: worker/notify/runNotify.ts reads the same key and binds it into
+ * the same term, so an alert is never sent for a listing this page would not show.
+ */
+export const SELECT_MARKET = "SELECT latitude, longitude, radius_km FROM watch_market WHERE id = 1";
+
+interface MarketRow {
+  latitude: number;
+  longitude: number;
+  radius_km: number;
+}
+
+/**
+ * The saved market's key, or null when there is no market row. NULL FAILS CLOSED in both
+ * callers: this read serves the empty page without running the main statement, and a NULL bound
+ * into `l.market_key = ?` matches nothing, so the notify step enqueues nothing and cancels a
+ * claimed row. A `marketKey()` throw propagates; the 0005 CHECKs on `watch_market` make it
+ * unreachable for a stored row.
+ */
+export const readSavedMarketKey = async (db: D1Database): Promise<string | null> => {
+  const read = await db.prepare(SELECT_MARKET).all<MarketRow>();
+  const row = read.results[0];
+  if (row === undefined) return null;
+  return marketKey({ latitude: row.latitude, longitude: row.longitude, radiusKm: row.radius_km });
+};
+
+/**
  * EXPORTED FOR ONE OTHER CALLER: worker/notify/enqueue.ts binds the SAME predicate (same `?2` /
  * `?3`, same storage ids) so an alert is never sent for a listing the dashboard would not show.
- * The predicate is unparenthesised here so this statement stays byte-identical to the one that
- * shipped; the notify statements wrap it in parentheses because they AND it with other terms.
+ * Both this statement and the notify statements AND it with the same market term, and both wrap
+ * it in parentheses: the predicate has a top-level OR, so without them the market term would bind
+ * only to its first half and the paired rows of every market would come back.
  */
-const WHERE_SELECTION = ` WHERE ${SELECTION_PREDICATE}`;
+const WHERE_MARKET = ` WHERE l.market_key = ?2`;
+const WHERE_MARKET_AND_SELECTION = ` WHERE l.market_key = ?4 AND (${SELECTION_PREDICATE})`;
 
 const ORDER_AND_BOUND = ` ORDER BY CASE WHEN t.verdict IS NULL      THEN 2
                WHEN t.verdict = 'DEAL'     THEN 0
@@ -202,7 +243,8 @@ const ORDER_AND_BOUND = ` ORDER BY CASE WHEN t.verdict IS NULL      THEN 2
  LIMIT ?1`;
 
 /**
- * TWO STATEMENTS, AND THE UNFILTERED ONE IS BYTE-IDENTICAL TO THE STATEMENT THAT SHIPPED. An
+ * TWO STATEMENTS, AND THE UNFILTERED ONE CARRIES NO SELECTION PREDICATE -- only the saved-market
+ * term both statements share. An
  * ABSENT `?all` is NOT the same request as `?all` naming all nine catalog types, and the
  * difference is measurable: binding the nine storage ids would make the SQL drop any row whose
  * `component_type` is outside the catalog, which is precisely the catalog/collector skew
@@ -211,8 +253,9 @@ const ORDER_AND_BOUND = ` ORDER BY CASE WHEN t.verdict IS NULL      THEN 2
  * unreachable, i.e. dead code. So absent means NO PREDICATE, and `?all=` present-and-empty means
  * the empty list.
  */
-export const SELECT_VERDICTS = SELECT_VERDICTS_BODY + ORDER_AND_BOUND;
-export const SELECT_VERDICTS_FILTERED = SELECT_VERDICTS_BODY + WHERE_SELECTION + ORDER_AND_BOUND;
+export const SELECT_VERDICTS = SELECT_VERDICTS_BODY + WHERE_MARKET + ORDER_AND_BOUND;
+export const SELECT_VERDICTS_FILTERED =
+  SELECT_VERDICTS_BODY + WHERE_MARKET_AND_SELECTION + ORDER_AND_BOUND;
 
 
 interface VerdictRow {
@@ -403,9 +446,12 @@ export const handleGetVerdicts = async (
   db: D1Database,
   params: URLSearchParams,
 ): Promise<VerdictsResult> => {
-  // THE try COVERS THE DATABASE CALL AND NOTHING ELSE. With the mapping inside it, a mapper
-  // throw was reported as a storage failure -- the wrong subsystem, and the reason the
-  // RangeError above was a 503 rather than one missing card.
+  // THE try COVERS THE DATABASE CALLS AND NOTHING ELSE -- the saved-market read and the verdict
+  // read. With the mapping inside it, a mapper throw was reported as a storage failure -- the
+  // wrong subsystem, and the reason the RangeError above was a 503 rather than one missing card.
+  // It also covers `marketKey()` inside `readSavedMarketKey`, whose throw the 0005 CHECKs on
+  // `watch_market` make unreachable for a stored row; were it reached, a market row the key
+  // cannot be built from IS a storage fault, so the storage code is the right one.
   // THE QUERY IS VALIDATED BEFORE THE READ, so a bad parameter costs no `rows_read` and cannot be
   // reported as a storage failure.
   const query = parseVerdictsQuery(params);
@@ -421,15 +467,20 @@ export const handleGetVerdicts = async (
 
   let rows: VerdictRow[];
   try {
+    // NO SAVED MARKET IS AN EMPTY PAGE, AND THE MAIN READ IS NOT RUN: there is no market whose
+    // listings this page could honestly claim to show.
+    const key = await readSavedMarketKey(db);
+    if (key === null) return { ok: true, status: 200, body: { listings: [], truncated: false } };
     const read =
       selection === null
-        ? await db.prepare(SELECT_VERDICTS).bind(VERDICT_PAGE_SIZE + 1).all<VerdictRow>()
+        ? await db.prepare(SELECT_VERDICTS).bind(VERDICT_PAGE_SIZE + 1, key).all<VerdictRow>()
         : await db
             .prepare(SELECT_VERDICTS_FILTERED)
             .bind(
               VERDICT_PAGE_SIZE + 1,
               JSON.stringify(selection.all),
               JSON.stringify(selection.pairs),
+              key,
             )
             .all<VerdictRow>();
     rows = read.results;

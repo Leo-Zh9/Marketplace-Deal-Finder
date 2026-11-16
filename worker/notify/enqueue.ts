@@ -14,6 +14,10 @@
  *     `last_seen_at` at most once per HEARTBEAT_SECONDS, so a live listing can look up to 6 h old;
  *     the extra hour is margin for a late collector run.
  *   - it is selected on the dashboard (selection.ts, the verdicts.ts predicate).
+ *   - it was collected in the SAVED market (`readSavedMarketKey`, the verdicts.ts market term).
+ *     Nothing deletes from `listings`, so without this a DEAL found in the old market would
+ *     still alert for up to NOTIFY_FRESH_SECONDS after a location or radius change. A NULL key
+ *     (no market row) matches nothing.
  *
  * THE NOT EXISTS RUNS BEFORE THE LIMIT, and that ordering is the anti-starvation property. With
  * the filter after the limit, the 20 newest DEALs -- already SENT -- would fill the window every
@@ -27,7 +31,7 @@
  * KEEPS `last_attempt_at` and `last_error`, which are what /api/status reads.
  *
  * Bindings: ?1 now, ?2 watched-type JSON, ?3 watched-pair JSON, ?4 freshness cutoff, ?5 limit,
- * ?6 the recent-evaluation cutoff.
+ * ?6 the recent-evaluation cutoff, ?7 the saved market key.
  */
 
 import { SELECTION_PREDICATE } from "../api/verdicts";
@@ -59,7 +63,7 @@ export const ENQUEUE_LIMIT = 20;
 
 /**
  * The qualification test, over `l` (listings), `t` (evaluation_tasks) and `ss` (search_settings),
- * with `?2`/`?3` the selection and `?4` the freshness cutoff.
+ * with `?2`/`?3` the selection, `?4` the freshness cutoff and `?7` the saved market key.
  */
 export const CANDIDATE_PREDICATE = `l.validity = 'VALID'
    AND l.model_key IS NOT NULL
@@ -67,6 +71,7 @@ export const CANDIDATE_PREDICATE = `l.validity = 'VALID'
    AND t.verdict = 'DEAL'
    AND t.evaluated_revision = ss.current_revision
    AND l.last_seen_at >= ?4
+   AND l.market_key = ?7
    AND (${SELECTION_PREDICATE})`;
 
 export const ENQUEUE = `INSERT INTO notifications
@@ -95,6 +100,7 @@ export const enqueueCandidates = async (
   db: D1Database,
   now: number,
   selection: NotifySelection,
+  marketKey: string | null,
 ): Promise<number> => {
   const result = await db
     .prepare(ENQUEUE)
@@ -105,6 +111,7 @@ export const enqueueCandidates = async (
       freshnessCutoff(now),
       ENQUEUE_LIMIT,
       now - NOTIFY_RECENT_EVALUATION_SECONDS,
+      marketKey,
     )
     .run();
   return result.meta.changes ?? 0;

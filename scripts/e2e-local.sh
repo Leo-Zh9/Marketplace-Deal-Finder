@@ -1092,6 +1092,10 @@ is "  ...and its listings reached D1"         4 "$(val "SELECT COUNT(*) FROM lis
 # coordinates, and a form that wrote a market the collector did not use would be invisible here
 # without this row.
 is "  ...in the market the form wrote"        '43.6532,-79.3832|25km' "$(val 'SELECT DISTINCT market_key FROM listings')"
+# THE KEY THE COLLECTOR WROTE IS THE KEY THE PAGE READS. /api/verdicts filters on the market key it
+# builds from the SAVED watch_market row; a drift between the two spellings would serve nothing.
+code -H "Origin: $ORIGIN" "$BASE/api/verdicts" >/dev/null
+atleast "  ...and the page serves them"         1 "$(python3 -c "import json;print(len(json.load(open('/tmp/e2e.body'))['listings']))")"
 
 echo "== Start/Stop: the dashboard pauses the collector and the monitor =="
 # THE WHOLE CONTROL OVER HTTP, AGAINST THE REAL COLLECTOR AND A REAL MONITORING RUN. Settings are

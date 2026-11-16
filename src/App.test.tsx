@@ -936,9 +936,9 @@ describe("the control panel", () => {
 
   /**
    * A-scope: WHAT PREVIEW STILL IGNORES IS ON SCREEN. `components` and `models` are real now;
-   * `location`, `radiusKm` and the deal rule are not -- a verdict is committed against the STORED
-   * revision, so an unsaved rule edit previews against the saved rule. The comment that used to
-   * disclose this was replaced when the read became half-real.
+   * the read filters on the SAVED market, so an unsaved `location` or `radiusKm` is disclosed, not
+   * applied -- and so is the deal rule: a verdict is committed against the STORED revision, so an
+   * unsaved rule edit previews against the saved rule.
    *
    * It also asserts the monitoring panel is GONE. With Start/Stop deleted, nothing could ever set
    * the status, so the panel answered "Not running / Stopped / Next scan —" forever, beside a line
@@ -949,9 +949,10 @@ describe("the control panel", () => {
     render(<App getToken={noToken} />);
     await waitForLoad("9 of 9 searches used");
 
-    expect(screen.getByTestId("preview-scope")).toHaveTextContent(
-      "using your saved deal rule — not unsaved edits",
-    );
+    const scope = screen.getByTestId("preview-scope");
+    expect(scope).toHaveTextContent("for your saved location and radius");
+    expect(scope).toHaveTextContent("judged by your saved deal rule");
+    expect(scope).toHaveTextContent("takes effect after you Save and the collector's next run");
     for (const claim of ["Monitoring", "Not running", "Stopped", "Last successful scan", "Next scan"]) {
       expect(screen.queryByText(claim), claim).not.toBeInTheDocument();
     }

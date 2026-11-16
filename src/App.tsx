@@ -518,15 +518,16 @@ function App({ identity, onSignOut, getToken }: AppProps) {
        * its own `LIMIT 50`, so a page of a component the user is not watching can no longer arrive
        * and be filtered to nothing in the browser.
        *
-       * WHAT THIS BUTTON STILL IGNORES, because the comment that said so was replaced and the fact
-       * was only PARTLY fixed. `components` and `models` are now real. `location` and `radiusKm`
-       * are still REQUIRED to press it (validate() refuses without them) and still reach nothing
-       * here -- the market lives in `watch_market` and the read has no market parameter -- so a
-       * preview after changing the location shows listings from the market the collector last ran
-       * in. And the DEAL RULE reaches nothing either: a verdict is committed by `evaluateBatch`
+       * THE MARKET IS THE SAVED ONE, NOT THE FORM'S. The read filters on the market key of the
+       * SAVED `watch_market` row, so rows collected in an old market no longer reach the page after
+       * a saved location change -- nothing deletes them from `listings`, so before that filter they
+       * stayed here indefinitely, DEALs first. The form's UNSAVED `location` and `radiusKm` are
+       * still REQUIRED to press this button (validate() refuses without them) and still reach
+       * nothing here: listings exist only for a market the collector has run in, and it runs in the
+       * saved one, so an unsaved market has nothing stored to show. That is disclosed on screen
+       * rather than applied. The DEAL RULE is the same: a verdict is committed by `evaluateBatch`
        * against the STORED revision, so an UNSAVED rule edit previews against the saved rule. The
-       * action-help line under the buttons says so on screen; the honest fix for the market half is
-       * for this read to take the market, which is a slice, not a line.
+       * action-help line under the buttons says both.
        */
       const result = await marketplaceClient.preview(settings, getToken);
       setListings(result.listings);
@@ -870,7 +871,7 @@ function App({ identity, onSignOut, getToken }: AppProps) {
                 type="button"
                 onClick={preview}
               >
-                {pendingAction === "preview" ? "Searching…" : "Preview listings"}
+                {pendingAction === "preview" ? "Loading…" : "Preview listings"}
               </button>
               <button
                 className="primary-button action-button"
@@ -887,13 +888,14 @@ function App({ identity, onSignOut, getToken }: AppProps) {
                 : "Reading your saved searches…"}
             </p>
             {/*
-              * ON SCREEN, because the surprise is reachable in one click: Preview reads verdicts
-              * that were judged against the SAVED deal rule, so editing the rule and previewing
-              * without saving shows the old judgements.
+              * ON SCREEN, because the surprise is reachable in one click: Preview reads listings
+              * collected in the SAVED market and judged against the SAVED deal rule, so editing the
+              * location, radius or rule and previewing without saving shows the saved ones.
               */}
             <p className="action-help" data-testid="preview-scope">
-              Preview shows listings your collector has already judged, using your saved deal rule —
-              not unsaved edits.
+              Preview shows listings your collector has already found for your saved location and
+              radius, judged by your saved deal rule. An unsaved location or radius change takes
+              effect after you Save and the collector's next run.
             </p>
             {savedAt && (
               <p className="action-help" role="status">

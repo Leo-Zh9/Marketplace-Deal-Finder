@@ -16,9 +16,9 @@
  *      DELIVERY_UNKNOWN -- never back to PENDING. A human decides whether to resend.
  * Rows that were still PENDING behind the failure are untouched by it and the retry sends them.
  *
- * BUDGET, per step, worst case: sweep 1 + selection read 1 + enqueue 1 + 5 x (claim, recheck,
- * result-or-cancel) = 18 D1 queries, against 50 per invocation on Workers Free; at most 5
- * subrequests to Discord. No unbounded loop: every iteration spends a claim.
+ * BUDGET, per step, worst case: sweep 1 + selection read 1 + market read 1 + enqueue 1 + 5 x
+ * (claim, recheck, result-or-cancel) = 19 D1 queries, against 50 per invocation on Workers Free;
+ * at most 5 subrequests to Discord. No unbounded loop: every iteration spends a claim.
  *
  * LOGGING: exactly one counts-only line per execution. Never the URL, a title or a token.
  */
@@ -30,6 +30,7 @@ import { deliver, NOTIFY_FETCH_TIMEOUT_MS, type NotifyFetch } from "./deliver";
 import { enqueueCandidates } from "./enqueue";
 import { formatMessage } from "./format";
 import { cancelClaimed, recheck } from "./recheck";
+import { readSavedMarketKey } from "../api/verdicts";
 import { readSelection } from "./selection";
 import { NOTIFY_LEASE_SECONDS, sweepExpiredLeases } from "./sweep";
 
@@ -120,7 +121,10 @@ export const runNotify = async (db: D1Database, input: NotifyInput): Promise<Not
 
   counts.swept = await sweepExpiredLeases(db, now);
   const selection = await readSelection(db);
-  counts.enqueued = await enqueueCandidates(db, now, selection);
+  // AFTER the inert return above, so an inert step still makes no D1 query. The same key the
+  // dashboard's read filters on: an alert is never sent for a listing that page would not show.
+  const marketKey = await readSavedMarketKey(db);
+  counts.enqueued = await enqueueCandidates(db, now, selection, marketKey);
 
   for (let index = 0; index < maxSends; index += 1) {
     const leaseToken = `${input.leaseTokenPrefix}:${crypto.randomUUID()}`;
@@ -130,6 +134,7 @@ export const runNotify = async (db: D1Database, input: NotifyInput): Promise<Not
     const listing = await recheck(db, {
       now,
       selection,
+      marketKey,
       source: claimed.source,
       listingId: claimed.listingId,
     });

@@ -100,6 +100,7 @@ const watch = async (targets: Array<[componentType: string, query: string]>) => 
 };
 
 interface DealInput {
+  market?: string;
   model?: string | null;
   price?: number;
   type?: string;
@@ -127,7 +128,7 @@ const deal = async (id: string, input: DealInput = {}) => {
     .bind(
       SOURCE,
       id,
-      MARKET,
+      input.market ?? MARKET,
       input.type ?? "gpu",
       input.model === undefined ? MODEL : input.model,
       input.title ?? `title ${id}`,
@@ -600,6 +601,44 @@ describe("enqueue", () => {
       // Re-armed fresh, and KEEPING the last Discord answer for /api/status.
       { listing_id: "1004", status: "PENDING", attempts: 0, last_attempt_at: T - 2_000, last_error: "x" },
     ]);
+  });
+});
+
+/**
+ * N-m. THE SAVED MARKET, as the dashboard's read applies it. Nothing deletes from `listings`, so a
+ * fresh DEAL collected in the market the user just moved away from would otherwise alert for up
+ * to NOTIFY_FRESH_SECONDS. Kills: dropping `l.market_key = ?7` from CANDIDATE_PREDICATE (the
+ * old-market deal is enqueued and posted), and not binding the key in RECHECK (the saved-market
+ * twin is cancelled at re-check and never posted).
+ */
+describe("the saved market", () => {
+  const OTHER_MARKET = "43.4643,-80.5204|10km";
+
+  it("N-m: an old-market DEAL is not enqueued, its twin is, and a claimed one is cancelled", async () => {
+    await world();
+    await deal("m-old", { market: OTHER_MARKET });
+    await deal("m-saved");
+    const fake = discord();
+
+    const first = await notify(fake);
+    expect(first).toMatchObject({ enqueued: 1, sent: 1, cancelled: 0 });
+    expect(fake.calls).toHaveLength(1);
+    expect(fake.calls[0].body.content).toContain("/marketplace/item/m-saved");
+    expect(await statusOf("m-old")).toBeUndefined();
+    expect(await statusOf("m-saved")).toBe("SENT");
+
+    // A claimed row whose listing is no longer in the saved market: the market is saved elsewhere
+    // between enqueue and send, and the re-check cancels it. A THIRD market, so neither earlier
+    // listing becomes eligible by the move.
+    await deal("m-moved");
+    expect((await notify(fake, T, { maxSends: 0 })).enqueued).toBe(1);
+    await db
+      .prepare("UPDATE watch_market SET latitude = 45.4215, longitude = -75.6972, radius_km = 20 WHERE id = 1")
+      .run();
+    const second = await notify(fake);
+    expect(second).toMatchObject({ enqueued: 0, cancelled: 1, sent: 0 });
+    expect(fake.calls).toHaveLength(1);
+    expect(await statusOf("m-moved")).toBe("CANCELLED");
   });
 });
 

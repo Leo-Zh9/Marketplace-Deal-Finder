@@ -181,7 +181,7 @@ const seed = async (source: string, count: number, priceCents: number = PRICE_CE
       .prepare(
         `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?2)
          INSERT INTO listings
-         SELECT ?1, ?1 || '-' || i, 'M', 'gpu', 'MODEL', '', 'title', ?3, NULL,
+         SELECT ?1, ?1 || '-' || i, '43.6532,-79.3832|25km', 'gpu', 'MODEL', '', 'title', ?3, NULL,
                 'https://example.test/l', 'VALID', 'hash', ?4, ?4 FROM n`,
       )
       .bind(source, count, priceCents, T),
@@ -1151,7 +1151,7 @@ describe("runMonitor", () => {
     await db.batch([
       db
         .prepare(
-          `INSERT INTO listings VALUES ('alpha','alpha-poison','M','gpu','MODEL','','title',?1,
+          `INSERT INTO listings VALUES ('alpha','alpha-poison','43.6532,-79.3832|25km','gpu','MODEL','','title',?1,
              NULL,'https://example.test/l','VALID','hash',?2,?2)`,
         )
         .bind(POISON_PRICE_CENTS, T),
@@ -1350,10 +1350,17 @@ describe("runMonitor -- the notify step", () => {
     APP_ENV: "production",
   };
 
+  // THE SAVED MARKET TOO: `truncateAll` deletes it, and the notify step only alerts on listings
+  // collected in it -- `seed()` writes that market's key.
   const watchEverything = async () => {
     await db
       .prepare(
         "INSERT INTO watch_targets (target_id, component_type, query) VALUES ('gpu-all', 'gpu', 'graphics card')",
+      )
+      .run();
+    await db
+      .prepare(
+        "INSERT INTO watch_market (id, location, latitude, longitude, radius_km) VALUES (1, 'toronto', 43.6532, -79.3832, 25)",
       )
       .run();
   };
@@ -1444,12 +1451,19 @@ describe("runMonitor -- the Stop flag", () => {
     notifications: (await db.prepare("SELECT * FROM notifications ORDER BY source, listing_id").all()).results,
   });
 
-  const watchEverything = () =>
-    db
+  // The saved market as well, for the same reason as the notify-step describe's helper.
+  const watchEverything = async () => {
+    await db
       .prepare(
         "INSERT INTO watch_targets (target_id, component_type, query) VALUES ('gpu-all', 'gpu', 'graphics card')",
       )
       .run();
+    await db
+      .prepare(
+        "INSERT INTO watch_market (id, location, latitude, longitude, radius_km) VALUES (1, 'toronto', 43.6532, -79.3832, 25)",
+      )
+      .run();
+  };
 
   /**
    * R-s1. PAIRED ON ONE FIXTURE: two DEAL-bound tasks and live notifications. Stopped, the run
