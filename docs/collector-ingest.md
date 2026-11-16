@@ -125,9 +125,9 @@ price:
 | key | means |
 |---|---|
 | `recorded` / `restored` | the listing entered the benchmark; `restored` means its observation had been deleted and was recreated |
-| `removed` | it used to contribute and no longer does — a re-sighting whose model key, market or price changed, or whose validity stopped being `VALID`. A catalogued listing re-sighted by a search of another type **mostly** no longer lands here — that used to be the dominant source of this key — **except** a real part whose title carries an accessory word (`"RTX 3080 with backplate"`, `"Corsair RM850x with all cables"`, `"... with box"`, `"... triple fan"`): it is `VALID` under its own search and `accessory` under a foreign one, so it still flips (see [the accessory residual](#the-type-comes-from-the-title-when-the-title-proves-it)) |
+| `removed` | it used to contribute and no longer does — a re-sighting whose model key, market or price changed, or whose validity stopped being `VALID`. A catalogued listing re-sighted by a search of another type no longer lands here — that used to be the dominant source of this key. The last case of it, a real part whose title carries an accessory word, is gone too: the accessory refusal is now a property of the title, so it is refused under every search (see [the accessory rule](#the-type-comes-from-the-title-when-the-title-proves-it)) |
 | `none` | `UNCHANGED`: nothing about it moved |
-| `skipped-invalid` | the rule refused it: wrong component, whole system, trade-only, for parts, a wanted ad, an accessory for another type's part, an unknown quantity, an ambiguous `CA$0`, or a title at the token cap |
+| `skipped-invalid` | the rule refused it: wrong component, whole system, trade-only, for parts, a wanted ad, an accessory, an unknown quantity, an ambiguous `CA$0`, or a title at the token cap |
 | `skipped-no-model` | the rule accepted it as the right component and could not name it — a real component the catalog does not list |
 | `skipped-no-price` | **newly reachable in this slice.** A listing that resolved to a catalog model and whose `priceText` did not parse. It was structurally unreachable only while `modelKey` was always null |
 
@@ -357,7 +357,7 @@ cross-type flip.
 
 **The rule, applied before rules 1–11:** if **exactly one** type is evidenced (by a marker or a
 catalog model) **and that type has a catalog model match**, the listing is classified — and
-stored — under that type, unless the title reads as an accessory for it (below). Otherwise it is
+stored — under that type, unless the title reads as an accessory (below). Otherwise it is
 classified under the envelope's type, exactly as before. The rules below then run under the resolved type; `normalizeListing` returns it, and the
 ingest route stores it and hashes it into `content_hash`. Both clauses are load-bearing and each
 has a test that goes red without it: the model clause stops a single marker word retyping a
@@ -394,47 +394,74 @@ model-matched cross-type id at all**
 (the production log's flips came from other listings on other days), so the sample measures the
 residual, not the fix; `L16` and the two-type block of `scripts/e2e-local.sh` measure the fix.
 
-**An accessory is not moved.** An accessory search returns accessories that name the part they
-fit — `"12VHPWR cable for RTX 4090"` from a psu search evidences one type (gpu) with a catalog
-model — and the resolution alone stored each one as a `VALID` reference for that part: a
-CA$15–90 observation in the model's mean, and once 5 references exist the accessory itself a
-`DEAL`. Found on review with a cable, a waterblock, a mounting bracket, a replacement fan, a riser
-mount, thermal pads and a backplate, each from the matching search — and in a second round with
-a fan replacement, replacement fans, an empty box, a box, a cpu box and a GPU holder. So when the
-resolution would **change** the type and the title carries an `ACCESSORY` phrase (`cable(s)`,
-`adapter`, `bracket`, `waterblock` / `water block`, `backplate`, `riser`, `mount(ing)`, `shroud`,
+**An accessory is refused under every search.** An accessory search returns accessories that
+name the part they fit — `"12VHPWR cable for RTX 4090"` from a psu search evidences one type
+(gpu) with a catalog model — and the resolution alone stored each one as a `VALID` reference for
+that part: a CA$15–90 observation in the model's mean, and once 5 references exist the accessory
+itself a `DEAL`. There is no outlier trim, so one CA$20 box among five CA$2,000 references moves
+the mean about 16%. So a title that carries an `ACCESSORY` phrase (`cable(s)`, `adapter`,
+`bracket`, `waterblock` / `water block`, `backplate`, `riser`, `mount(ing)`, `shroud`,
 `thermal pad(s)`, `fan(s)`, `replacement`, `box`, `holder`, `stand`, `support`) or reads
-`for <catalog model>` — `for` directly before the matched
-model, never a bare `for`, because `"for sale"` is everywhere — the listing keeps the search's
-type and is refused `NEEDS_REVIEW` / `accessory` (rule 3b below). **Measured over all 217
-sightings of the live sample, before and after the refusal: 0 outcomes change** — none of them
-is an accessory the resolution would have moved, and the second round of words changed none
-either. **The trade is deliberate**: the list runs only on a cross-type resolution, where a false
-refusal costs a `NEEDS_REVIEW` (a lost reference) and a missed accessory writes a wrong price.
-**One exemption**: `fan` and `fans` do not count when the resolution is **to** `case_fan`, because
-a case fan is a fan — five catalog names carry the word (`Lian Li UNI FAN SL120 V2`, …), and
-without it a real fan found by another type's search could never move (`AX-f`, and T12 drops by
-40 pairs).
+`for <catalog model>` — `for` directly before a matched model of any type, never a bare `for`,
+because `"for sale"` is everywhere — is refused `NEEDS_REVIEW` / `accessory` (rule 3b below),
+**whichever search found it**, and keeps the search's type: a refused row is not filed under
+the type of the part it fits.
 
-**It is cross-type ONLY, and the same-type hole stays, named.** Applied under every type it would
-refuse ordinary same-type copy — a PSU "with all cables", a card with a "support bracket" — and a
-test (`AX-c`) goes red if it is. The cost is the pre-existing hole: `"GPU support bracket RTX
-4090"` from a **gpu** search is still a `VALID` RTX 4090 reference, as it was before this change.
-It is pinned in `ACCEPTED_EXPOSURE` (`AX-r`) for the accessory corpus work in Part 2.
+**Why every search (PR 2.3).** PR #21 applied the refusal only when the resolution would
+**change** the type, and that scope left two defects, both now closed:
 
-**And the cross-type scope leaves a flip, named.** A **real** part whose title carries an
-accessory word — `"RTX 3080 with backplate"`, `"RTX 4090 + 12VHPWR adapter included"`,
-`"Corsair RM850x with all cables"`, and with the second round `"... with box"` and
-`"... triple fan"` — is `VALID` with its model under its own search and `NEEDS_REVIEW` /
-`accessory` under a foreign one, so across searches it still removes and restores its
-contribution and re-queues evaluation, exactly as every model-matched cross-type listing did
-before this change. It is a **strict subset** of what flipped before, and it never writes a wrong
-price: the foreign-search side refuses, it does not mis-key. **The Part 2 direction (from review)
-closes it and the same-type hole together:** make the accessory rule a property of the title
-alone — an `ACCESSORY` phrase, or `for` before the first model span — applied under **every**
-search, so a listing classifies the same way whichever search finds it. That needs the
-accessory corpus first, because applied everywhere today it would refuse `AX-c`'s PSU "with all
-cables".
+- **The same-type hole is closed.** `"GPU support bracket RTX 4090"` from a **gpu** search was a
+  `VALID` RTX 4090 reference. It is now `accessory` under every search (`AX-r`).
+- **The flip is gone, by construction.** A real part whose title carries an accessory word was
+  `VALID` with its model under its own search and `accessory` under a foreign one, so each
+  re-sighting removed, then restored, its contribution and re-queued evaluation. The rule now
+  reads the title alone — the search's type is not an input to it — so validity, reason and key
+  are the same under all nine searches (`AX-s`, and every `ACCESSORY_EVERYWHERE` row is asserted
+  under all nine).
+
+**The exemptions, and only these.**
+
+- **`fan` / `fans` when the title itself evidences `case_fan`** (a marker or a catalog model) —
+  a case fan is a fan, and five catalog names carry the word (`Lian Li UNI FAN SL120 V2`, …), so
+  without it T11 goes red. It is keyed on the **title**, not on the search: keyed on the search it
+  would refuse the Lian Li fan from a gpu search and admit `"RTX 3080 FE fan"` from a case_fan
+  search as an RTX 3080. A title that evidences case_fan **and** another type is refused by rule 5
+  anyway, so the exemption can only ever let a pure fan through. `"RTX 3080 replacement fan
+  92mm"` and `"GPU fan PWM 4pin replacement for RTX 3070"` evidence only gpu and stay refused;
+  `"Arctic P12 PWM case fan for RTX 4090 build"` evidences two types and stays refused.
+- **`open box`** — a sale condition, not a box. The live case is `"ASUS PRIME Z270-A ATX
+  Motherboard – New, Never Used, Open Box"`. Any other `box` in the same title still counts.
+
+**Deliberately NOT exempt.** No inclusion-clause grammar (`with` / `w/` / `includes`):
+`"EK Quantum Vector RTX 3080 w/ backplate"` is a waterblock that names none, and an exemption for
+what follows `with` would key it as an RTX 3080. And never `box`, `original box`, `backplate`,
+`waterblock` or `cable`: `"RTX 4090 original box"` is an empty-box sale. No own-words for coolers,
+cases or PSUs either — each would reopen a wrong key (`"Noctua NH-D15 fan"` is a replacement fan,
+`"Corsair RM850x cable kit"` is cables).
+
+**The accepted losses, by phrase.** Real parts now refused under every search, pinned in
+`ACCEPTED_EXPOSURE`. Each is a lost reference, never a wrong one:
+
+- `"... with all cables"` — `"Corsair RM850x Shift power supply with all cables"` (psu, `AX-c`,
+  which was `VALID` under #21)
+- `"... with 2 fans"` — `"Noctua NH-D15 with 2 fans"` (cpu_cooler)
+- `"... with backplate"` — a GPU sold with its backplate
+- `"... new in box"` — a GPU sold boxed
+- `"... triple fan"` / `"... dual fan"` — a GPU's cooler descriptor
+
+**An exemption is added only when the production replay measures real parts lost to that exact
+phrase** — not because a phrase reads as plausible. **The one candidate family, pre-named:**
+fan-count descriptors (`dual` / `triple` / `twin fan`). If it ever ships it must come with pinning
+rows keeping `"RTX 3080 triple fan shroud"` and `"RTX 3080 triple fan replacement"` refused.
+
+**Measured over the 141-title live corpus (216 title × search sightings), before and after:
+4 outcomes change, all on titles labelled not-a-component and all refused both before and
+after, with no key on either side.** Three move from `INVALID_REFERENCE` to `NEEDS_REVIEW` /
+`accessory` because rule 3b now runs ahead of rule 4 on them — a laptop charger `"AC Adapter"`
+(cpu, was `whole-system`), a MacBook `"+ Original Box"` (gpu, was `whole-system`) and a Wi-Fi card
+kit `"Complete in Box"` (motherboard, was `whole-system`) — and one `"Cable & Pipe Locator Kit"`
+(psu) moves from `component-unconfirmed` to `accessory`. Both hard gates stay at 0 and the floor
+stays at 11 of 13.
 
 **And one consequence for `MAXIMUM_PRICE`.** A catalogued listing found only by a search of
 another type used to be `INVALID_REFERENCE` → `NOT_DEAL`. It is now `VALID` with its model on
@@ -450,9 +477,10 @@ Not addressed here; it belongs to the later parts that gate that leg.
 1.  wanted ad         wtb, want to buy, wanted, looking for, iso, ...       -> INVALID_REFERENCE
 2.  trade only        for trade, trade only, swap, trading, ...             -> INVALID_REFERENCE
 3.  broken / parts    for parts, not working, damaged, as is, ...           -> INVALID_REFERENCE
-3b. accessory         the title proves ANOTHER type than the search's, but
-                      reads as an accessory for it (cable, bracket,
-                      backplate, ..., or `for <model>`); search's type kept -> NEEDS_REVIEW
+3b. accessory         under EVERY search: an accessory phrase (cable,
+                      bracket, backplate, box, fan, ...) or `for <model>`;
+                      fan exempt if the title evidences case_fan, `open
+                      box` exempt; search's type kept                       -> NEEDS_REVIEW
 4.  whole system      a system brand or product line, or an uncovered whole-unit
                       token (pc, tower, build, rig, laptop, notebook,
                       desktop, ...)                                         -> INVALID_REFERENCE
@@ -585,6 +613,16 @@ live 5080 is CA$3,000. Any threshold would be a fabricated number.
   listings, and the file alone at load average 9–10 read `T40c` p95 2.85–3.57 ms and `T40c-r` p95
   3.38–3.73 ms, three runs each, with the two Part 2 match rules in place. Under the whole
   parallel suite the same tests had read 6.3–7.1 ms p95 before it.
+  **PR 2.3 runs the accessory scan on every listing, not only a resolving one**, so `T40c` (a
+  batch that does not resolve) now pays it too. Written as a span scan per phrase it cost about
+  +0.4 ms p50 per 100 listings; it is now one allocation-free pass over the title against the
+  phrases indexed by first token, and the `for <model>` check reuses the span walk the evidence
+  scan already makes. Interleaved with master, the file alone, three runs each, load average
+  6.6–7.0: master `T40c` p95 2.83–3.29 ms and `T40c-r` p95 3.28–3.75 ms; PR 2.3 `T40c` p95
+  2.85–3.09 ms and `T40c-r` p95 2.53–2.67 ms. Inside the 7 ms working ceiling, the 8 ms budget
+  and the Workers Free 10 ms limit. **Do not `Object.freeze` the phrase cache**: measured, it
+  took `T40c` to p50 ~4.0 ms file-alone and past 8 ms p95 under the full parallel suite (see
+  `phraseTokens`).
 
 ### The residuals, named — and the corpora they are measured from
 
@@ -629,12 +667,11 @@ having improved by one. That old set's gap is how a laptop's whole price reached
    requires the token after a leading `free` to be the item. A free listing cannot reach a
    benchmark in any case, so this costs a `DEAL` verdict rather than a reference.
    `FREE_PHRASINGS` (19 real phrasings) is the committed corpus that keeps the family
-   re-measurable; it found two live defects on its first run. It also bounds the **free-accessory**
-   family: when the free thing is an accessory whose own word is a marker of the declared type
-   (`"Free graphics card box with GeForce RTX 5080"`), the predicate reads it as the item and the
-   listing stays `VALID` at CA$0. No benchmark impact — a zero price cannot contribute — so the
-   cost is a spurious `DEAL` under `MAXIMUM_PRICE`, which is the square row 3 of the evaluation
-   table already documents and accepts.
+   re-measurable; it found two live defects on its first run. **The free-accessory family it used
+   to bound is closed:** `"Free graphics card box with GeForce RTX 5080"` and `"Free gpu support
+   bracket with GeForce RTX 5080"` were `VALID` at CA$0 (a spurious `DEAL` under
+   `MAXIMUM_PRICE`) while the accessory refusal was cross-type only; rule 3b now refuses both
+   under every search, before rule 8 runs.
 7. **Seven real SKU-variant phrasings still pool into their base model** — a year suffix
    (`RM850x 2021`), a form factor (`Focus GX-850 ATX 3.0`), an `A-RGB` that tokenizes as two
    words, `North XL TG`, a `DDR5 EXPO` kit, `SF1000 Platinum` and `4000D Airflow Core`. Each is a
