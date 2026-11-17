@@ -92,6 +92,8 @@ interface Wire {
   watchAfter?: WatchWire;
   /** A 200 whose body is not JSON, which is the only way the save fallback is reached. */
   watchPutRaw?: string;
+  /** A refused save: the status and the error body PUT /api/watch answers. */
+  watchPutError?: { status: number; error: Record<string, unknown> };
   watchStatus?: number;
   settings?: WireSettings | null;
   settingsStatus?: number;
@@ -139,6 +141,9 @@ const stubWire = (wire: Wire = {}) => {
       const path = String(url).split("?")[0];
       if (path === "/api/watch") {
         if (method === "PUT") {
+          if (wire.watchPutError !== undefined) {
+            return reply({ error: wire.watchPutError.error }, wire.watchPutError.status);
+          }
           return wire.watchPutRaw === undefined
             ? reply(wire.watchAfter ?? wire.watch ?? EMPTY_WATCH)
             : new Response(wire.watchPutRaw, { status: 200 });
@@ -609,6 +614,31 @@ describe("the control panel", () => {
   });
 
   /**
+   * A-shared-budget: THE 409 IS SAID IN THE PAGE'S WORDS, with the numbers the Worker sent, and the
+   * deal rule is NOT saved after a refused watch save (nothing was written).
+   */
+  it("A-shared-budget: a 409 WATCH_BUDGET_FULL names the shared use and the user's share", async () => {
+    const user = userEvent.setup();
+    const calls = stubWire({
+      watch: LIVE_WATCH,
+      settings: { mode: "DISCOUNT", minimumDiscountPercent: 10, maximumPriceCents: null },
+      watchPutError: {
+        status: 409,
+        error: { code: "WATCH_BUDGET_FULL", message: "x", used: 9, maximum: 9, yours: 2 },
+      },
+    });
+    render(<App getToken={noToken} />);
+    await waitForLoad("9 of 9 searches used");
+
+    await user.click(screen.getByRole("button", { name: "Save searches" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "9 of 9 shared searches in use (2 yours). Nothing was saved",
+    );
+    expect(putTo(calls, "/api/settings")).toBeUndefined();
+  });
+
+  /**
    * A-budget: THE COUNT ON SCREEN IS THE COUNT THAT GETS REFUSED, and it includes the kept
    * searches. MEASURED CONSEQUENCE OF THE SYMMETRIC PRESERVATION RULE: deselecting a component does
    * NOT free a slot -- it converts a derived slot into a kept one -- so the over-budget copy says
@@ -833,7 +863,7 @@ describe("the control panel", () => {
     await waitForLoad("9 of 9 searches used");
 
     expect(screen.getByTestId("radius-warning")).toHaveTextContent(
-      "Changing the location or radius starts your price benchmarks over.",
+      "Price benchmarks are shared across everyone's areas, so changing yours keeps them.",
     );
 
     await user.click(screen.getByRole("button", { name: "Custom" }));

@@ -11,6 +11,7 @@ import { ModelSelector } from "./components/ModelSelector";
 import { ApiRequestError, type AuthenticatedIdentity } from "./auth/authTypes";
 import { componentById, mockLocations } from "./data/catalog";
 import { requestErrorMessage } from "./services/apiClient";
+import { budgetFullMessage } from "./utils/budget";
 import { marketplaceClient, settingsToDealRule } from "./services/marketplaceClient";
 import {
   preservableTargets,
@@ -605,6 +606,13 @@ function App({ identity, onSignOut, getToken }: AppProps) {
       await marketplaceClient.saveDealRule(settings.dealRule, getToken);
       setSavedAt(new Date().toISOString());
     } catch (error: unknown) {
+      // THE SHARED BUDGET (migrations/0009): every user's searches share 9 Facebook requests, and
+      // the Worker refused this save atomically -- nothing was written. Say how much is in use and
+      // how much of it is this user's, which is the part they can free.
+      if (error instanceof ApiRequestError && error.code === "WATCH_BUDGET_FULL") {
+        setRequestError(budgetFullMessage(error.details));
+        return;
+      }
       /*
        * "NOTHING WAS CHANGED" WAS A FALSE CLAIM ABOUT THE OPERATOR'S DATA, and the D-3 reordering
        * cannot fix it: this fallback is reached only when the throw is NOT an `ApiRequestError`,
@@ -852,7 +860,7 @@ function App({ identity, onSignOut, getToken }: AppProps) {
                * read zero.
                */}
               <p className="muted-copy" data-testid="radius-warning">
-                Changing the location or radius starts your price benchmarks over.
+                Price benchmarks are shared across everyone's areas, so changing yours keeps them.
               </p>
             </div>
 

@@ -1,4 +1,5 @@
 import { ApiRequestError } from "../auth/authTypes";
+import { localUserFor } from "../auth/localUser";
 
 type FetchImplementation = typeof fetch;
 
@@ -44,9 +45,19 @@ const errorCodeFrom = (body: unknown): string | null => {
   return typeof code === "string" ? code : null;
 };
 
+const detailsFrom = (body: unknown): Record<string, unknown> => {
+  if (typeof body !== "object" || body === null) return {};
+  const error = (body as { error?: unknown }).error;
+  if (typeof error !== "object" || error === null) return {};
+  return Object.fromEntries(
+    Object.entries(error).filter(([key]) => key !== "code" && key !== "message"),
+  );
+};
+
 const errorForResponse = async (response: Response) => {
   const body: unknown = await response.json().catch(() => null);
   const code = errorCodeFrom(body);
+  const details = detailsFrom(body);
 
   if (response.status === 401) {
     return new ApiRequestError(
@@ -80,6 +91,7 @@ const errorForResponse = async (response: Response) => {
     "unexpected",
     response.status,
     code,
+    details,
   );
 };
 
@@ -103,6 +115,13 @@ export const requestJson = async <T>(
   // `application/json` with a 415, and a GET carrying the header would need a wider CORS
   // preflight than `preflightHeadersFor` grants a GET-only path.
   if (options.body !== undefined) headers.set("Content-Type", "application/json");
+  // DEVELOPMENT ONLY (src/auth/localUser.ts). Same-origin through Vite's /api proxy, so it needs no
+  // CORS allowance; a production build never sets it.
+  const localUser = localUserFor(
+    import.meta.env.DEV,
+    typeof sessionStorage === "undefined" ? undefined : sessionStorage,
+  );
+  if (localUser !== null) headers.set("X-Local-User", localUser);
 
   let response: Response;
   try {

@@ -307,3 +307,49 @@ describe("query strings and bodies", () => {
     expect(new Headers(retried.headers).get("Authorization")).toBe("Bearer fresh");
   });
 });
+
+/**
+ * THE DEV-ONLY SECOND IDENTITY (src/auth/localUser.ts) and the 409's details. `?as=<name>` stores a
+ * name for the tab; a DEV build sends it as X-Local-User; a production build never does.
+ */
+describe("X-Local-User and error details", () => {
+  afterEach(() => {
+    sessionStorage.clear();
+  });
+
+  it("L-1: ?as= stores a valid name, refuses a bad one, and ?as= empty clears it", async () => {
+    const { captureLocalUser, localUserFor, LOCAL_USER_KEY } = await import("../auth/localUser");
+    captureLocalUser("?as=alice", sessionStorage);
+    expect(sessionStorage.getItem(LOCAL_USER_KEY)).toBe("alice");
+    captureLocalUser("?as=Bad%20Name", sessionStorage);
+    expect(sessionStorage.getItem(LOCAL_USER_KEY)).toBe("alice");
+    expect(localUserFor(true, sessionStorage)).toBe("alice");
+    // A PRODUCTION build never reads it.
+    expect(localUserFor(false, sessionStorage)).toBeNull();
+    captureLocalUser("?as=", sessionStorage);
+    expect(localUserFor(true, sessionStorage)).toBeNull();
+  });
+
+  it("L-2: a dev request carries the stored name; with none stored the header is absent", async () => {
+    const { LOCAL_USER_KEY } = await import("../auth/localUser");
+    const fetchImplementation = fetcherFor(jsonResponse({}), jsonResponse({}));
+    await requestJson("/api/settings", { fetchImplementation: fetchImplementation as unknown as typeof fetch });
+    expect(new Headers(fetchImplementation.mock.calls[0][1].headers).get("X-Local-User")).toBeNull();
+
+    sessionStorage.setItem(LOCAL_USER_KEY, "bob");
+    await requestJson("/api/settings", { fetchImplementation: fetchImplementation as unknown as typeof fetch });
+    expect(new Headers(fetchImplementation.mock.calls[1][1].headers).get("X-Local-User")).toBe("bob");
+  });
+
+  it("L-3: a 409's body fields other than code and message reach the error's details", async () => {
+    const fetchImplementation = fetcherFor(
+      jsonResponse({ error: { code: "WATCH_BUDGET_FULL", message: "m", used: 9, maximum: 9, yours: 3 } }, 409),
+    );
+    const error = await requestJson("/api/watch", {
+      fetchImplementation: fetchImplementation as unknown as typeof fetch,
+    }).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(ApiRequestError);
+    expect((error as ApiRequestError).code).toBe("WATCH_BUDGET_FULL");
+    expect((error as ApiRequestError).details).toEqual({ used: 9, maximum: 9, yours: 3 });
+  });
+});
