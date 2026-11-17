@@ -875,6 +875,13 @@ different markets, because overlapping areas legitimately share listings.
 `collector/testing/fixtures/watchTargetsPerTargetMarket.json` is the wire, and
 `collector/runTargets.test.ts` M-1 runs it through the real fetcher and loop with no Worker.
 
+> **Multi-user (migrations/0009, `docs/multi-user.md`).** The list is now the de-duplicated union of
+> every ACTIVE user's `user_watch_targets`. Each target carries its own `market` and a wire
+> `targetId` of `${type}-${slug(query)}@${location}-${radius}`; the top-level `market` is present
+> only when every target shares one. A listing's `market_key` is the evidence pool, not the market
+> the collector ran in; the area it was seen in is `listing_markets`. The paragraphs below describe
+> the single-user tables 0009 replaced for readers.
+
 It lives in `watch_market` and `watch_targets` (migration `0005`) and **deliberately not in
 `search_revisions`.** That table is the append-only revision log and its revision number is
 `evaluateBatch`'s staleness key: a bump re-opens **every** evaluation task in the corpus. Adding

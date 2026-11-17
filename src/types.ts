@@ -21,7 +21,7 @@ export interface SearchLocation {
   label: string;
   /**
    * REQUIRED, not optional, and that is the whole guard. `slug` is the Facebook URL path segment
-   * `PUT /api/watch` stores in `watch_market.location`; an optional field would let a caller
+   * `PUT /api/watch` stores in `users.location` (migrations/0009); an optional field would let a caller
    * build a location object the write refuses at runtime. Required makes it a `tsc` error
    * instead -- the argument `src/App.tsx`'s `getToken` prop already makes for itself.
    */

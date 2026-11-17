@@ -336,7 +336,16 @@ evaluation_tasks
 notifications
 
 monitor_lock
+
+users                 -- migrations/0009: up to three people, each with an area, rule, Start/Stop
+user_watch_targets
+user_notifications
+listing_markets       -- which areas saw a listing; listings.market_key is the evidence pool
+watch_cap_guard       -- the shared 9-search budget, enforced by a CHECK
 ```
+
+Multi-user is described in `docs/multi-user.md`: one evidence pool, area membership, per-user rules
+applied at read and notify time, and the shared search budget.
 
 `price_observations` and `model_stats` stay in the same D1 so aggregate changes and observation changes can be atomic.
 

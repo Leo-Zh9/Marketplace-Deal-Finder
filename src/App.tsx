@@ -521,16 +521,15 @@ function App({ identity, onSignOut, getToken }: AppProps) {
        * its own `LIMIT 50`, so a page of a component the user is not watching can no longer arrive
        * and be filtered to nothing in the browser.
        *
-       * THE MARKET IS THE SAVED ONE, NOT THE FORM'S. The read filters on the market key of the
-       * SAVED `watch_market` row, so rows collected in an old market no longer reach the page after
-       * a saved location change -- nothing deletes them from `listings`, so before that filter they
-       * stayed here indefinitely, DEALs first. The form's UNSAVED `location` and `radiusKm` are
-       * still REQUIRED to press this button (validate() refuses without them) and still reach
-       * nothing here: listings exist only for a market the collector has run in, and it runs in the
-       * saved one, so an unsaved market has nothing stored to show. That is disclosed on screen
-       * rather than applied. The DEAL RULE is the same: a verdict is committed by `evaluateBatch`
-       * against the STORED revision, so an UNSAVED rule edit previews against the saved rule. The
-       * action-help line under the buttons says both.
+       * THE AREA IS THE SAVED ONE, NOT THE FORM'S. The read filters on the user's SAVED area
+       * (migrations/0009: `users.location`/`radius_km`, matched through `listing_markets`), so
+       * listings seen only in an old area no longer reach the page after a saved location change.
+       * The form's UNSAVED `location` and `radiusKm` are still REQUIRED to press this button
+       * (validate() refuses without them) and still reach nothing here: a listing is a member of
+       * an area only once the collector has searched it. That is disclosed on screen rather than
+       * applied. The DEAL RULE is the same: the page applies the user's STORED rule, so an UNSAVED
+       * rule edit previews against the saved rule. The action-help line under the buttons says
+       * both.
        */
       const result = await marketplaceClient.preview(settings, getToken);
       setListings(result.listings);
@@ -899,7 +898,7 @@ function App({ identity, onSignOut, getToken }: AppProps) {
             </p>
             {/*
               * ON SCREEN, because the surprise is reachable in one click: Preview reads listings
-              * collected in the SAVED market and judged against the SAVED deal rule, so editing the
+              * seen in the SAVED area and judged against the SAVED deal rule, so editing the
               * location, radius or rule and previewing without saving shows the saved ones.
               */}
             <p className="action-help" data-testid="preview-scope">
