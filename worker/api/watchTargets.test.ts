@@ -9,6 +9,7 @@ import {
 } from "../testing/evaluationFingerprint";
 import { addTarget, addUser, setArea, setMonitoring, TEST_ALLOWLIST } from "../testing/users";
 import { handleGetWatchTargets } from "./watchTargets";
+import { readFileSync } from "node:fs";
 
 /** The environment every production read sees: the owner and the two extra test users approved. */
 const ENV = { APP_ENV: "production", APPROVED_EMAILS: TEST_ALLOWLIST };
@@ -330,5 +331,27 @@ describe("GET /api/watch-targets", () => {
       ["gpu-rtx@toronto-25", "RTX"],
       ["gpu-rtx@toronto-25~2", "rtx"],
     ]);
+  });
+
+  /**
+   * W-contract: THE COLLECTOR'S OWN FIXTURE IS WHAT THIS WORKER SENDS. PR1 pinned the per-target
+   * wire in `collector/testing/fixtures/watchTargetsPerTargetMarket.json` and runs it through the real
+   * collector loop (runTargets.test.ts M-1). The same three searches seeded here -- two users,
+   * Toronto 25 km and Hamilton 20 km -- must come back byte-for-byte as that fixture, so the two
+   * sides cannot drift apart.
+   */
+  it("W-contract: two users' searches serialise to the collector's per-target fixture", async () => {
+    await seedMarket();
+    await seedTarget("cpu-toronto", "cpu", "cpu");
+    await seedTarget("gpu-toronto", "gpu", "graphics card");
+    await addUser(database.db, 2, "second@example.com", true);
+    await seedMarket({ location: "hamilton", latitude: 43.2557, longitude: -79.8711, radiusKm: 20 }, 2);
+    await seedTarget("mine", "gpu", "graphics card", 2);
+
+    const fixture: unknown = JSON.parse(
+      readFileSync(new URL("../../collector/testing/fixtures/watchTargetsPerTargetMarket.json", import.meta.url), "utf8"),
+    );
+    const result = await read();
+    expect(result.ok && result.body).toEqual(fixture);
   });
 });
