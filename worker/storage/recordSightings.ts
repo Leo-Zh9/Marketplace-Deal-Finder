@@ -14,7 +14,7 @@
  * netting zero. If you find yourself binding a number you read a moment ago, stop.
  */
 
-import { marketKey as computeMarketKey, type Market } from "./marketKey";
+import { marketKey as computeMarketKey, EVIDENCE_POOL_KEY, type Market } from "./marketKey";
 import {
   HEARTBEAT_SECONDS,
   type ContributionOutcome,
@@ -181,6 +181,20 @@ const HEARTBEAT_LISTING = `UPDATE listings           SET last_seen_at = ?3
 const HEARTBEAT_OBS = `UPDATE price_observations SET last_seen_at = ?3
  WHERE source = ?1 AND listing_id = ?2 AND last_seen_at < ?4`;
 
+/**
+ * AREA MEMBERSHIP (migrations/0009), on EVERY sighting path -- NEW, CHANGED and UNCHANGED alike --
+ * keyed by the market the collector actually searched. The insert always lands for a first sighting
+ * in an area; a repeat sighting refreshes `last_seen_at` only past the heartbeat window, exactly like
+ * HEARTBEAT_LISTING, so an unchanged listing costs no write between heartbeats. The suppression is in
+ * the statement, not a JS `if`, for the reason HEARTBEAT_LISTING states.
+ * ?1 area key, ?2 source, ?3 listing_id, ?4 now, ?5 now - heartbeatSeconds.
+ */
+const UPSERT_MEMBERSHIP = `INSERT INTO listing_markets (market_key, source, listing_id, last_seen_at)
+VALUES (?1, ?2, ?3, ?4)
+ON CONFLICT (market_key, source, listing_id) DO UPDATE
+   SET last_seen_at = excluded.last_seen_at
+ WHERE listing_markets.last_seen_at < ?5`;
+
 interface Contribution {
   marketKey: string;
   modelKey: string;
@@ -207,7 +221,13 @@ export const recordSightings = async (
 ): Promise<SightingReport> => {
   const { source, now } = input;
   const heartbeatSeconds = input.heartbeatSeconds ?? HEARTBEAT_SECONDS;
-  const marketKey = computeMarketKey(input.market);
+  // TWO KEYS, AND MIXING THEM UP IS THE DEFECT THE POOL EXISTS TO PREVENT. `marketKey` is the
+  // evidence pool (marketKey.ts): the hash, the observation, the aggregate and the listing row all
+  // carry it, whatever area this page came from. `areaKey` is the area the collector searched, and
+  // it reaches ONE statement: the membership upsert. Computed eagerly, so a bad market still throws
+  // before any write (listings.ts validates it first).
+  const marketKey = EVIDENCE_POOL_KEY;
+  const areaKey = computeMarketKey(input.market);
   const usage: D1Usage = { rowsRead: 0, rowsWritten: 0 };
   const results: SightingResult[] = [];
 
@@ -344,7 +364,11 @@ export const recordSightings = async (
               ? "CHANGED"
               : "UNCHANGED";
 
-      const statements: D1PreparedStatement[] = [];
+      const statements: D1PreparedStatement[] = [
+        db
+          .prepare(UPSERT_MEMBERSHIP)
+          .bind(areaKey, source, listing.listingId, now, now - heartbeatSeconds),
+      ];
       let contribution: ContributionOutcome;
 
       if (outcome === "UNCHANGED") {

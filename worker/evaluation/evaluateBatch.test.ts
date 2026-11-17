@@ -14,7 +14,7 @@
  */
 
 import { cleanupStaleObservations } from "../storage/cleanupStaleObservations";
-import { marketKey } from "../storage/marketKey";
+import { EVIDENCE_POOL_KEY } from "../storage/marketKey";
 import type { Market } from "../storage/marketKey";
 import { recordSightings } from "../storage/recordSightings";
 import type { Listing, Sighting } from "../storage/types";
@@ -65,8 +65,8 @@ const T0 = 1_760_000_000;
 const DAY = 24 * 60 * 60;
 
 const MARKET_A: Market = { latitude: 43.4643, longitude: -80.5204, radiusKm: 25 };
-const MARKET_B: Market = { latitude: 43.4643, longitude: -80.5204, radiusKm: 50 };
-const MARKET_A_KEY = marketKey(MARKET_A);
+/** Every sighting's stored rows carry the evidence pool (migrations/0009), whatever its area. */
+const MARKET_A_KEY = EVIDENCE_POOL_KEY;
 
 const MODEL = "RTX_4070_SUPER";
 
@@ -415,15 +415,31 @@ describe("evaluateBatch -- aggregates never mix", () => {
     await build("lo", [20_500, 20_100, 20_200, 20_300, 20_400, 20_600]);
   };
 
-  // E5. Two market_keys (radius 25 and 50), same model and variant, chosen so the VERDICT differs.
+  // E5. Two market_keys, same model and variant, chosen so the VERDICT differs. recordSightings
+  // writes ONE key since migrations/0009 (EVIDENCE_POOL_KEY), so the second key's aggregate is a
+  // decoy written directly: a read that dropped `market_key` from STATS_JOIN_KEYS would join it.
   it("E5: reads only its own market's aggregate", async () => {
-    await twoGroupFixture(async (suffix, prices) => {
-      await sight(
-        prices.map((priceCents, index) => valid({ listingId: `${suffix}-${index}`, priceCents })),
-        T0,
-        suffix === "hi" ? MARKET_A : MARKET_B,
-      );
-    });
+    await sight(
+      [20_000, 30_000, 31_000, 32_000, 33_000, 34_000].map((priceCents, index) =>
+        valid({ listingId: `hi-${index}`, priceCents }),
+      ),
+      T0,
+      MARKET_A,
+    );
+    const pooled = await db
+      .prepare("SELECT market_key, model_key, variant_key FROM model_stats")
+      .all<{ market_key: string; model_key: string; variant_key: string }>();
+    expect(pooled.results).toHaveLength(1);
+    const { model_key: modelKey, variant_key: variantKey } = pooled.results[0];
+    for (const decoyKey of ["43.4643,-80.5204|50km", "00.0000,00.0000|1km"]) {
+      await db
+        .prepare(
+          `INSERT INTO model_stats (market_key, model_key, variant_key, count, total_price_cents)
+           VALUES (?1, ?2, ?3, 5, 101600)`,
+        )
+        .bind(decoyKey, modelKey, variantKey)
+        .run();
+    }
 
     const report = await evaluateBatch(db, {
       source: SOURCE,
@@ -433,19 +449,13 @@ describe("evaluateBatch -- aggregates never mix", () => {
       leaseToken: "token-e5",
     });
 
-    // hi-0 at 20000 against 5 / 160000 (average 32000): 20000*5*10000 <= 160000*8000 -> DEAL
+    // hi-0 at 20000 against 5 / 160000 (average 32000): 20000*5*10000 <= 160000*8000 -> DEAL.
+    // Against the decoy (5 / 101600, average 20320) it would be NOT_DEAL.
     expect(outcomeFor(report.outcomes, "hi-0")).toMatchObject({
       verdict: "DEAL",
       referenceCount: 5,
       referenceTotalCents: 160_000,
       referenceAverageCents: 32_000,
-    });
-    // lo-0 at 20500 against 5 / 101600 (average 20320): 20500*5*10000 > 101600*8000 -> NOT_DEAL
-    expect(outcomeFor(report.outcomes, "lo-0")).toMatchObject({
-      verdict: "NOT_DEAL",
-      referenceCount: 5,
-      referenceTotalCents: 101_600,
-      referenceAverageCents: 20_320,
     });
   });
 

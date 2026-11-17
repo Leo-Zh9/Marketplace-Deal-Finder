@@ -7,14 +7,15 @@ import {
 } from "./cleanupStaleObservations";
 import { recordSightings } from "./recordSightings";
 import { STALE_AFTER_SECONDS, type Listing, type Sighting } from "./types";
-import type { Market } from "./marketKey";
+import { EVIDENCE_POOL_KEY, type Market } from "./marketKey";
 import { createTestDatabase, truncateAll, type TestDatabase } from "../testing/d1";
 
 const SOURCE = "test-provider";
 const T0 = 1_760_000_000;
 const DAY = 24 * 60 * 60;
 const MARKET: Market = { latitude: 43.4643, longitude: -80.5204, radiusKm: 25 };
-const MARKET_KEY = "43.4643,-80.5204|25km";
+/** The stored key is the evidence pool, whatever area the sighting came from (migrations/0009). */
+const MARKET_KEY = EVIDENCE_POOL_KEY;
 
 let database!: TestDatabase;
 let db!: D1Database;

@@ -11,6 +11,7 @@ import type { AuthDependencies } from "../auth/verifyFirebaseToken";
 import { handleRequest, type Environment } from "../index";
 import { createTestDatabase, truncateAll, type TestDatabase } from "../testing/d1";
 import type { SightingReport } from "../storage/types";
+import { EVIDENCE_POOL_KEY } from "../storage/marketKey";
 import {
   MAX_INGEST_BODY_BYTES,
   MAX_LISTINGS_PER_BATCH,
@@ -28,6 +29,7 @@ const REQUEST_CLOCK = 1_800_000_000;
 const SOURCE = "test-marketplace";
 const COMPONENT_TYPE = "psu";
 const MARKET = { latitude: 45.4215, longitude: -75.6972, radiusKm: 31 };
+/** The AREA the envelope names: it reaches `listing_markets`, and nothing else (migrations/0009). */
 const MARKET_KEY = "45.4215,-75.6972|31km";
 
 let database!: TestDatabase;
@@ -168,10 +170,20 @@ describe("POST /api/listings", () => {
       "SELECT * FROM listings ORDER BY listing_id",
     );
     expect(stored).toHaveLength(3);
+    // The envelope's area is recorded as MEMBERSHIP, one row per listing.
+    expect(
+      await rows<Record<string, unknown>>(
+        "SELECT market_key, listing_id FROM listing_markets ORDER BY listing_id",
+      ),
+    ).toEqual([
+      { market_key: MARKET_KEY, listing_id: "L-901" },
+      { market_key: MARKET_KEY, listing_id: "L-902" },
+      { market_key: MARKET_KEY, listing_id: "L-903" },
+    ]);
     expect(stored[0]).toMatchObject({
       source: SOURCE,
       listing_id: "L-901",
-      market_key: MARKET_KEY,
+      market_key: EVIDENCE_POOL_KEY,
       component_type: "psu",
       model_key: null,
       // The '' sentinel, applied by recordSightings. A NULL here would break ON CONFLICT and
@@ -462,7 +474,7 @@ describe("POST /api/listings", () => {
 
     expect(response.status).toBe(200);
     const stored = await database.db
-      .prepare("SELECT market_key FROM listings LIMIT 1")
+      .prepare("SELECT market_key FROM listing_markets LIMIT 1")
       .first<{ market_key: string }>();
     expect(stored?.market_key).toBe("43.0000,-79.0000|1km");
   });
@@ -819,7 +831,7 @@ describe("POST /api/listings", () => {
     expect(observations).toHaveLength(1);
     expect(observations[0]).toMatchObject({
       listing_id: "L-904",
-      market_key: MARKET_KEY,
+      market_key: EVIDENCE_POOL_KEY,
       model_key: "Corsair RM850x Shift",
       // The '' sentinel, never NULL: SUBTRACT_OLD's correlated EXISTS matches on it.
       variant_key: "",
@@ -829,7 +841,7 @@ describe("POST /api/listings", () => {
     const stats = await rows<Record<string, unknown>>("SELECT * FROM model_stats");
     expect(stats).toHaveLength(1);
     expect(stats[0]).toMatchObject({
-      market_key: MARKET_KEY,
+      market_key: EVIDENCE_POOL_KEY,
       model_key: "Corsair RM850x Shift",
       variant_key: "",
       count: 1,

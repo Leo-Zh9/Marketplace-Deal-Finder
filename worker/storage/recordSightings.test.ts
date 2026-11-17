@@ -2,8 +2,8 @@
 
 import { cleanupStaleObservations } from "./cleanupStaleObservations";
 import { recordSightings } from "./recordSightings";
-import { STALE_AFTER_SECONDS, type Listing, type Sighting } from "./types";
-import type { Market } from "./marketKey";
+import { HEARTBEAT_SECONDS, STALE_AFTER_SECONDS, type Listing, type Sighting } from "./types";
+import { EVIDENCE_POOL_KEY, type Market } from "./marketKey";
 import { createTestDatabase, truncateAll, type TestDatabase } from "../testing/d1";
 
 const SOURCE = "test-provider";
@@ -82,6 +82,15 @@ const allStats = async (): Promise<StatsRow[]> =>
           " ORDER BY market_key, model_key, variant_key",
       )
       .all<StatsRow>()
+  ).results;
+
+const members = async () =>
+  (
+    await db
+      .prepare(
+        "SELECT market_key, listing_id, last_seen_at FROM listing_markets ORDER BY market_key, listing_id",
+      )
+      .all<{ market_key: string; listing_id: string; last_seen_at: number }>()
   ).results;
 
 const allObservations = async () =>
@@ -203,7 +212,7 @@ describe("first sighting", () => {
     expect(listings[0]).toMatchObject({
       source: SOURCE,
       listing_id: "l1",
-      market_key: "43.4643,-80.5204|25km",
+      market_key: EVIDENCE_POOL_KEY,
       component_type: "gpu",
       model_key: "RTX_4070_SUPER",
       variant_key: "", // the '' sentinel, never NULL
@@ -217,7 +226,7 @@ describe("first sighting", () => {
       {
         source: SOURCE,
         listing_id: "l1",
-        market_key: "43.4643,-80.5204|25km",
+        market_key: EVIDENCE_POOL_KEY,
         model_key: "RTX_4070_SUPER",
         variant_key: "",
         price_cents: 50_000,
@@ -227,7 +236,7 @@ describe("first sighting", () => {
 
     expect(await allStats()).toEqual([
       {
-        market_key: "43.4643,-80.5204|25km",
+        market_key: EVIDENCE_POOL_KEY,
         model_key: "RTX_4070_SUPER",
         variant_key: "",
         count: 1,
@@ -532,7 +541,7 @@ describe("the count CHECK", () => {
     expect((await allObservations()).map((row) => row.listing_id)).toEqual(["c1", "c2"]);
     expect(await allStats()).toEqual([
       {
-        market_key: "43.4643,-80.5204|25km",
+        market_key: EVIDENCE_POOL_KEY,
         model_key: "RTX_5080",
         variant_key: "",
         count: 1,
@@ -594,7 +603,7 @@ describe("an explicitly free listing", () => {
     // reads (1, 30_000). Either way the arithmetic here is what dies, not a label.
     expect(await allStats()).toEqual([
       {
-        market_key: "43.4643,-80.5204|25km",
+        market_key: EVIDENCE_POOL_KEY,
         model_key: "RX_7900_XTX",
         variant_key: "",
         count: 2,
@@ -808,48 +817,47 @@ describe("evaluation task queuing", () => {
 // ---------------------------------------------------------------------------
 // Test 10 -- the same model in two different market_key values.
 // ---------------------------------------------------------------------------
-describe("same model in two markets", () => {
-  it("keeps two separate aggregates that never mix", async () => {
-    // TWO DISTINCT LISTINGS. Sighting the same listing under both markets would MOVE its one
-    // observation, giving [{25km, 0}, {50km, 1}] rather than two rows of 1.
+describe("same model in two areas", () => {
+  it("pools ONE aggregate under EVIDENCE_POOL_KEY and records each area in listing_markets", async () => {
+    // migrations/0009: the pool constant, never the sighting's market, reaches the aggregate. A
+    // mutation that binds the sighting's market splits this back into two rows.
     await sight([valid({ listingId: "l1", priceCents: 50_000 })], T0, MARKET_A);
     await sight([valid({ listingId: "l2", priceCents: 60_000 })], T0, MARKET_B);
 
     expect(await allStats()).toEqual([
       {
-        market_key: "43.4643,-80.5204|25km",
+        market_key: EVIDENCE_POOL_KEY,
         model_key: "RTX_4070_SUPER",
         variant_key: "",
-        count: 1,
-        total_price_cents: 50_000,
-      },
-      {
-        market_key: "43.4643,-80.5204|50km",
-        model_key: "RTX_4070_SUPER",
-        variant_key: "",
-        count: 1,
-        total_price_cents: 60_000,
+        count: 2,
+        total_price_cents: 110_000,
       },
     ]);
-
-    await sight([valid({ listingId: "l1", priceCents: 45_000 })], T0 + 60, MARKET_A);
-
-    expect(await allStats()).toEqual([
-      {
-        market_key: "43.4643,-80.5204|25km",
-        model_key: "RTX_4070_SUPER",
-        variant_key: "",
-        count: 1,
-        total_price_cents: 45_000,
-      },
-      {
-        market_key: "43.4643,-80.5204|50km",
-        model_key: "RTX_4070_SUPER",
-        variant_key: "",
-        count: 1,
-        total_price_cents: 60_000,
-      },
+    expect(await members()).toEqual([
+      { market_key: "43.4643,-80.5204|25km", listing_id: "l1", last_seen_at: T0 },
+      { market_key: "43.4643,-80.5204|50km", listing_id: "l2", last_seen_at: T0 },
     ]);
+
+    // THE SAME LISTING SEEN FROM A SECOND, OVERLAPPING AREA is UNCHANGED -- no hash churn, no
+    // contribution move -- and gains a membership row.
+    const overlap = await sight([valid({ listingId: "l1", priceCents: 50_000 })], T0 + 60, MARKET_B);
+    expect(overlap.results).toEqual([{ listingId: "l1", outcome: "UNCHANGED", contribution: "none" }]);
+    expect(overlap.usage.rowsWritten).toBe(1);
+    expect((await allStats())[0]).toMatchObject({ count: 2, total_price_cents: 110_000 });
+    expect((await members()).map((row) => `${row.market_key}/${row.listing_id}`)).toEqual([
+      "43.4643,-80.5204|25km/l1",
+      "43.4643,-80.5204|50km/l1",
+      "43.4643,-80.5204|50km/l2",
+    ]);
+  });
+
+  it("refreshes a membership only past the heartbeat window, like HEARTBEAT_LISTING", async () => {
+    await sight([valid({ listingId: "l1", priceCents: 50_000 })], T0, MARKET_A);
+    await sight([valid({ listingId: "l1", priceCents: 50_000 })], T0 + 60, MARKET_A);
+    expect((await members())[0].last_seen_at).toBe(T0);
+    const late = T0 + HEARTBEAT_SECONDS + 1;
+    await sight([valid({ listingId: "l1", priceCents: 50_000 })], late, MARKET_A);
+    expect((await members())[0].last_seen_at).toBe(late);
   });
 });
 
@@ -931,21 +939,18 @@ describe("consistency properties over a scripted sequence", () => {
     expect((await allStats())[0]).toMatchObject({ count: 5, total_price_cents: 150_000 });
     await assertBoth("step 3 (two price changes)", now);
 
-    // 4a -- move p5 into market B, where it becomes the ONLY listing in its group.
+    // 4a -- p5 seen from area B. Under the evidence pool (migrations/0009) this is NOT a market
+    // move: the contribution stays in the one pooled aggregate and only a membership is added.
     now = T0 + 180;
     await sight([valid({ listingId: "p5", priceCents: 50_000 })], now, MARKET_B);
-    await assertBoth("step 4a (market move into B)", now);
+    await assertBoth("step 4a (seen from area B)", now);
 
-    // 4b -- a market move OF THE ONLY LISTING IN ITS GROUP. This leaves market B's aggregate
-    // row at (0,0): a write-path orphan the GROUPS query can never see, because GROUPS selects
-    // FROM price_observations and that group no longer has any.
+    // 4b -- and from area C. Still one aggregate row, no orphan, three memberships for p5.
     now = T0 + 240;
     await sight([valid({ listingId: "p5", priceCents: 50_000 })], now, MARKET_C);
-    const orphaned = (await allStats()).find(
-      (row) => row.market_key === "43.4643,-80.5204|50km",
-    );
-    expect(orphaned).toMatchObject({ count: 0, total_price_cents: 0 });
-    await assertBoth("step 4b (market move of the only listing in its group)", now);
+    expect((await allStats()).map((row) => row.market_key)).toEqual([EVIDENCE_POOL_KEY]);
+    expect((await members()).filter((row) => row.listing_id === "p5")).toHaveLength(3);
+    await assertBoth("step 4b (seen from area C)", now);
 
     // 5 -- a validity flip to INVALID_REFERENCE.
     now = T0 + 300;
