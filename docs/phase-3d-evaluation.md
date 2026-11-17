@@ -50,8 +50,9 @@ comes from the real seam in step 1, and it lives inside the CPU test file so it 
 for one.
 
 The captured batch is the **pessimistic** shape, not the steady state: the 15 candidates are spread
-so that all four claim statements run (5 `PENDING`, 4 expired `PROCESSING`, 3 stale-revision
-`COMPLETE`, 3 `NEEDS_REVIEW`), plus one candidate read and one completion batch. The steady state
+so that all five claim statements run (5 `PENDING`, 4 expired `PROCESSING`, 2 stale-revision
+`COMPLETE`, 2 stale-revision `NEEDS_REVIEW`, 2 `NEEDS_REVIEW` with sufficient evidence), plus one
+candidate read and one completion batch. The steady state
 fills entirely in tier 1 and issues three round trips.
 
 ### The numbers
@@ -93,7 +94,7 @@ figure below is measured by a test in `evaluationCpu.test.ts`, not asserted from
 | C1b — claim only, 20,000 `PENDING` sharing one `created_at` | 90 |
 | C2 — whole call, post-bump: 200 / 5,000 / 20,000 tasks all eligible | 141 / 141 / 141 |
 | C2b — whole call, 15 stale tasks behind 20,000 settled ones | 142 |
-| C3 — claim only, 20,000 `NEEDS_REVIEW` sharing one `evaluated_at` | 101 |
+| C3 — claim only, 200 / 2,000 `NEEDS_REVIEW` with no evidence | 819 / 8,019, 0 written |
 
 C1's 165 decomposes as 90 (tier 1 claim) + 60 (candidate read) + 15 (completion batch), and C1
 asserts it exactly rather than only under a ceiling: every other figure here is a ceiling, and a
@@ -146,15 +147,31 @@ and it is why `listing_id` is the fourth column of the index.
 
 ## The parts most likely to be "simplified" back into a defect
 
-- **The four tiers run 1, 2, 4, 3 — finite work before infinite work.** Tier 3 (`NEEDS_REVIEW`) is
-  unbounded and perpetual by design; tier 4 (stale revision) is finite. With tier 3 third, tier 4
-  gets `batchSize − alreadyClaimed`, which is zero whenever `|NEEDS_REVIEW| ≥ batchSize`, and the
-  stale set is never claimed at all.
+- **The five tiers run 1, 2, 4, 4b, 3 — revision work before evidence work.** Tier 3 used to
+  re-claim every `NEEDS_REVIEW` row on every call; run before tier 4, it left tier 4
+  `batchSize − alreadyClaimed`, which was zero whenever `|NEEDS_REVIEW| ≥ batchSize`, and the
+  stale set was never claimed at all. Tier 3 is now gated on evidence (below), but the order
+  stays: a revision bump is the recovery path for a bad verdict and must not wait on the market.
+- **Tier 3 claims a parked task only when its evidence has arrived.** The claim joins the same
+  `listings` / `price_observations` / `model_stats` rows the candidate read does, through the
+  same SQL expressions, and admits a task only when the reference count and total are integers,
+  the total is at least zero and the count at least `MINIMUM_REFERENCE_COUNT` — the exact
+  complement of `decide`'s corrupt and insufficient branches, so everything it admits completes.
+  Without the gate it re-claimed all 333 parked production tasks every run for 721 rows written,
+  with none able to resolve. It covers a candidate that is its own observation, and a free listing
+  (which never contributes). Two other listings without an observation are not admitted. One
+  whose observation was cleaned away has gone unseen; its next sighting restores the observation
+  and `recordSightings` requeues it. One with no model key never has evidence; `recordSightings`
+  requeues it when its validity or asking price changes. A revision bump reaches both.
+- **Tier 4b re-judges every `NEEDS_REVIEW` task once per revision bump.** Tier 3 only looks at
+  the current revision, so without 4b a settings change would never reach a parked task.
 - **The tier loop breaks only when the batch is full**, never because a tier returned zero rows. In
   the ordinary steady state nothing is `PENDING`, so an early return on tier 1 would disable
   expired-lease recovery, evidence re-checks and revision bumps simultaneously.
-- **Tier 3 orders by `evaluated_at`, which every completion writes.** Nothing advances `created_at`
-  for a task that stays in the queue, so ordering by it returns the same 15 rows forever.
+- **Tier 3 orders by `evaluated_at`, which every completion writes**, so when more parked tasks
+  become eligible at once than a batch holds, the longest-waiting go first. `CROSS JOIN` keeps
+  `evaluation_tasks` the outer loop on `evaluation_tasks_attempt`, so that order costs no sort
+  (`claimPlan.test.ts`).
 - **`lease_token` is a fresh UUID per claim.** The lease *value* cannot serve as the fence: a
   requeue between two claims at the same instant gives both claimants the same lease, and the stale
   verdict wins.
@@ -187,8 +204,9 @@ observations when observations were never the problem. That is the entire reason
 category exists, so it applies to every column the aggregate has. Test R12 asserts both cases side
 by side, because a distinction that lives only in the code is one nothing protects.
 
-Both rotate in tier 3, so both self-heal if the aggregate is ever repaired — a `model_stats` change
-never requeues a listing, so tier 3 is the only way back. Only the second one tells you a model is
+Both self-heal if the aggregate is ever repaired — a `model_stats` change never requeues a listing,
+so tier 3 is the only way back, and it claims the task as soon as the repaired aggregate passes
+both gates. Only the second one tells you a model is
 **stuck** rather than merely waiting, which is the whole reason it is not folded into the first.
 The signal lives in the returned `EvaluationReport`: 3D persists `verdict`, not `reason`.
 
@@ -240,12 +258,14 @@ historical price table to replay from.
   `cleanupStaleObservations` keep the observation row and the aggregate in lockstep. 3C's own
   doc has a drift-detection section, which means 3C already anticipates they can diverge. No test
   3D can write catches that, because the test would have to assume the invariant it is checking.
-- **`evaluation_tasks` grows with `listings`, which has no retention policy.** Every claim tier is
-  O(batchSize) in rows read at any table size, so growth costs storage rather than time.
-- **Tier 3 rotates**, so a large `NEEDS_REVIEW` population is re-examined round-robin rather than
-  not at all. The time to revisit any one task grows linearly with the population; if that ever
-  becomes a problem the right lever is a re-check interval on `evaluated_at`, not a change to the
-  ordering.
+- **`evaluation_tasks` grows with `listings`, which has no retention policy.** Every claim tier
+  but tier 3 is O(batchSize) in rows read at any table size, so growth costs storage rather than
+  time; tier 3 is the exception below.
+- **Tier 3 reads linearly in the parked population.** It claims only tasks whose evidence has
+  arrived, so it writes nothing for the rest — but to find that out it walks every
+  current-revision `NEEDS_REVIEW` row, about 4 rows read per row (C3). If that population ever
+  grows large enough to matter, the lever is an index covering `evaluated_revision`, not a return
+  to re-claiming.
 - **The frontend's `EvaluationStatus` used `"NOT_A_DEAL"` while 3D's `Verdict` uses `"NOT_DEAL"`.**
   **Settled by the read-path slice, and settled by renaming rather than by mapping**: the
   frontend union, `statusLabels`, `statusHints` and the `.status-badge--not_deal` CSS class all

@@ -166,7 +166,7 @@ so a budget checked at a coarser granule bounds nothing. The drain's granule is 
 flat: 141 rows for the tiered claim at 200, 5,000 and 20,000 eligible alike, and a full 15-task
 batch measures 150 read / 120 written, a partial 121/80, an empty-queue batch 14/0 — the read
 figure moving with **how many claim tiers run** (measured: 135 when tier 1 alone fills the batch,
-146 across all four), not with fixture size, and the writes being exactly 120 in every fixture
+146 across the first four), not with fixture size, and the writes being exactly 120 in every fixture
 measured. The writes are the side that binds. **A bounded
 granule is safe to multiply.** That asymmetry is the whole justification and is the first thing
 to re-check if either constant moves.
@@ -180,8 +180,16 @@ per day (48 runs)                  = 34,560          ->  34.6% of D1's 100,000/d
 ```
 
 and it is why `DRAIN_STEPS` is 3 and not 4: at 8 batches/run that is 46,080/day, and collection
-has not spent anything yet. The worst case is the **steady state**, not an outlier — tier 3
-(`NEEDS_REVIEW`) is unconditionally eligible on every call by design.
+has not spent anything yet.
+
+**That worst case applies only while real work exists.** It used to be the steady state: tier 3
+re-claimed every `NEEDS_REVIEW` task on every call, so a standing backlog spent all six batches
+every run. Measured in production: 90 claims and 721 rows written per run — 34.6k of the day's
+41.9k D1 writes — with 333 parked tasks and not one able to resolve. Tier 3 now claims a parked
+task only when the evidence `decide` needs has arrived, so a parked backlog costs no writes and
+the drain stops on its first empty batch. What it costs instead is reads: tier 3 walks every
+current-revision `NEEDS_REVIEW` row, about 4 rows read per parked row (`evaluationCpu.test.ts`
+C3), once or twice a run — about 65k–130k reads a day at 333 rows, against a 5M/day allowance.
 
 **The lease token carries a fresh UUID per claim:**
 `${runId}:${stepIndex}:${batchIndex}:${crypto.randomUUID()}`.
@@ -208,8 +216,9 @@ There is no poison-task loop: `evaluateBatch` catches per-candidate failures int
 only throws are D1-level or validation-level and neither is task-specific.
 
 The drain stops for a source when a batch reports **`claimed === 0`** — the conjunction of all
-four tiers. Note the asymmetry with `evaluateBatch`'s *internal* tier loop, which must never
-break on a zero tier.
+five tiers. Note the asymmetry with `evaluateBatch`'s *internal* tier loop, which must never
+break on a zero tier. A parked `NEEDS_REVIEW` task with no new evidence is not claimed by any
+tier, so a source whose only tasks are parked exhausts on its first batch.
 
 ## Telemetry
 

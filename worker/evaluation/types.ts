@@ -40,7 +40,7 @@ export type EvaluationReason =
    * `count < MINIMUM_REFERENCE_COUNT`; waiting repairs the first and NEVER repairs the second.
    * Reporting them alike is precisely the misreading this reason exists to stop -- an operator
    * looking for more observations, when observations were never the problem. Every candidate in
-   * that model parks at NEEDS_REVIEW and rotates in tier 3 until the aggregate is repaired.
+   * that model parks at NEEDS_REVIEW, and tier 3 claims it again once the aggregate is repaired.
    * Note the signal lives in the returned `EvaluationReport` only: 3D persists `verdict`, not
    * `reason`, so a stuck model is visible to the caller of the batch, not in `evaluation_tasks`.
    */

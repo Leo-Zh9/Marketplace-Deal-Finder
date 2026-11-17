@@ -164,11 +164,13 @@ const maximumPriceSettings = () =>
 
 /**
  * DISCOUNT with no `model_stats` row at all: `reference_count` is NULL, so every candidate
- * lands on `insufficient-evidence` -> status NEEDS_REVIEW -> UNCONDITIONALLY ELIGIBLE IN TIER 3
- * ON EVERY CALL. That is what lets a handful of rows sustain a full batch budget without the
- * drain exhausting, which is exactly the production steady state the budget is sized for.
+ * lands on `insufficient-evidence` -> status NEEDS_REVIEW, and tier 3 never claims it again
+ * without new evidence. So each seeded PENDING task is claimed exactly once: a test that needs
+ * the drain to keep claiming through step k seeds at least k steps' worth of PENDING tasks.
+ * (Before tier 3 was evidence-gated these rows were re-claimed on every call, so five of them
+ * sustained any batch budget -- which was also the production write budget's steady state.)
  */
-const rotatingSettings = () =>
+const evidenceStarvedSettings = () =>
   bootstrapSettings({ mode: "DISCOUNT", percent: MIN_DISCOUNT_PERCENT, maxCents: null });
 
 /**
@@ -227,14 +229,14 @@ describe("runMonitor", () => {
    * step 0's result forever and the drain silently never advances; a missing step vanishes
    * from here and nowhere else.
    *
-   * 4 drain steps x 7 batches, and the fixture rotates in tier 3 so nothing exhausts and all
-   * four steps are reached. 4, 7, 9 are mutually distinct and none is a default.
+   * 4 drain steps x 7 batches x 9 = 252 PENDING tasks, each claimed once, so nothing exhausts
+   * before drain-3's last batch and all four steps are reached. 4, 7, 9 are mutually distinct and
+   * none is a default.
    */
   it("R1: runs exactly the named steps, in order, with the shared step config", async () => {
-    await rotatingSettings();
-    // Small on purpose: the drain's cost here is 28 batches of round trips, not rows, and five
-    // rotating tasks sustain all 28 exactly as well as fifty would.
-    await seed("alpha", 5);
+    await evidenceStarvedSettings();
+    // Exactly the 28 batches' worth: one fewer batch of tasks and drain-3 exhausts the source.
+    await seed("alpha", 252);
 
     const recorder = recording();
     const run = await runMonitor(db, recorder.stepper, { now: T }, "run-one", {
@@ -258,6 +260,7 @@ describe("runMonitor", () => {
     ]);
     expect(run.stepsUsed).toBe(9);
     expect(run.status).toBe("OK");
+    expect({ batches: run.batches, claimed: run.claimedCount }).toEqual({ batches: 28, claimed: 252 });
     // ONE retry, not runCleanup's two: each retry re-claims up to a step's worth of further
     // tasks and strands them until the next fire.
     expect(recorder.configs.every((config) => config === MONITOR_STEP_CONFIG)).toBe(true);
@@ -265,7 +268,7 @@ describe("runMonitor", () => {
   });
 
   /**
-   * R2. `claimed === 0` -- the conjunction of all four tiers -- is the only exhaustion signal,
+   * R2. `claimed === 0` -- the conjunction of all five tiers -- is the only exhaustion signal,
    * and the drain must spend a batch to learn it. 40 tasks at batchSize 13 is 13, 13, 13, 1,
    * then the empty fifth.
    */
@@ -467,9 +470,11 @@ describe("runMonitor", () => {
    * last line of this test is the one that fails.
    */
   it("R5: a stolen lock aborts the drain and the release does not touch the thief", async () => {
-    await rotatingSettings();
-    await seed("alpha", 11);
+    await evidenceStarvedSettings();
+    // 90: drain-0's 7 x 9 = 63 leave 27 PENDING, so drain-1 has work and the steal is what stops it.
+    await seed("alpha", 90);
 
+    let stolenAt: string | null = null;
     const thiefAcquiredAt = T + 601;
     const recorder = recording({
       before: async (name) => {
@@ -482,6 +487,7 @@ describe("runMonitor", () => {
           lockSeconds: 709,
         });
         expect(stolen.acquired).toBe(true);
+        stolenAt = name;
       },
     });
 
@@ -499,6 +505,12 @@ describe("runMonitor", () => {
       stepFailures: run.stepFailures,
       stepsUsed: run.stepsUsed,
     }).toEqual({ status: "LOCK_LOST", batches: 7, stepFailures: 0, stepsUsed: 6 });
+    // The steal fired, and it is what stopped the drain: 27 tasks were left to claim.
+    expect(stolenAt).toBe("drain-1");
+    expect(await taskStatuses()).toEqual([
+      { status: "NEEDS_REVIEW", n: 63 },
+      { status: "PENDING", n: 27 },
+    ]);
     expect((await runRows()).map((row) => row.status)).toEqual(["LOCK_LOST"]);
     expect(await lockRow()).toEqual({
       run_id: "run-thief",
@@ -516,8 +528,9 @@ describe("runMonitor", () => {
    * 3 drain-0, 4 drain-1.
    */
   it("R6: a failed drain step degrades the run, records the message, and still releases", async () => {
-    await rotatingSettings();
-    await seed("alpha", 11);
+    await evidenceStarvedSettings();
+    // 90, as in R5: drain-1 has 27 PENDING to claim, so it is reached and its failure is real.
+    await seed("alpha", 90);
 
     const run = await runMonitor(db, recording({ failAt: 4 }).stepper, { now: T }, "run-degraded", {
       drainSteps: 4,
@@ -534,6 +547,11 @@ describe("runMonitor", () => {
     }).toEqual({ status: "DEGRADED", stepFailures: 1, batches: 7, stepsUsed: 7 });
     expect(run.errors).toHaveLength(1);
     expect(run.errors[0]).toMatch(/^drain-1: .*step exploded/);
+    // failAt 4 fired on drain-1's body before it claimed anything.
+    expect(await taskStatuses()).toEqual([
+      { status: "NEEDS_REVIEW", n: 63 },
+      { status: "PENDING", n: 27 },
+    ]);
     expect((await runRows()).map((row) => row.status)).toEqual(["DEGRADED"]);
     expect(await lockRow()).toEqual({ run_id: "", acquired_at: T, expires_at: 0 });
   });

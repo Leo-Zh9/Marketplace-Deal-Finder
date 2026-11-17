@@ -1,8 +1,10 @@
 // @vitest-environment node
 
 /**
- * The CPU invariant: p95 < 8 ms on a 15-listing batch, and every claim tier O(batchSize) in rows
- * read at any corpus or eligible-set size.
+ * The CPU invariant: p95 < 8 ms on a 15-listing batch, and every claim tier but tier 3
+ * O(batchSize) in rows read at any corpus or eligible-set size. Tier 3 (evidence-gated
+ * NEEDS_REVIEW) reads linearly in the parked population and writes nothing it does not claim;
+ * C3 pins its slope.
  *
  * WHAT THIS HARNESS MUST NOT BE. createTestDatabase() hands the Node test process a PROXY: every
  * prepare, bind and all is an HTTP round trip to workerd. Measured directly, one 15-candidate
@@ -355,38 +357,84 @@ describe("evaluation CPU -- rows read per call", () => {
   });
 
   /**
-   * C3. TIER 3 AT SCALE. Every completion in one batch writes the same `now`, so evaluated_at
-   * ties are the NORMAL case -- which is why listing_id is in evaluation_tasks_attempt. Without
-   * it SQLite sorts the whole tier to pick 15.
+   * C3. TIER 3 WITH NO EVIDENCE -- the production steady state: 333 parked tasks, not one with
+   * enough evidence. It replaced a test that pinned the OLD tier 3 at a flat 101 rows read per
+   * claim; that flatness was bought by re-claiming 15 rows on every call, and those 15 claims were
+   * 120 rows WRITTEN per batch, six batches a monitor run.
    *
-   * MEASURED HERE, not assumed: the four-tier claim reads 101 rows against 200, 5,000 and 20,000
-   * NEEDS_REVIEW rows -- IDENTICAL at every size. Tier 3's own UPDATE ... RETURNING accounts for
-   * 90 of them: D1 charges the index maintenance of the claim's own write, not only the 15-row
-   * covering scan that chooses the rows. The property under test is that the number does not
-   * move with the corpus; the ceiling is set just above the measurement so the named mutation
-   * (which sorts the whole tier) cannot hide under it.
+   * The evidence-gated claim inverts the trade. It writes NOTHING when nothing is eligible, and to
+   * learn that it walks every current-revision NEEDS_REVIEW row once: one table lookup for
+   * evaluated_revision (evaluation_tasks_attempt is not covering for it) and the listings,
+   * price_observations and model_stats probes. So the read cost is LINEAR in that population, and
+   * this test pins the slope: rows_read <= K x N + FIXED at N = 200 and N = 2,000. Measured:
+   * 819 at 200 and 8,019 at 2,000 -- K = 4 rows per parked row, and FIXED = 19 for the four other
+   * tiers' empty seeks, the same at both sizes. claimPlan.test.ts pins the plan itself.
    */
-  it("C3: claims 15 of 20,000 NEEDS_REVIEW rows sharing one evaluated_at", async () => {
-    await bulkTasks({
-      prefix: "nr-",
-      count: 20_000,
-      status: "NEEDS_REVIEW",
-      createdAt: T0,
-      evaluatedRevision: CURRENT_REVISION,
-      evaluatedAt: T0,
-    });
+  it("C3: a claim over N evidence-starved NEEDS_REVIEW rows writes nothing and reads at most K x N", async () => {
+    const K = 4;
+    const FIXED = 19;
+    const measured: Array<{ parked: number; rowsRead: number }> = [];
 
-    const claim = await claimEvaluationTasks(db, {
-      source: SOURCE,
-      batchSize: 15,
-      now: T0 + 1000,
-      leaseSeconds: 300,
-      leaseToken: "token-c3",
-      searchRevision: CURRENT_REVISION,
-    });
+    for (const parked of [200, 2_000]) {
+      await truncateAll(db);
+      // About three contributors per model, so every candidate sees two references: thin.
+      const models = Math.ceil(parked / 3);
+      await db
+        .prepare(
+          `INSERT INTO listings
+                  (source, listing_id, market_key, component_type, model_key, variant_key, title,
+                   price_cents, location_text, url, validity, content_hash, first_seen_at, last_seen_at)
+           WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < ?3)
+           SELECT ?1, ?2 || printf('%06d', n), ?4, 'gpu', 'M-' || (n % ?5), '', 'thin', 20000 + n,
+                  'Waterloo, ON', 'https://example.test/x', 'VALID', 'hash-t-' || n, ?6, ?6
+             FROM seq`,
+        )
+        .bind(SOURCE, "nr-", parked, MARKET_A_KEY, models, T0)
+        .run();
+      await db
+        .prepare(
+          `INSERT INTO price_observations
+                  (source, listing_id, market_key, model_key, variant_key, price_cents, last_seen_at)
+           SELECT source, listing_id, market_key, model_key, variant_key, price_cents, last_seen_at
+             FROM listings`,
+        )
+        .run();
+      await db
+        .prepare(
+          `INSERT INTO model_stats (market_key, model_key, variant_key, count, total_price_cents)
+           SELECT market_key, model_key, variant_key, COUNT(*), SUM(price_cents)
+             FROM price_observations GROUP BY market_key, model_key, variant_key`,
+        )
+        .run();
+      await bulkTasks({
+        prefix: "nr-",
+        count: parked,
+        status: "NEEDS_REVIEW",
+        createdAt: T0,
+        evaluatedRevision: CURRENT_REVISION,
+        evaluatedAt: T0,
+      });
 
-    expect(claim.tasks).toHaveLength(15);
-    expect(claim.usage.rowsRead).toBeLessThanOrEqual(150);
+      const claim = await claimEvaluationTasks(db, {
+        source: SOURCE,
+        batchSize: 15,
+        now: T0 + 1000,
+        leaseSeconds: 300,
+        leaseToken: `token-c3-${parked}`,
+        searchRevision: CURRENT_REVISION,
+      });
+
+      expect(claim.tasks).toEqual([]);
+      expect(claim.usage.rowsWritten).toBe(0);
+      measured.push({ parked, rowsRead: claim.usage.rowsRead });
+    }
+
+    console.log(
+      `C3 evidence-starved claim: ${measured.map((m) => `${m.parked} parked -> ${m.rowsRead} rows read (${(m.rowsRead / m.parked).toFixed(2)}/row)`).join(", ")}`,
+    );
+    for (const sample of measured) {
+      expect(sample.rowsRead, `parked=${sample.parked}`).toBeLessThanOrEqual(K * sample.parked + FIXED);
+    }
   });
 });
 
@@ -469,10 +517,12 @@ describe("evaluation CPU -- measurement", () => {
       evaluatedRevision: CURRENT_REVISION,
       evaluatedAt: T0,
     });
-    // THE PESSIMISTIC SHAPE: the 15 claimed candidates are spread so that ALL FOUR tier
-    // statements run -- 5 PENDING, 4 expired PROCESSING, 3 stale-revision COMPLETE and the rest
-    // NEEDS_REVIEW, of which tier 3 takes the last 3. The steady state fills in tier 1 and issues
-    // ONE claim statement; capturing that would measure the cheap case.
+    // THE PESSIMISTIC SHAPE: the 15 claimed candidates are spread so that ALL FIVE tier
+    // statements run -- 5 PENDING, 4 expired PROCESSING, 2 stale-revision COMPLETE, 2
+    // stale-revision NEEDS_REVIEW (tier 4b) and the rest NEEDS_REVIEW at the current revision, of
+    // which tier 3 takes the last 2. Each of those has its own observation inside the
+    // 60-observation aggregate, so it has the evidence tier 3 requires. The steady state fills in
+    // tier 1 and issues ONE claim statement; capturing that would measure the cheap case.
     await db
       .prepare(
         `INSERT INTO evaluation_tasks
@@ -481,11 +531,11 @@ describe("evaluation CPU -- measurement", () => {
          SELECT ?1, listing_id,
                 CASE WHEN CAST(substr(listing_id, 5) AS INTEGER) <= 5  THEN 'PENDING'
                      WHEN CAST(substr(listing_id, 5) AS INTEGER) <= 9  THEN 'PROCESSING'
-                     WHEN CAST(substr(listing_id, 5) AS INTEGER) <= 12 THEN 'COMPLETE'
+                     WHEN CAST(substr(listing_id, 5) AS INTEGER) <= 11 THEN 'COMPLETE'
                      ELSE 'NEEDS_REVIEW' END,
                 ?2,
                 CASE WHEN CAST(substr(listing_id, 5) AS INTEGER) <= 9  THEN NULL
-                     WHEN CAST(substr(listing_id, 5) AS INTEGER) <= 12 THEN ?4
+                     WHEN CAST(substr(listing_id, 5) AS INTEGER) <= 13 THEN ?4
                      ELSE ?3 END,
                 'NOT_DEAL', ?2, 0, ''
            FROM listings
@@ -505,9 +555,9 @@ describe("evaluation CPU -- measurement", () => {
     const real = await evaluateBatch(recordingDatabase(db, capture), input);
     expect(real.claimed).toBe(15);
     expect(real.outcomes).toHaveLength(15);
-    // All four claim statements, plus the candidate read -- a REAL 15-row result over a real
+    // All five claim statements, plus the candidate read -- a REAL 15-row result over a real
     // 60-observation aggregate.
-    expect(capture.all.size).toBe(5);
+    expect(capture.all.size).toBe(6);
     expect(capture.batch).toHaveLength(15);
 
     const stub = replayDatabase(capture);

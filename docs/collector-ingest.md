@@ -394,10 +394,12 @@ between `VALID` with a null key and `INVALID_REFERENCE` across searches — meas
 `"5-Bay Hard Drive Station"` and a Microsoft Surface Pro whose only marker is `SSD`. **Part 2 took
 the first off the list**: with MSI's inner `MAG` droppable, that board now names its catalog model,
 resolves to `motherboard` from every search, and is keyed — **3 ids** remain. They carry no key, so **no aggregate ever moves**. Their
-stored validity is whichever search saw them last, but **evaluation is NOT re-queued by the flip**:
-`recordSightings` queues a task only on `NEW` or when the contribution changes, and a listing with
-no key has none on either side. So the verdict goes **stale relative to the stored validity** —
-it is the verdict of the first sighting, while the row may since have flipped. **A wider, quieter
+stored validity is whichever search saw them last, and **each flip re-queues evaluation**:
+`recordSightings` queues a task on `NEW`, when the contribution changes, and when the stored
+validity or asking price changes — the last term exists for exactly these listings, which have no
+contribution on either side. So the verdict follows the stored validity. The cost is measured: a
+flip writes 4 rows to queue the task and 8 to judge it again, against 1 for the listing row
+alone. (Before that term existed, the verdict went stale relative to the stored validity.) **A wider, quieter
 version of the same thing:** 30 of the 132 ids have a stored row that depends on which search saw
 them last — the 4 above plus 26 whole machines, bundles and unconfirmed titles that are refused
 under every search but evidence no single catalogued type, so they fall back to the search's type
