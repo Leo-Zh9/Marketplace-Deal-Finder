@@ -1,5 +1,6 @@
 // @vitest-environment node
 
+import { readFileSync } from "node:fs";
 import type { HealthPostResult, RunHealthReport } from "./postRunHealth.ts";
 import * as exitCodes from "./run.ts";
 import type { CollectorConfig, RunSummary } from "./run.ts";
@@ -20,7 +21,7 @@ import {
   type RunAllTargetsDependencies,
   type RunLine,
 } from "./runTargets.ts";
-import type { FetchWatchTargetsResult } from "./watchTargets.ts";
+import { fetchWatchTargets, type FetchWatchTargetsResult } from "./watchTargets.ts";
 
 const processConfig: ProcessConfig = {
   apiBase: "https://api.example.workers.dev",
@@ -1225,6 +1226,181 @@ describe("running every target in the watch list", () => {
     // THE LATCH DOES NOT CUT THIS RUN. The cut starts on the NEXT run, because this one had
     // already made its nine requests by the time the overlap was measurable.
     expect(runLine.canary).toBe(false);
+  });
+
+  /**
+   * PER-TARGET MARKETS. Each target searches its own `market` when its row carries one, else the
+   * shared top-level `market`. A wire with no per-target markets behaves exactly as before: every
+   * L- row above is that evidence, unchanged.
+   */
+  const hamilton = { location: "hamilton", latitude: 43.2557, longitude: -79.8711, radiusKm: 20 };
+  const withMarket = (row: ReturnType<typeof target>, own: unknown) => ({ ...row, market: own });
+
+  /**
+   * M-1: THE WIRE FIXTURE, THROUGH THE REAL FETCHER AND THE REAL LOOP, NO WORKER. Two areas, a
+   * null top-level market, and every search goes to its own row's area. Kills: reading only the
+   * top-level market (the run is refused as "market absent"). M-2 covers own-over-shared.
+   */
+  it("M-1: the per-target wire fixture runs every target in its own market", async () => {
+    const wire = readFileSync(
+      new URL("./testing/fixtures/watchTargetsPerTargetMarket.json", import.meta.url),
+      "utf8",
+    );
+    const rows = (JSON.parse(wire) as { targets: { targetId: string; market: unknown }[] }).targets;
+    const fetchResult = await fetchWatchTargets(
+      { apiBase: processConfig.apiBase, token: processConfig.token },
+      (async () => new Response(wire, { status: 200 })) as unknown as typeof fetch,
+    );
+    expect(fetchResult).toMatchObject({ ok: true, market: null });
+
+    const { exitCode, runCalls, runLine, healthReports, savedState } = await harness({
+      fetchResult,
+      codes: [0, 0, 0],
+    });
+
+    expect(exitCode).toBe(0);
+    expect(runCalls).toEqual(
+      rows.map(({ market: own, ...row }) => ({
+        ...processConfig,
+        ...(own as object),
+        ...row,
+      })),
+    );
+    expect(runCalls.map((call) => `${call.location}-${call.radiusKm}`)).toEqual([
+      "toronto-25",
+      "hamilton-20",
+      "toronto-25",
+    ]);
+    expect(runLine).toMatchObject({ targets: 3, complete: true, exitCodes: { "0": 3 } });
+    expect(healthReports).toHaveLength(1);
+    expect(savedState).toBeDefined();
+  });
+
+  /** M-2: the row's own market beats a non-null shared one. Kills: shared spread last. */
+  it("M-2: a row's own market wins over the shared top-level market", async () => {
+    const { runCalls } = await harness({
+      targets: [withMarket(target("a"), hamilton), withMarket(target("b"), market)],
+    });
+
+    expect(runCalls.map((call) => call.location)).toEqual(["hamilton", "toronto"]);
+    expect(runCalls[0]).toEqual({ ...processConfig, ...hamilton, ...target("a") });
+    expect(runCalls[1]).toEqual({ ...processConfig, ...market, ...target("b") });
+  });
+
+  /**
+   * M-3: ON THE PER-TARGET WIRE A ROW WITHOUT A MARKET IS THAT TARGET'S EXIT 2. It never silently
+   * takes the top-level market, and a null top-level market never refuses the whole run. Kills:
+   * falling back to the top-level market when other rows carry their own (the `market` row), and
+   * the whole-run refusal for a null top-level market whenever some row lacks one (the `null` row).
+   */
+  it.each<[string, unknown]>([
+    ["a valid top-level market", market],
+    ["a null top-level market", null],
+  ])("M-3: with %s, a row without a market among rows with one is that target's exit 2", async (_label, top) => {
+    const { exitCode, runCalls, runLine, targetLines } = await harness({
+      targets: [withMarket(target("a"), hamilton), target("b", "cpu", "cpu"), withMarket(target("c"), market)],
+      market: top,
+      codes: [0, 0, 0],
+    });
+
+    expect(exitCode).toBe(2);
+    expect(runCalls.map(targetIdOf)).toEqual(["a", "c"]);
+    expect(runCalls.map((call) => call.location)).toEqual(["hamilton", "toronto"]);
+    expect(runLine).toMatchObject({ targets: 3, exitCodes: { "0": 2, "2": 1 }, complete: false });
+    expect(runLine.error).toBeUndefined();
+    expect(targetLines[1]).toMatchObject({
+      target: "b",
+      exitCode: 2,
+      error: "the target has no market of its own and no shared market applies",
+    });
+  });
+
+  /**
+   * M-3b: TODAY'S WORKER, TODAY'S MESSAGE. With no row carrying a market the refusal text is
+   * byte-identical to before.
+   */
+  it("M-3b: a null market with no per-target markets keeps the old message exactly", async () => {
+    const { runLine } = await harness({ targets: [target("a"), target("b")], market: null });
+    expect(runLine.error).toBe("the watch market is unusable: the market row is absent");
+  });
+
+  /**
+   * M-4: A MALFORMED OWN MARKET IS THAT TARGET'S EXIT 2: never searched in the shared market,
+   * never a whole-run failure, under BOTH top-level markets. The `null` top-level rows are the
+   * wire the multi-user Worker sends. Kills: falling back to the shared market on a bad own market,
+   * treating an explicit `market: null` on a row as "no market" (truthiness instead of presence),
+   * and one row's `market: null` refusing the whole run when the top-level market is null.
+   */
+  it.each<[string, unknown, unknown]>([
+    ["null, top-level valid", null, market],
+    ["a location with a slash, top-level valid", { ...hamilton, location: "hamilton/search" }, market],
+    ["a fractional radius, top-level valid", { ...hamilton, radiusKm: 12.5 }, market],
+    ["null, top-level null", null, null],
+    ["a location with a slash, top-level null", { ...hamilton, location: "hamilton/search" }, null],
+    ["a fractional radius, top-level null", { ...hamilton, radiusKm: 12.5 }, null],
+  ])("M-4: an own market of %s is that target's exit 2 and the others still run", async (_label, own, top) => {
+    const { exitCode, runCalls, runLine, targetLines } = await harness({
+      targets: [
+        withMarket(target("a"), hamilton),
+        withMarket(target("b", "cpu", "cpu"), own),
+        withMarket(target("c"), market),
+      ],
+      market: top,
+      codes: [0, 0, 0],
+    });
+
+    expect(exitCode).toBe(2);
+    expect(runCalls.map(targetIdOf)).toEqual(["a", "c"]);
+    expect(runLine).toMatchObject({ targets: 3, exitCodes: { "0": 2, "2": 1 }, complete: false });
+    expect(runLine.error).toBeUndefined();
+    expect(targetLines[1]).toMatchObject({ target: "b", componentType: "cpu", exitCode: 2 });
+    expect(String(targetLines[1].error)).toMatch(/^the target's market is unusable: /);
+  });
+
+  /**
+   * M-4c: EVERY ROW'S OWN MARKET IS NULL, TOP-LEVEL NULL. Every row still carries the key, so this
+   * is the per-target wire: three target exit 2s, never the whole-run refusal. Kills: deciding the
+   * wire by value (`raw.market !== null`) instead of key presence.
+   */
+  it("M-4c: every row with market:null is three target exit 2s, not a whole-run refusal", async () => {
+    const { exitCode, runCalls, runLine, targetLines } = await harness({
+      targets: [withMarket(target("a"), null), withMarket(target("b"), null), withMarket(target("c"), null)],
+      market: null,
+    });
+
+    expect(exitCode).toBe(2);
+    expect(runCalls).toHaveLength(0);
+    expect(runLine).toMatchObject({ targets: 3, exitCodes: { "2": 3 } });
+    expect(runLine.error).toBeUndefined();
+    expect(targetLines.map((line) => line.target)).toEqual(["a", "b", "c"]);
+  });
+
+  /**
+   * M-5: A NON-NULL SHARED MARKET IS ALWAYS VALIDATED, even when every row carries its own.
+   * Kills: validating the shared market only when some row falls back to it.
+   */
+  it("M-5: a malformed shared market is a whole-run exit 2 even when every row has its own", async () => {
+    const { exitCode, runCalls, runLine } = await harness({
+      targets: [withMarket(target("a"), hamilton), withMarket(target("b"), market)],
+      market: { ...market, radiusKm: 0 },
+    });
+
+    expect(exitCode).toBe(2);
+    expect(runCalls).toHaveLength(0);
+    expect(runLine).toMatchObject({ targets: 2, exitCodes: {} });
+  });
+
+  /** M-6: the cap still refuses first, whatever markets the rows carry. */
+  it("M-6: ten targets that each carry a market still run nothing", async () => {
+    const targets = Array.from({ length: 10 }, (_value, index) =>
+      withMarket(target(`t${index}`), hamilton),
+    );
+    const { exitCode, runCalls, runLine } = await harness({ targets, market: null });
+
+    expect(exitCode).toBe(2);
+    expect(runCalls).toHaveLength(0);
+    expect(runLine.targets).toBe(10);
+    expect(runLine.error).toContain(String(MAX_TARGETS_PER_RUN));
   });
 
   /**

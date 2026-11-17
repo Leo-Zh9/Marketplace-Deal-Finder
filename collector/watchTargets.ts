@@ -1,6 +1,7 @@
 /**
  * The watch list, read from the Worker before anything is searched: what to hunt (one row per
- * target) and where (the singleton market).
+ * target) and where (each target's own `market`, falling back to the top-level `market` for a
+ * row that carries none -- see `resolveTargetMarket`).
  *
  * ONE request, NO retry -- the same rule `postListings` states, for the same reason. The next
  * scheduled run is the retry, and a retry loop on a process that lives on a laptop is what turns
@@ -13,7 +14,10 @@
 import { LOCATION_PATTERN } from "./searchUrl.ts";
 import { REQUEST_TIMEOUT_MS } from "./types.ts";
 
-/** The market every target in one run shares. Singular by construction -- see migration 0005. */
+/**
+ * Where one search looks. The top-level `market` is present only when every target shares one;
+ * a target may carry its own (`targets[i].market`), and that one wins.
+ */
 export interface WatchMarket {
   location: string;
   latitude: number;
@@ -148,6 +152,36 @@ export const parseMarket = (raw: unknown): ParseResult<WatchMarket> => {
   }
 
   return { ok: true, value: { location, latitude, longitude, radiusKm } };
+};
+
+/**
+ * A ROW CARRIES ITS OWN MARKET WHEN THE KEY IS PRESENT, WHATEVER ITS VALUE. Presence, not
+ * truthiness: `market: null` on a row is that row's market being absent, and it is refused by
+ * `parseMarket` rather than quietly replaced by the shared one. A row with no `market` key is
+ * what every Worker before per-target markets sends, and only that row falls back.
+ */
+export const hasOwnMarket = (raw: unknown): raw is Record<string, unknown> & { market: unknown } =>
+  isRecord(raw) && "market" in raw;
+
+/**
+ * THE MARKET ONE TARGET SEARCHES: its own when the row carries one, else `shared`. A row whose own
+ * market is malformed is REFUSED, never sent to the shared market -- that would collect one
+ * person's searches into another person's area, silently.
+ *
+ * `shared` is the fallback the CALLER allows. `runAllTargets` passes the top-level market only on
+ * the old wire (no row carries a market) and null on the per-target wire, so there a row without
+ * a market of its own is refused by the last branch rather than given someone else's area.
+ */
+export const resolveTargetMarket = (
+  raw: unknown,
+  shared: WatchMarket | null,
+): ParseResult<WatchMarket> => {
+  if (hasOwnMarket(raw)) {
+    const own = parseMarket(raw.market);
+    return own.ok ? own : { ok: false, reason: `the target's market is unusable: ${own.reason}` };
+  }
+  if (shared !== null) return { ok: true, value: shared };
+  return { ok: false, reason: "the target has no market of its own and no shared market applies" };
 };
 
 export const parseTarget = (raw: unknown): ParseResult<WatchTarget> => {

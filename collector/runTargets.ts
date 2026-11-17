@@ -30,10 +30,13 @@ import {
   type TargetRun,
 } from "./runState.ts";
 import {
+  hasOwnMarket,
   parseMarket,
   parseTarget,
+  resolveTargetMarket,
   type FetchWatchTargetsInput,
   type FetchWatchTargetsResult,
+  type WatchMarket,
 } from "./watchTargets.ts";
 
 /** Everything in a `CollectorConfig` that is NOT per-target and NOT per-market. */
@@ -539,14 +542,34 @@ export const runAllTargets = async (
     );
   }
 
-  const market = parseMarket(fetched.market);
-  if (!market.ok) {
-    // NO DEFAULT MARKET IS EVER INVENTED. A wrong market collects into the wrong `market_key`
-    // silently, and `targets` still reports the returned count so the operator is not told they
-    // have zero targets when they have two.
-    return await emit(
-      wholeRunFailure(config, returned, EXIT_CONFIG, `the watch market is unusable: ${market.reason}`),
-    );
+  /**
+   * TWO WIRES, DECIDED ONCE FOR THE WHOLE LIST.
+   *
+   * NO ROW CARRIES A `market` KEY: every Worker before per-target markets. The top-level market is
+   * checked exactly as it always was (a null or malformed one is the whole run's exit 2) and every
+   * target searches it. `perTarget` is false and nothing below differs from before.
+   *
+   * ANY ROW CARRIES ONE: the per-target wire. Every target must bring its own market, and a row
+   * without one is THAT target's exit 2 -- it never silently takes the top-level market, which is
+   * only a summary of the rows. A null top-level market is normal here; a non-null one is still
+   * validated, because a malformed one says the two sides disagree about the wire.
+   *
+   * `perTarget` IS DECIDED BY KEY PRESENCE (`hasOwnMarket`), so one row's `market: null` is that
+   * row's exit 2 and can never turn the list back into the old wire and refuse the whole run.
+   */
+  const perTarget = fetched.targets.some((raw) => hasOwnMarket(raw));
+  let shared: WatchMarket | null = null;
+  if (fetched.market !== null || !perTarget) {
+    const market = parseMarket(fetched.market);
+    if (!market.ok) {
+      // NO DEFAULT MARKET IS EVER INVENTED. A wrong market collects into the wrong `market_key`
+      // silently, and `targets` still reports the returned count so the operator is not told
+      // they have zero targets when they have two.
+      return await emit(
+        wholeRunFailure(config, returned, EXIT_CONFIG, `the watch market is unusable: ${market.reason}`),
+      );
+    }
+    shared = market.value;
   }
 
   /**
@@ -594,9 +617,28 @@ export const runAllTargets = async (
     }
 
     const target = parsed.value;
+
+    // A ROW WHOSE OWN MARKET IS MALFORMED OR MISSING (on the per-target wire) IS THAT TARGET'S
+    // EXIT 2, NEVER A FALLBACK TO THE TOP-LEVEL MARKET (that would search one person's query in
+    // another person's area) and never a whole-run failure (one bad area must not stop every
+    // other search). Same validation, same exit code as the top-level market.
+    const targetMarket = resolveTargetMarket(raw, perTarget ? null : shared);
+    if (!targetMarket.ok) {
+      const failed: TargetOutcome = {
+        target: target.targetId,
+        componentType: target.componentType,
+        exitCode: EXIT_CONFIG,
+        error: targetMarket.reason,
+        query: target.query,
+      };
+      outcomes.push(failed);
+      emitTarget(failed);
+      continue;
+    }
+
     const perTargetConfig: CollectorConfig = {
       ...config.process,
-      ...market.value,
+      ...targetMarket.value,
       ...target,
     };
 
