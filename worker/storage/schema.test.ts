@@ -8,6 +8,7 @@ import watchSql from "../../migrations/0005_watch_targets.sql?raw";
 import healthSql from "../../migrations/0006_collector_health.sql?raw";
 import notificationsSql from "../../migrations/0007_notifications.sql?raw";
 import monitoringStateSql from "../../migrations/0008_monitoring_state.sql?raw";
+import multiUserSql from "../../migrations/0009_multi_user.sql?raw";
 import { COMPONENT_TYPES } from "../api/listings";
 
 /**
@@ -73,8 +74,8 @@ describe("0001_initial_storage.sql", () => {
   // worker/api/collectorHealth.test.ts failing with `no such table: collector_health` -- so the
   // two failures together say which edit was missed.
   // 0007 adds exactly the one notifications table (S-p1 below pins its shape), and 0008 exactly
-  // the one monitoring_state singleton (S-m1 below).
-  it("creates exactly the thirteen tables 0001 through 0008 define", async () => {
+  // the one monitoring_state singleton (S-m1 below). 0009 adds exactly five (S-u1 below).
+  it("creates exactly the eighteen tables 0001 through 0009 define", async () => {
     // The filter is required: after the migration sqlite_master also holds D1's internal
     // _cf_METADATA and four sqlite_autoindex_* entries for the composite primary keys.
     const { results } = await database.db
@@ -86,6 +87,7 @@ describe("0001_initial_storage.sql", () => {
     expect(results.map((row) => row.name)).toEqual([
       "collector_health",
       "evaluation_tasks",
+      "listing_markets",
       "listings",
       "model_stats",
       "monitor_lock",
@@ -95,6 +97,10 @@ describe("0001_initial_storage.sql", () => {
       "price_observations",
       "search_revisions",
       "search_settings",
+      "user_notifications",
+      "user_watch_targets",
+      "users",
+      "watch_cap_guard",
       "watch_market",
       "watch_targets",
     ]);
@@ -132,6 +138,9 @@ describe("0001_initial_storage.sql", () => {
       // makes an autoindex, invisible here by the `sql IS NOT NULL` rule.
       "notifications_due",
       "price_observations_last_seen_at",
+      // 0009: the per-user claim lookup. users.email UNIQUE and the composite primary keys make
+      // autoindexes, invisible here; listing_markets is WITHOUT ROWID, so its key IS the table.
+      "user_notifications_due",
     ]);
   });
 
@@ -1006,5 +1015,123 @@ describe("0008_monitoring_state.sql", () => {
     for (const statement of statements) {
       expect(statement).not.toMatch(/\b(DROP|ALTER|UPDATE|DELETE)\b/);
     }
+  });
+});
+
+/**
+ * Multi-user (migrations/0009). Additive, like every migration before it. Every behavioural row
+ * below that writes is REFUSED, so the shipped seed S-u3 reads is left as it was found.
+ */
+describe("0009_multi_user.sql", () => {
+  /** S-u1. THE CHECKS, EXHAUSTIVELY -- a presence pin, like S2b, S7b, S-n3 and S-m1. */
+  it("S-u1: declares exactly these CHECK constraints, and no others", () => {
+    expect(extractChecks(splitSqlStatements(multiUserSql).join("\n"))).toEqual([
+      "user_id >= 1",
+      "email IS NULL OR (length(email) > 0 AND email = lower(trim(email)))",
+      "(location IS NULL) = (latitude IS NULL) AND (location IS NULL) = (longitude IS NULL) AND (location IS NULL) = (radius_km IS NULL)",
+      "location IS NULL OR (length(location) > 0 AND location NOT GLOB '*[^a-z0-9-]*')",
+      "radius_km IS NULL OR (typeof(radius_km) = 'integer' AND radius_km >= 1 AND radius_km <= 25)",
+      "latitude IS NULL OR (latitude >= -90 AND latitude <= 90)",
+      "longitude IS NULL OR (longitude >= -180 AND longitude <= 180)",
+      "mode IS NULL OR mode IN ('DISCOUNT', 'MAXIMUM_PRICE', 'BOTH')",
+      "minimum_discount_bp IS NULL OR (typeof(minimum_discount_bp) = 'integer' AND minimum_discount_bp >= 0 AND minimum_discount_bp <= 10000)",
+      "maximum_price_cents IS NULL OR (typeof(maximum_price_cents) = 'integer' AND maximum_price_cents >= 0)",
+      "mode IS NULL OR mode = 'MAXIMUM_PRICE' OR minimum_discount_bp IS NOT NULL",
+      "mode IS NULL OR mode = 'DISCOUNT' OR maximum_price_cents IS NOT NULL",
+      "monitoring_enabled IN (0, 1)",
+      "typeof(monitoring_changed_at) = 'integer' AND monitoring_changed_at >= 0",
+      "length(target_id) > 0",
+      "length(component_type) > 0",
+      "length(query) > 0",
+      "status IN ('PENDING', 'SENDING', 'SENT', 'DELIVERY_UNKNOWN', 'FAILED', 'CANCELLED')",
+      "attempts >= 0",
+      "last_error IS NULL OR length(last_error) <= 200",
+      "ok = 1",
+    ]);
+  });
+
+  /** S-u2. The rule and area CHECKs, behaviourally: each refuses the value it exists to refuse. */
+  it.each<[string, string]>([
+    ["a mixed-case email", "UPDATE users SET email = 'Owner@Example.com' WHERE user_id = 1"],
+    ["an empty email", "UPDATE users SET email = '' WHERE user_id = 1"],
+    ["a partial area", "UPDATE users SET location = NULL WHERE user_id = 1"],
+    ["a REAL radius", "UPDATE users SET radius_km = 12.5 WHERE user_id = 1"],
+    ["a radius of 26", "UPDATE users SET radius_km = 26 WHERE user_id = 1"],
+    ["a path in the location", "UPDATE users SET location = 'toronto/search' WHERE user_id = 1"],
+    ["an invented mode", "UPDATE users SET mode = 'WISHFUL', minimum_discount_bp = 1 WHERE user_id = 1"],
+    ["DISCOUNT without bp", "UPDATE users SET mode = 'DISCOUNT' WHERE user_id = 1"],
+    ["MAXIMUM_PRICE without max", "UPDATE users SET mode = 'MAXIMUM_PRICE' WHERE user_id = 1"],
+    ["a REAL bp", "UPDATE users SET mode = 'DISCOUNT', minimum_discount_bp = 43.5 WHERE user_id = 1"],
+    ["bp above 10000", "UPDATE users SET mode = 'DISCOUNT', minimum_discount_bp = 10001 WHERE user_id = 1"],
+    ["a REAL maximum", "UPDATE users SET mode = 'MAXIMUM_PRICE', maximum_price_cents = 60000.5 WHERE user_id = 1"],
+    ["monitoring_enabled = 2", "UPDATE users SET monitoring_enabled = 2 WHERE user_id = 1"],
+    ["user_id 0", "INSERT INTO users (user_id, monitoring_enabled, monitoring_changed_at, created_at) VALUES (0, 0, 0, 0)"],
+    ["a stored cap-guard row", "INSERT INTO watch_cap_guard (ok) VALUES (0)"],
+  ])("S-u2: %s is refused", async (_label, statement) => {
+    await expect(database.db.prepare(statement).run()).rejects.toThrow(/constraint failed/);
+  });
+
+  /**
+   * S-u3. THE SHIPPED SEED. Applied to an install with the 0005 market, the 0008 running seed and no
+   * settings: user 1 is that install, UNCLAIMED, with no rule; a DISCOUNT evidence rule now exists.
+   */
+  it("S-u3: user 1 is the existing install, unclaimed, and an evidence rule exists", async () => {
+    const users = await database.db.prepare("SELECT * FROM users").all<Record<string, unknown>>();
+    expect(users.results).toEqual([
+      {
+        user_id: 1,
+        email: null,
+        location: "toronto",
+        latitude: 43.6532,
+        longitude: -79.3832,
+        radius_km: 25,
+        mode: null,
+        minimum_discount_bp: null,
+        maximum_price_cents: null,
+        monitoring_enabled: 1,
+        monitoring_changed_at: 0,
+        alerts_reopened_at: null,
+        created_at: 0,
+      },
+    ]);
+    const targets = await database.db
+      .prepare("SELECT user_id, target_id, component_type, query FROM user_watch_targets ORDER BY target_id")
+      .all();
+    expect(targets.results).toEqual([
+      { user_id: 1, target_id: "cpu-toronto", component_type: "cpu", query: "cpu" },
+      { user_id: 1, target_id: "gpu-toronto", component_type: "gpu", query: "graphics card" },
+    ]);
+    const rule = await database.db
+      .prepare(
+        `SELECT r.mode, r.minimum_discount_percent FROM search_settings s
+           JOIN search_revisions r ON r.revision = s.current_revision`,
+      )
+      .all();
+    expect(rule.results).toEqual([{ mode: "DISCOUNT", minimum_discount_percent: 0 }]);
+  });
+
+  /** S-u4. The FILE: creates, seeds and copies; nothing is dropped, altered, deleted or updated. */
+  it("S-u4: is additive -- nothing destructive", () => {
+    for (const statement of splitSqlStatements(multiUserSql)) {
+      expect(statement).toMatch(/^(CREATE (TABLE|INDEX)|INSERT INTO) /);
+      expect(statement).not.toMatch(/\b(DROP|ALTER|DELETE)\b/);
+    }
+  });
+
+  /** S-u5. listing_markets is WITHOUT ROWID, keyed (market_key, source, listing_id). */
+  it("S-u5: listing_markets is keyed by area then listing, with no rowid", async () => {
+    const { results } = await database.db
+      .prepare("SELECT name, pk FROM pragma_table_info('listing_markets') ORDER BY cid")
+      .all<{ name: string; pk: number }>();
+    expect(results).toEqual([
+      { name: "market_key", pk: 1 },
+      { name: "source", pk: 2 },
+      { name: "listing_id", pk: 3 },
+      { name: "last_seen_at", pk: 0 },
+    ]);
+    const sql = await database.db
+      .prepare("SELECT sql FROM sqlite_master WHERE name = 'listing_markets'")
+      .first<{ sql: string }>();
+    expect(sql?.sql).toMatch(/WITHOUT ROWID/);
   });
 });

@@ -13,6 +13,7 @@ import watchTargetsSql from "../../migrations/0005_watch_targets.sql?raw";
 import collectorHealthSql from "../../migrations/0006_collector_health.sql?raw";
 import notificationsSql from "../../migrations/0007_notifications.sql?raw";
 import monitoringStateSql from "../../migrations/0008_monitoring_state.sql?raw";
+import multiUserSql from "../../migrations/0009_multi_user.sql?raw";
 
 /**
  * Strip `--` line comments, split on `;`, trim, drop empties. The schema contains no
@@ -27,6 +28,9 @@ export const splitSqlStatements = (sql: string): string[] =>
     .split(";")
     .map((statement) => statement.trim())
     .filter((statement) => statement.length > 0);
+
+/** User 1's email after `truncateAll`. In the allowlist every test environment builds. */
+export const TEST_OWNER_EMAIL = "owner@example.com";
 
 export interface TestDatabase {
   db: D1Database;
@@ -50,22 +54,34 @@ export interface TestDatabase {
  * a missing notifications table; without 0008, every monitoring-controls test would fail on a
  * missing monitoring_state and S1 would report twelve tables instead of thirteen.
  */
-export const applyMigrations = async (db: D1Database): Promise<void> => {
-  for (const sql of [
-    schemaSql,
-    evaluationSql,
-    searchSql,
-    monitorSql,
-    watchTargetsSql,
-    collectorHealthSql,
-    notificationsSql,
-    monitoringStateSql,
-  ]) {
+export const MIGRATIONS: readonly string[] = [
+  schemaSql,
+  evaluationSql,
+  searchSql,
+  monitorSql,
+  watchTargetsSql,
+  collectorHealthSql,
+  notificationsSql,
+  monitoringStateSql,
+  multiUserSql,
+];
+
+/**
+ * `through` applies only the first N files -- the migration test (worker/storage/migration0009.test.ts)
+ * builds a pre-0009 install, seeds it, measures it, and only then applies 0009.
+ */
+export const applyMigrations = async (
+  db: D1Database,
+  through: number = MIGRATIONS.length,
+): Promise<void> => {
+  for (const sql of MIGRATIONS.slice(0, through)) {
     await db.batch(splitSqlStatements(sql).map((statement) => db.prepare(statement)));
   }
 };
 
-export const createTestDatabase = async (): Promise<TestDatabase> => {
+export const createTestDatabase = async (
+  through: number = MIGRATIONS.length,
+): Promise<TestDatabase> => {
   // Miniflare 5 rejects the flat v4 options object ("workers: undefined ... expected
   // array"); convertV4MiniflareOptions is the exported compat helper for it.
   const mf = new Miniflare(
@@ -79,7 +95,7 @@ export const createTestDatabase = async (): Promise<TestDatabase> => {
 
   await mf.ready;
   const db = (await mf.getD1Database("DB")) as unknown as D1Database;
-  await applyMigrations(db);
+  await applyMigrations(db, through);
 
   return { db, dispose: () => mf.dispose() };
 };
@@ -130,6 +146,19 @@ export const truncateAll = async (db: D1Database): Promise<void> => {
     db.prepare("DELETE FROM collector_health"),
     // Phase 4. No seed, no foreign key: an ordinary delete.
     db.prepare("DELETE FROM notifications"),
+    // 0009. Children before `users` (foreign keys are on), and user 1 is RESTORED -- claimed by
+    // TEST_OWNER_EMAIL, monitoring on, with NO area and NO rule, the multi-user analogue of the
+    // deleted watch_market and search_settings above: each test sets the area and rule it needs
+    // (worker/testing/users.ts). The SHIPPED seed (email NULL) is asserted by schema.test.ts.
+    db.prepare("DELETE FROM user_watch_targets"),
+    db.prepare("DELETE FROM user_notifications"),
+    db.prepare("DELETE FROM listing_markets"),
+    db.prepare("DELETE FROM watch_cap_guard"),
+    db.prepare("DELETE FROM users"),
+    db.prepare(
+      `INSERT INTO users (user_id, email, monitoring_enabled, monitoring_changed_at, created_at)
+       VALUES (1, '${TEST_OWNER_EMAIL}', 1, 0, 0)`,
+    ),
     db.prepare(
       `INSERT INTO monitor_lock (id, run_id, acquired_at, expires_at) VALUES (1, '', 0, 0)
        ON CONFLICT(id) DO UPDATE SET run_id = '', acquired_at = 0, expires_at = 0`,
