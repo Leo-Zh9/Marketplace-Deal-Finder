@@ -171,6 +171,10 @@ export interface MarketplaceClient {
    */
   startMonitoring(getToken: GetToken, signal?: AbortSignal): Promise<MonitoringState>;
   stopMonitoring(getToken: GetToken, signal?: AbortSignal): Promise<MonitoringState>;
+  /** The caller's Discord webhook: whether one is stored. The URL itself never comes back. */
+  getWebhook(getToken: GetToken): Promise<{ configured: boolean }>;
+  /** Store (a URL) or clear (null) the caller's Discord webhook. */
+  saveWebhook(url: string | null, getToken: GetToken): Promise<{ configured: boolean }>;
 }
 
 interface VerdictsResponse {
@@ -322,5 +326,16 @@ export const marketplaceClient: MarketplaceClient = {
 
   stopMonitoring(getToken, signal) {
     return postMonitoring("/api/monitoring/stop", getToken, signal);
+  },
+
+  getWebhook(getToken) {
+    return requestJsonWithAuth<{ configured: boolean }>("/api/webhook", getToken);
+  },
+
+  saveWebhook(url, getToken) {
+    return requestJsonWithAuth<{ configured: boolean }>("/api/webhook", getToken, {
+      method: "PUT",
+      body: { url },
+    });
   },
 };

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   CollectionStatusPanel,
   type MonitoringNotice,
@@ -8,6 +8,7 @@ import { DealRuleForm } from "./components/DealRuleForm";
 import { ListingCard } from "./components/ListingCard";
 import { LocationSelector } from "./components/LocationSelector";
 import { ModelSelector } from "./components/ModelSelector";
+import { WebhookForm } from "./components/WebhookForm";
 import { ApiRequestError, type AuthenticatedIdentity } from "./auth/authTypes";
 import { componentById, mockLocations } from "./data/catalog";
 import { requestErrorMessage } from "./services/apiClient";
@@ -396,6 +397,13 @@ function App({ identity, onSignOut, getToken }: AppProps) {
       setMonitoringPending(false);
     }
   };
+
+  /** Stable across renders, so the form's load effect runs once per token source. */
+  const loadWebhook = useCallback(() => marketplaceClient.getWebhook(getToken), [getToken]);
+  const saveWebhook = useCallback(
+    (url: string | null) => marketplaceClient.saveWebhook(url, getToken),
+    [getToken],
+  );
 
   const selectedComponents = useMemo(
     () => settings.components.map((component) => componentById[component]),
@@ -973,6 +981,8 @@ function App({ identity, onSignOut, getToken }: AppProps) {
               monitoringPending={monitoringPending}
               monitoringNotice={monitoringNotice}
             />
+
+            <WebhookForm load={loadWebhook} save={saveWebhook} />
 
             <section className="results-panel" aria-live="polite" aria-busy={pendingAction === "preview"}>
               <div className="results-heading">
