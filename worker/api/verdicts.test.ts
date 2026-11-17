@@ -5,14 +5,19 @@ import { STORAGE_COMPONENT_ID } from "../normalize/catalogIndex";
 import { createTestDatabase, truncateAll, type TestDatabase } from "../testing/d1";
 import { evaluateBatch } from "../evaluation/evaluateBatch";
 import { MINIMUM_REFERENCE_COUNT } from "../evaluation/types";
+import { enqueueCandidates } from "../notify/enqueue";
+import { recordSightings } from "../storage/recordSightings";
 import {
   handleGetVerdicts,
+  SELECT_MARKET,
   SELECT_VERDICTS,
   SELECT_VERDICTS_FILTERED,
   VERDICT_PAGE_SIZE,
 } from "./verdicts";
 
 const MARKET = "43.5123,-79.8765|18km";
+/** The seeded production market: a listing collected there is in ANOTHER market from `MARKET`. */
+const OLD_MARKET = "43.6532,-79.3832|25km";
 const SOURCE = "facebook-marketplace";
 
 /**
@@ -38,8 +43,24 @@ afterAll(async () => {
   await database.dispose();
 });
 
+/**
+ * THE SAVED MARKET IS SEEDED, because the read filters on it and `truncateAll` deletes the row
+ * (worker/testing/d1.ts). These are `MARKET`'s own coordinates, so every fixture below is in the
+ * saved market unless it says otherwise.
+ */
+const saveMarket = (latitude: number, longitude: number, radiusKm: number) =>
+  database.db
+    .prepare(
+      `INSERT INTO watch_market (id, location, latitude, longitude, radius_km)
+       VALUES (1, 'toronto', ?1, ?2, ?3)
+       ON CONFLICT(id) DO UPDATE SET latitude = ?1, longitude = ?2, radius_km = ?3`,
+    )
+    .bind(latitude, longitude, radiusKm)
+    .run();
+
 beforeEach(async () => {
   await truncateAll(database.db);
+  await saveMarket(43.5123, -79.8765, 18);
 });
 
 const listing = async (over: Record<string, unknown> = {}) => {
@@ -685,7 +706,7 @@ describe("GET /api/verdicts -- the server-side selection filter", () => {
 
     const baseline = await database.db
       .prepare(SELECT_VERDICTS)
-      .bind(VERDICT_PAGE_SIZE + 1)
+      .bind(VERDICT_PAGE_SIZE + 1, MARKET)
       .all();
     const unfiltered = baseline.meta.rows_read;
 
@@ -701,7 +722,7 @@ describe("GET /api/verdicts -- the server-side selection filter", () => {
     for (const [all, pairs] of table) {
       const read = await database.db
         .prepare(SELECT_VERDICTS_FILTERED)
-        .bind(VERDICT_PAGE_SIZE + 1, JSON.stringify(all), JSON.stringify(pairs))
+        .bind(VERDICT_PAGE_SIZE + 1, JSON.stringify(all), JSON.stringify(pairs), MARKET)
         .all();
       const delta = read.meta.rows_read - unfiltered;
       measured.push(`|all|=${all.length} |pairs|=${pairs.length} delta=${delta}`);
@@ -725,5 +746,148 @@ describe("GET /api/verdicts -- the server-side selection filter", () => {
     const body = await read(query(["gpu"]));
     expect(body.listings).toHaveLength(VERDICT_PAGE_SIZE);
     expect(body.truncated).toBe(true);
+  });
+});
+
+/**
+ * THE SAVED MARKET. Nothing deletes from `listings`, so before this term a SAVED location change
+ * left every old-market row on the page indefinitely, DEALs first. The key is built in JS from the
+ * `watch_market` row by the same `marketKey()` the collector's writes go through.
+ */
+describe("GET /api/verdicts -- the saved market", () => {
+  /**
+   * V-m1: AN OLD-MARKET DEAL IS NOT SERVED, filtered or not. The old row is a DEAL and newer, so
+   * it would sort FIRST if it leaked. The pairs-only read is what pins the parentheses: the
+   * selection predicate has a top-level OR, and `market AND all OR pairs` lets the old row back in
+   * through its pair.
+   */
+  it("V-m1: only the saved market's rows are served, filtered and unfiltered", async () => {
+    await listing({ listing_id: "saved", last_seen_at: 1_800_000_000 });
+    await listing({ listing_id: "old-deal", market_key: OLD_MARKET, last_seen_at: 1_800_000_500 });
+    await task("old-deal", "COMPLETE", "DEAL");
+
+    for (const params of [unfiltered(), query(["gpu"]), query([], ["gpu/GeForce RTX 5080"])]) {
+      const body = await read(params);
+      expect(body.listings.map((row) => row.listingId), params.toString()).toEqual(["saved"]);
+      expect(body.truncated, params.toString()).toBe(false);
+    }
+  });
+
+  /**
+   * V-m2: THE KEY THE COLLECTOR WRITES IS THE KEY THE READ BUILDS. The row is written through
+   * `recordSightings` from the `watch_market` row's OWN values, as the collector's echo does, and
+   * read back. Coordinates with fewer than four decimals make the fixed-width format load-bearing:
+   * a key built as `${latitude},${longitude}` would read `43.5,-79.8|18km` and match nothing.
+   */
+  it("V-m2: a listing written through recordSightings for the saved market is read back", async () => {
+    await saveMarket(43.5, -79.8, 18);
+    const stored = (
+      await database.db.prepare(SELECT_MARKET).all<{
+        latitude: number;
+        longitude: number;
+        radius_km: number;
+      }>()
+    ).results[0];
+    await recordSightings(database.db, {
+      source: SOURCE,
+      market: { latitude: stored.latitude, longitude: stored.longitude, radiusKm: stored.radius_km },
+      sightings: [
+        {
+          validity: "VALID",
+          listing: {
+            listingId: "written",
+            componentType: "gpu",
+            modelKey: "GeForce RTX 5080",
+            variantKey: null,
+            title: "RTX 5080",
+            priceCents: 100_000,
+            locationText: "Toronto, ON",
+            url: "https://example.com/written",
+            observedAt: "2026-11-16T00:00:00Z",
+          },
+        },
+      ],
+      now: 1_800_000_000,
+    });
+
+    expect((await read()).listings.map((row) => row.listingId)).toEqual(["written"]);
+    expect((await read(query(["gpu"]))).listings.map((row) => row.listingId)).toEqual(["written"]);
+  });
+
+  /**
+   * V-m3: NO SAVED MARKET FAILS CLOSED -- an empty, complete page, and the main read is not run.
+   * Listings are present, so serving them would be visible here.
+   */
+  it("V-m3: with no market row, listings present, the page is empty and the main read is skipped", async () => {
+    await listing({ listing_id: "present" });
+    await database.db.prepare("DELETE FROM watch_market").run();
+
+    for (const params of [unfiltered(), query(["gpu"])]) {
+      const prepared: string[] = [];
+      const spy = {
+        prepare: (sql: string) => {
+          prepared.push(sql);
+          return database.db.prepare(sql);
+        },
+      } as unknown as D1Database;
+      const result = await handleGetVerdicts(spy, params);
+      expect(result, params.toString()).toEqual({
+        ok: true,
+        status: 200,
+        body: { listings: [], truncated: false },
+      });
+      expect(prepared, params.toString()).toEqual([SELECT_MARKET]);
+    }
+  });
+
+  /**
+   * V-nh: THE READ IS A READ. On a seed that the notify step WOULD enqueue, the handler prepares
+   * only SELECTs and leaves `notifications` empty. The control at the end proves the seed is live:
+   * without it, an ineligible seed would pass the first half vacuously.
+   */
+  it("V-nh: the page read writes nothing, on a seed the notify step would enqueue", async () => {
+    const now = 1_800_000_600;
+    await database.db
+      .prepare(
+        `INSERT INTO search_revisions (revision, mode, minimum_discount_percent, maximum_price_cents, created_at)
+         VALUES (3, 'DISCOUNT', 20, NULL, 1)`,
+      )
+      .run();
+    await database.db
+      .prepare("INSERT INTO search_settings (id, current_revision) VALUES (1, 3)")
+      .run();
+    await database.db
+      .prepare("INSERT INTO watch_targets (target_id, component_type, query) VALUES ('g', 'gpu', 'graphics card')")
+      .run();
+    await listing({ listing_id: "eligible", last_seen_at: now - 60 });
+    await database.db
+      .prepare(
+        `INSERT INTO evaluation_tasks (source, listing_id, status, created_at, verdict,
+           evaluated_revision, evaluated_at, lease_expires_at, lease_token)
+         VALUES (?1, 'eligible', 'COMPLETE', 1, 'DEAL', 3, ?2, 0, '')`,
+      )
+      .bind(SOURCE, now - 120)
+      .run();
+
+    const prepared: string[] = [];
+    const spy = {
+      prepare: (sql: string) => {
+        prepared.push(sql);
+        return database.db.prepare(sql);
+      },
+    } as unknown as D1Database;
+    for (const params of [unfiltered(), query(["gpu"])]) {
+      const body = await handleGetVerdicts(spy, params);
+      expect(body.ok, params.toString()).toBe(true);
+    }
+    expect(prepared.length).toBeGreaterThan(0);
+    for (const sql of prepared) expect(sql.trimStart().startsWith("SELECT"), sql).toBe(true);
+    const count = async () =>
+      (await database.db.prepare("SELECT COUNT(*) AS n FROM notifications").first<{ n: number }>())?.n;
+    expect(await count()).toBe(0);
+
+    // THE CONTROL: the same seed IS enqueue-eligible.
+    expect(await enqueueCandidates(database.db, now, { all: ["gpu"], pairs: [] }, MARKET)).toBe(1);
+    expect(await count()).toBe(1);
   });
 });

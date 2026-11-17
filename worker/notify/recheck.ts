@@ -3,7 +3,8 @@
  *
  * Same `CANDIDATE_PREDICATE` as enqueue.ts, for this one listing. Any failure -- the price
  * changed so the task was re-queued, the task is no longer a DEAL, the revision moved, the
- * listing went stale, the user stopped watching it, the model was lost -- CANCELS the row. There
+ * listing went stale, the user stopped watching it, the model was lost, the saved market moved
+ * away from the one it was collected in -- CANCELS the row. There
  * is no fetch for a cancelled row.
  *
  * NEVER HOLD. A held row would need its own wake-up rule; a cancelled row already has one:
@@ -78,7 +79,13 @@ interface RecheckRow {
 /** The listing as it now stands, or null when it no longer qualifies. */
 export const recheck = async (
   db: D1Database,
-  input: { now: number; selection: NotifySelection; source: string; listingId: string },
+  input: {
+    now: number;
+    selection: NotifySelection;
+    marketKey: string | null;
+    source: string;
+    listingId: string;
+  },
 ): Promise<RecheckedListing | null> => {
   const read = await db
     .prepare(RECHECK)
@@ -89,6 +96,9 @@ export const recheck = async (
       freshnessCutoff(input.now),
       input.source,
       input.listingId,
+      // ?7, which CANDIDATE_PREDICATE names: the saved market key. NULL matches nothing, so a
+      // claimed row with no market to check against is cancelled.
+      input.marketKey,
     )
     .all<RecheckRow>();
   const row = read.results[0];

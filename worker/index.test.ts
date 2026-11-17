@@ -7,6 +7,7 @@ import worker, {
   ROUTE_METHODS,
   type Environment,
 } from "./index";
+import { SELECT_MARKET } from "./api/verdicts";
 import { createTestDatabase, truncateAll, type TestDatabase } from "./testing/d1";
 import { createTokenFactory, type TokenClaims } from "./testing/firebaseTokens";
 
@@ -1282,12 +1283,21 @@ describe("the browser read route's boundary", () => {
   beforeAll(async () => {
     database = await createTestDatabase();
     await truncateAll(database.db);
+    // THE SAVED MARKET, which the read filters on and `truncateAll` deletes. Its key is
+    // `43.5000,-79.8000|18km`: `marketKey()` always writes four decimals, so the listing below
+    // must carry that spelling and not `43.5,-79.8|18km`.
+    await database.db
+      .prepare(
+        `INSERT INTO watch_market (id, location, latitude, longitude, radius_km)
+         VALUES (1, 'toronto', 43.5, -79.8, 18)`,
+      )
+      .run();
     await database.db
       .prepare(
         `INSERT INTO listings (source, listing_id, market_key, component_type, model_key,
            variant_key, title, price_cents, location_text, url, validity, content_hash,
            first_seen_at, last_seen_at)
-         VALUES ('facebook-marketplace','L1','43.5,-79.8|18km','case_fan',NULL,'','Arctic P12',
+         VALUES ('facebook-marketplace','L1','43.5000,-79.8000|18km','case_fan',NULL,'','Arctic P12',
                  3200,'Toronto','https://e/x','VALID','h',1,1800000000)`,
       )
       .run();
@@ -1471,9 +1481,16 @@ describe("the browser read route's boundary", () => {
    */
   it("V-10b: a page where every row is unusable is its own code and message", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // THE MARKET READ ANSWERS A VALID ROW, so the handler reaches the verdict read below.
     const unusableRows = () =>
       ({
-        prepare: () => ({
+        prepare: (sql: string) => ({
+          all: () =>
+            Promise.resolve(
+              sql === SELECT_MARKET
+                ? { results: [{ latitude: 43.5, longitude: -79.8, radius_km: 18 }], meta: {} }
+                : { results: [], meta: {} },
+            ),
           bind: () => ({
             all: () =>
               Promise.resolve({
