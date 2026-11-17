@@ -8,7 +8,9 @@
  * THE ONE FIXTURE RULE THAT EARNED ITS PLACE: an ordering, priority or fencing claim is NOT
  * tested by a fixture. It is tested by a fixture that is CLAIMED, COMPLETED, AND CLAIMED AGAIN.
  * Three defects in this design passed a single call against a fresh fixture and were obvious on
- * the second. E13 drives five calls and E14 four; do not reduce them.
+ * the second -- and a fourth, tier 3 re-claiming every NEEDS_REVIEW row on every call with no new
+ * evidence, was the production write budget. E13 drives five calls and E14 four; do not reduce
+ * them.
  */
 
 import { cleanupStaleObservations } from "../storage/cleanupStaleObservations";
@@ -25,7 +27,10 @@ import {
   CLAIM_NEEDS_REVIEW,
   CLAIM_PENDING,
   CLAIM_STALE_REVISION,
+  CLAIM_STALE_REVISION_NEEDS_REVIEW,
+  candidateReadSql,
 } from "./evaluateBatch";
+import { decide, validateSettings } from "./dealRules";
 import type { EvaluationOutcome, EvaluationSettings } from "./types";
 
 /**
@@ -219,6 +224,30 @@ const insertTask = (args: {
       args.leaseExpiresAt ?? 0,
       args.leaseToken ?? "",
     );
+
+/** A price_observations row written directly: the candidate's own contribution. */
+const insertObservation = (args: {
+  listingId: string;
+  priceCents: number;
+  modelKey?: string;
+  source?: string;
+}): D1PreparedStatement =>
+  db
+    .prepare(
+      `INSERT INTO price_observations
+              (source, listing_id, market_key, model_key, variant_key, price_cents, last_seen_at)
+       VALUES (?1, ?2, ?3, ?4, '', ?5, ?6)`,
+    )
+    .bind(args.source ?? SOURCE, args.listingId, MARKET_A_KEY, args.modelKey ?? MODEL, args.priceCents, T0);
+
+/** A model_stats row written directly, so tier 3's evidence gate can be put on either side. */
+const insertStats = (args: { count: number; totalCents: number; modelKey?: string }): D1PreparedStatement =>
+  db
+    .prepare(
+      `INSERT INTO model_stats (market_key, model_key, variant_key, count, total_price_cents)
+       VALUES (?1, ?2, '', ?3, ?4)`,
+    )
+    .bind(MARKET_A_KEY, args.modelKey ?? MODEL, args.count, args.totalCents);
 
 /**
  * THE MARKET FIXTURE. Six DISTINCT prices, because with equal prices `T - q` is identical for
@@ -490,9 +519,11 @@ describe("evaluateBatch -- the verdict and the stored status", () => {
   // E8. GATE: insufficient evidence stays pending. Five contributors means every candidate sees
   // a reference count of four.
   //
-  // THE SECOND CALL IS THE TEST. `status='NEEDS_REVIEW'` means "3D will try again", and a fixture
-  // that is claimed once cannot tell that apart from `COMPLETE`.
-  it("E8: parks insufficient evidence at NEEDS_REVIEW and re-claims it next call", async () => {
+  // THE SECOND AND THIRD CALLS ARE THE TEST. `status='NEEDS_REVIEW'` means "3D will try again
+  // WHEN THE MARKET MOVES": with no new evidence the second call must claim nothing, and once a
+  // sixth contributor arrives -- through real recordSightings, which never requeues the other
+  // five -- the third call must re-claim all five and complete them.
+  it("E8: parks insufficient evidence at NEEDS_REVIEW and re-claims it only once evidence arrives", async () => {
     await sight(
       [20_000, 21_000, 22_000, 23_000, 24_000].map((priceCents, index) =>
         valid({ listingId: `few-${index}`, priceCents }),
@@ -520,19 +551,35 @@ describe("evaluateBatch -- the verdict and the stored status", () => {
       evaluated_at: T0,
     });
 
+    // Nothing moved: nothing is claimed and nothing is written.
     const second = await evaluateBatch(db, {
       source: SOURCE,
       settings: discount(20),
       now: T0 + 60,
       leaseToken: "token-e8b",
     });
-    expect(second.outcomes.map((outcome) => outcome.listingId).sort()).toEqual([
+    expect(second.claimed).toBe(0);
+    expect(second.usage.rowsWritten).toBe(0);
+    expect(await taskRow("few-0")).toMatchObject({ status: "NEEDS_REVIEW", evaluated_at: T0 });
+
+    // The sixth contributor: model_stats reaches 6, so each parked candidate now sees 5.
+    await sight([valid({ listingId: "few-5", priceCents: 25_000 })], T0 + 120);
+    const third = await evaluateBatch(db, {
+      source: SOURCE,
+      settings: discount(20),
+      now: T0 + 180,
+      leaseToken: "token-e8c",
+    });
+    expect(third.outcomes.map((outcome) => outcome.listingId).sort()).toEqual([
       "few-0",
       "few-1",
       "few-2",
       "few-3",
       "few-4",
+      "few-5",
     ]);
+    expect(third.outcomes.every((outcome) => outcome.status === "COMPLETE")).toBe(true);
+    expect(outcomeFor(third.outcomes, "few-0")).toMatchObject({ referenceCount: 5 });
   });
 });
 
@@ -667,7 +714,8 @@ describe("evaluateBatch -- claim tier order and rotation", () => {
    *
    * - 2 fresh PENDING (pf-0, pf-1), terminal when evaluated
    * - 30 stale-revision COMPLETE (cm-00..cm-29), terminal when evaluated, created OLDEST
-   * - 40 NEEDS_REVIEW (nr-00..nr-39), every one resolving to insufficient-evidence AGAIN
+   * - 40 NEEDS_REVIEW (nr-00..nr-39) at the current revision with no evidence at all, which tier
+   *   3 must now never claim
    */
   const CURRENT_REVISION = 2;
 
@@ -723,10 +771,10 @@ describe("evaluateBatch -- claim tier order and rotation", () => {
         .first<{ n: number }>()
     )!.n;
 
-  // E13. FIVE REAL CALLS, claim -> complete -> repeat. Tier 3 is unbounded and perpetual; tier 4
-  // is finite. Running tier 3 first hands it the whole budget forever and the stale set is NEVER
-  // CLAIMED AT ALL -- measured stationary over five calls -- which silently disables the only
-  // recovery path this design has for a bad verdict.
+  // E13. FIVE REAL CALLS, claim -> complete -> repeat. Tier 4 is finite. When tier 3 re-claimed
+  // every NEEDS_REVIEW row on every call, running it first handed it the whole budget forever and
+  // the stale set was NEVER CLAIMED AT ALL -- measured stationary over five calls -- which
+  // silently disabled the only recovery path this design has for a bad verdict.
   it("E13: drains finite revision work before infinite evidence work", async () => {
     await tierFixture();
 
@@ -773,8 +821,10 @@ describe("evaluateBatch -- claim tier order and rotation", () => {
     expect(claim.tasks.map((task) => task.listingId).sort()).toEqual(["cm-00", "pf-0", "pf-1"]);
   });
 
-  // E13, single-call shape at batch 45: every PENDING, every stale task, and only then evidence.
-  it("E13: at batch 45 claims 2 PENDING + 30 stale + 13 NEEDS_REVIEW", async () => {
+  // E13, single-call shape at batch 45: every PENDING and every stale task -- and with 13 slots
+  // left over, NOT ONE of the 40 evidence-starved NEEDS_REVIEW rows. Before tier 3 was gated on
+  // evidence this claimed 13 of them, on every call, forever.
+  it("E13: at batch 45 claims 2 PENDING + 30 stale and no evidence-starved NEEDS_REVIEW", async () => {
     await tierFixture();
 
     const claim = await claimEvaluationTasks(db, {
@@ -787,18 +837,18 @@ describe("evaluateBatch -- claim tier order and rotation", () => {
     });
 
     const ids = claim.tasks.map((task) => task.listingId);
-    expect(ids).toHaveLength(45);
+    expect(ids).toHaveLength(32);
     expect(ids.filter((id) => id.startsWith("pf-"))).toHaveLength(2);
     expect(ids.filter((id) => id.startsWith("cm-"))).toHaveLength(30);
-    expect(ids.filter((id) => id.startsWith("nr-"))).toHaveLength(13);
+    expect(ids.filter((id) => id.startsWith("nr-"))).toHaveLength(0);
   });
 
-  // E14. FOUR REAL CALLS. Nothing ever advances created_at for a task that stays in the
-  // NEEDS_REVIEW queue, so ORDER BY created_at returns THE SAME 15 ROWS ON EVERY CALL, forever,
-  // while the other 25 are never re-examined. A rare model with 1-4 comparables never resolves,
-  // so those 15 are permanent occupants -- and cold start makes every listing
-  // insufficient-evidence, so this is the FIRST state the system reaches.
-  it("E14: rotates the NEEDS_REVIEW queue so every task is re-examined", async () => {
+  // E14. FOUR REAL CALLS, AND THE PRODUCTION WRITE BUDGET. Tier 3 used to re-claim every
+  // NEEDS_REVIEW row on every call -- 15 claims and 120 rows written per batch, six batches a
+  // monitor run, 34.6k of the day's 41.9k measured D1 writes -- while not one of the 333 parked
+  // rows had the evidence to resolve. A NEEDS_REVIEW row with no new evidence is now never
+  // re-claimed: four calls, zero claims, zero writes, evaluated_at untouched.
+  it("E14: never re-claims a NEEDS_REVIEW task that still has no evidence", async () => {
     const statements: D1PreparedStatement[] = [];
     for (let index = 0; index < 40; index += 1) {
       const id = `nr-${String(index).padStart(2, "0")}`;
@@ -807,7 +857,7 @@ describe("evaluateBatch -- claim tier order and rotation", () => {
         insertTask({
           listingId: id,
           status: "NEEDS_REVIEW",
-          createdAt: T0, // IDENTICAL for all 40: created_at is a fixed point by construction
+          createdAt: T0,
           evaluatedRevision: 1,
           verdict: "NEEDS_REVIEW",
           evaluatedAt: T0 - 1000,
@@ -816,28 +866,449 @@ describe("evaluateBatch -- claim tier order and rotation", () => {
     }
     await db.batch(statements);
 
-    const perCall: string[][] = [];
     for (let call = 0; call < 4; call += 1) {
       const report = await evaluateBatch(db, {
         source: SOURCE,
         settings: discount(20, 1),
-        // A REAL CALLER ADVANCES THE CLOCK. At a frozen `now` a completion writes the same
-        // evaluated_at it just ordered by, so a tie group can recur.
         now: T0 + call * 60,
         batchSize: 15,
         leaseToken: `token-e14-${call}`,
       });
-      expect(report.outcomes).toHaveLength(15);
-      expect(report.outcomes.every((outcome) => outcome.reason === "insufficient-evidence")).toBe(
-        true,
-      );
-      perCall.push(report.outcomes.map((outcome) => outcome.listingId));
+      expect(report.claimed, `call ${call}`).toBe(0);
+      expect(report.usage.rowsWritten, `call ${call}`).toBe(0);
     }
 
-    // Call 2 must not repeat call 1: the rows just examined went to the back of the queue.
-    expect(perCall[1].filter((id) => perCall[0].includes(id))).toEqual([]);
-    // Coverage: all 40 distinct rows re-examined within four calls.
-    expect(new Set(perCall.flat()).size).toBe(40);
+    expect(
+      await db
+        .prepare(
+          "SELECT COUNT(*) AS n FROM evaluation_tasks WHERE status = 'NEEDS_REVIEW' AND evaluated_at = ?1",
+        )
+        .bind(T0 - 1000)
+        .first<{ n: number }>(),
+    ).toEqual({ n: 40 });
+  });
+});
+
+describe("evaluateBatch -- tier 3 claims a parked task only once its evidence has arrived", () => {
+  const CURRENT = 2;
+  const settingsNow = (percent = 20) => discount(percent, CURRENT);
+
+  /** One parked task: a VALID listing at NEEDS_REVIEW, judged at the current revision. */
+  const parked = (args: {
+    listingId: string;
+    priceCents: number;
+    modelKey?: string;
+    evaluatedAt?: number;
+    evaluatedRevision?: number | null;
+    observation?: boolean;
+  }): D1PreparedStatement[] => [
+    insertListing({
+      listingId: args.listingId,
+      priceCents: args.priceCents,
+      validity: "VALID",
+      modelKey: args.modelKey ?? MODEL,
+    }),
+    insertTask({
+      listingId: args.listingId,
+      status: "NEEDS_REVIEW",
+      evaluatedRevision: args.evaluatedRevision === undefined ? CURRENT : args.evaluatedRevision,
+      verdict: "NEEDS_REVIEW",
+      evaluatedAt: args.evaluatedAt ?? T0,
+    }),
+    ...(args.observation === false
+      ? []
+      : [
+          insertObservation({
+            listingId: args.listingId,
+            priceCents: args.priceCents,
+            modelKey: args.modelKey ?? MODEL,
+          }),
+        ]),
+  ];
+
+  const claimNow = (batchSize = 15, now = T0 + 1000) =>
+    claimEvaluationTasks(db, {
+      source: SOURCE,
+      batchSize,
+      now,
+      leaseSeconds: 300,
+      leaseToken: `token-claim-${now}`,
+      searchRevision: CURRENT,
+    });
+
+  /**
+   * E25. THE TIERS ARE DISJOINT AND COVER EVERYTHING. 4 statuses x evaluated_revision in {NULL,
+   * below, equal, above} x lease in {expired, exactly now, future} = 48 rows, every one with
+   * sufficient evidence so tier 3 has something to admit. EACH TIER IS RUN ALONE against a fresh
+   * copy -- through claimEvaluationTasks with the production bindings, the other four statements
+   * answered empty without executing -- because inside one call an overlap is invisible: whichever
+   * tier runs first takes the row and the second never sees it.
+   */
+  it("E25: over all 48 status x revision x lease combinations, exactly one tier claims each eligible row", async () => {
+    const NOW = T0 + 1000;
+    const statuses = ["PENDING", "PROCESSING", "COMPLETE", "NEEDS_REVIEW"];
+    const revisions: Array<[string, number | null]> = [
+      ["null", null],
+      ["below", CURRENT - 1],
+      ["equal", CURRENT],
+      ["above", CURRENT + 1],
+    ];
+    const leases: Array<[string, number]> = [
+      ["expired", NOW - 1],
+      ["now", NOW],
+      ["future", NOW + 1],
+    ];
+    const rows = statuses.flatMap((status) =>
+      revisions.flatMap(([revisionName, revision]) =>
+        leases.map(([leaseName, lease]) => ({
+          id: `${status}-${revisionName}-${leaseName}`,
+          status,
+          revision,
+          lease,
+        })),
+      ),
+    );
+    expect(rows).toHaveLength(48);
+
+    const fixture = async () => {
+      await truncateAll(db);
+      const statements: D1PreparedStatement[] = [insertStats({ count: 49, totalCents: 49 * 25_000 })];
+      for (const row of rows) {
+        statements.push(
+          insertListing({ listingId: row.id, priceCents: 25_000, validity: "VALID" }),
+          insertObservation({ listingId: row.id, priceCents: 25_000 }),
+          insertTask({
+            listingId: row.id,
+            status: row.status,
+            evaluatedRevision: row.revision,
+            evaluatedAt: T0,
+            leaseExpiresAt: row.lease,
+            leaseToken: row.status === "PROCESSING" ? "token-crashed" : "",
+          }),
+        );
+      }
+      await db.batch(statements);
+    };
+
+    const tiers: Array<[string, string]> = [
+      ["1", CLAIM_PENDING],
+      ["2", CLAIM_EXPIRED],
+      ["4", CLAIM_STALE_REVISION],
+      ["4b", CLAIM_STALE_REVISION_NEEDS_REVIEW],
+      ["3", CLAIM_NEEDS_REVIEW],
+    ];
+    const claimedBy = new Map<string, string[]>();
+    for (const [name, sql] of tiers) {
+      await fixture();
+      const only = {
+        prepare: (text: string) => {
+          if (text === sql) return db.prepare(text);
+          const silent = {
+            bind: () => silent,
+            all: () => Promise.resolve({ results: [], success: true, meta: { rows_read: 0, rows_written: 0 } }),
+          };
+          return silent;
+        },
+      } as unknown as D1Database;
+      const claim = await claimEvaluationTasks(only, {
+        source: SOURCE,
+        batchSize: 98,
+        now: NOW,
+        leaseSeconds: 300,
+        leaseToken: `token-e25-${name}`,
+        searchRevision: CURRENT,
+      });
+      for (const task of claim.tasks) {
+        claimedBy.set(task.listingId, [...(claimedBy.get(task.listingId) ?? []), name]);
+      }
+    }
+
+    const expected = (row: (typeof rows)[number]): string[] => {
+      const stale = row.revision !== CURRENT;
+      if (row.status === "PENDING") return ["1"];
+      if (row.status === "PROCESSING") return row.lease <= NOW ? ["2"] : [];
+      if (row.status === "COMPLETE") return stale ? ["4"] : [];
+      return stale ? ["4b"] : ["3"];
+    };
+    const mismatches = rows
+      .map((row) => ({ id: row.id, expected: expected(row), actual: claimedBy.get(row.id) ?? [] }))
+      .filter((entry) => JSON.stringify(entry.expected) !== JSON.stringify(entry.actual));
+    expect(mismatches).toEqual([]);
+    // 12 PENDING + 8 expired-or-now PROCESSING + 9 stale COMPLETE + 12 NEEDS_REVIEW.
+    expect([...claimedBy.values()].flat()).toHaveLength(41);
+  });
+
+  /**
+   * E26. EVERY STATE `decide` WOULD PARK AGAIN IS LEFT ALONE. Each one, admitted, is judged
+   * NEEDS_REVIEW again and re-claimed on every call forever -- one claim and eight rows written per
+   * call. One model per case, and a control row (`ok`) that IS admitted, so "claimed nothing"
+   * cannot pass by the claim never running.
+   */
+  it("E26: does not claim a corrupt, REAL, too-large, thin, absent or observation-less aggregate", async () => {
+    await db.batch([
+      // The control: its own observation inside a six-row aggregate -> 5 references.
+      ...parked({ listingId: "ok", priceCents: 25_000, modelKey: "M-OK" }),
+      insertStats({ modelKey: "M-OK", count: 6, totalCents: 150_000 }),
+      // A corrupt total: 10,000 - 25,000 is negative.
+      ...parked({ listingId: "corrupt-total", priceCents: 25_000, modelKey: "M-CORRUPT" }),
+      insertStats({ modelKey: "M-CORRUPT", count: 6, totalCents: 10_000 }),
+      // INTEGER affinity keeps 6.5 as REAL; 6.5 - 1 = 5.5 passes `>= 5` and fails isSafeInteger.
+      ...parked({ listingId: "real-count", priceCents: 25_000, modelKey: "M-REAL" }),
+      insertStats({ modelKey: "M-REAL", count: 6.5, totalCents: 150_000 }),
+      ...parked({ listingId: "real-total", priceCents: 25_000, modelKey: "M-REALT" }),
+      insertStats({ modelKey: "M-REALT", count: 6, totalCents: 150_000.5 }),
+      // Its own observation at count 5: the read subtracts it, leaving 4.
+      ...parked({ listingId: "own-at-five", priceCents: 25_000, modelKey: "M-FIVE" }),
+      insertStats({ modelKey: "M-FIVE", count: 5, totalCents: 125_000 }),
+      // A positive-price listing with no observation (cleaned away as stale).
+      ...parked({ listingId: "no-obs", priceCents: 25_000, modelKey: "M-NOOBS", observation: false }),
+      insertStats({ modelKey: "M-NOOBS", count: 6, totalCents: 150_000 }),
+      // No aggregate row at all: NULL evidence.
+      ...parked({ listingId: "no-stats", priceCents: 25_000, modelKey: "M-NONE" }),
+      // A count past Number.MAX_SAFE_INTEGER, written as a literal so no JS number rounds it.
+      ...parked({ listingId: "huge-count", priceCents: 25_000, modelKey: "M-HUGE" }),
+      db
+        .prepare(
+          `INSERT INTO model_stats (market_key, model_key, variant_key, count, total_price_cents)
+           VALUES (?1, 'M-HUGE', '', 9007199254740993, 150000)`,
+        )
+        .bind(MARKET_A_KEY),
+    ]);
+
+    const claim = await claimNow();
+    expect(claim.tasks).toEqual([{ listingId: "ok" }]);
+  });
+
+  // E27. The boundary from the other side: its own observation at count 6 is 5 references, which
+  // is enough. Claimed, completed, and -- because it completed -- never claimed again.
+  it("E27: claims a task with its own observation at count 6, completes it, and never again", async () => {
+    await db.batch([
+      ...parked({ listingId: "six", priceCents: 25_000 }),
+      insertStats({ count: 6, totalCents: 150_000 }),
+    ]);
+
+    const first = await evaluateBatch(db, {
+      source: SOURCE,
+      settings: settingsNow(),
+      now: T0 + 1000,
+      leaseToken: "token-e27a",
+    });
+    expect(outcomeFor(first.outcomes, "six")).toMatchObject({
+      status: "COMPLETE",
+      referenceCount: 5,
+      referenceTotalCents: 125_000,
+    });
+
+    const second = await evaluateBatch(db, {
+      source: SOURCE,
+      settings: settingsNow(),
+      now: T0 + 1060,
+      leaseToken: "token-e27b",
+    });
+    expect(second.claimed).toBe(0);
+  });
+
+  // E28. A FREE LISTING never contributes (recordSightings, `> 0`), so it has no observation by
+  // design and is judged against the whole aggregate: count 5 is 5 references. Without the
+  // `price_cents = 0` term a free item parked in a young market would never be re-checked.
+  it("E28: claims a free listing with no observation at count 5, and it becomes a DEAL", async () => {
+    await db.batch([
+      ...parked({ listingId: "free", priceCents: 0, observation: false }),
+      insertStats({ count: 5, totalCents: 125_000 }),
+    ]);
+
+    const report = await evaluateBatch(db, {
+      source: SOURCE,
+      settings: settingsNow(),
+      now: T0 + 1000,
+      leaseToken: "token-e28",
+    });
+    expect(outcomeFor(report.outcomes, "free")).toMatchObject({
+      verdict: "DEAL",
+      reason: "within-discount",
+      status: "COMPLETE",
+      referenceCount: 5,
+    });
+    expect(await taskRow("free")).toMatchObject({ status: "COMPLETE", verdict: "DEAL" });
+  });
+
+  // E29. TIER 4b: every revision bump re-judges every NEEDS_REVIEW task exactly once -- here one
+  // with no evidence at all, so tier 3 could never reach it. Claimed once, re-parked at the
+  // current revision, and then left alone.
+  it("E29: claims a stale-revision NEEDS_REVIEW task once through tier 4b, and never again", async () => {
+    await db.batch(
+      parked({ listingId: "stale-review", priceCents: 25_000, evaluatedRevision: CURRENT - 1 }),
+    );
+
+    const claimed: number[] = [];
+    for (let call = 0; call < 4; call += 1) {
+      const report = await evaluateBatch(db, {
+        source: SOURCE,
+        settings: settingsNow(),
+        now: T0 + 1000 + call * 60,
+        leaseToken: `token-e29-${call}`,
+      });
+      claimed.push(report.claimed);
+      if (call === 0) {
+        expect(outcomeFor(report.outcomes, "stale-review")).toMatchObject({
+          status: "NEEDS_REVIEW",
+          reason: "insufficient-evidence",
+        });
+      }
+    }
+    expect(claimed).toEqual([1, 0, 0, 0]);
+    expect(await taskRow("stale-review")).toMatchObject({
+      status: "NEEDS_REVIEW",
+      evaluated_revision: CURRENT,
+    });
+  });
+
+  // E30. THE GATE IS INSIDE THE LIMIT. One eligible task sits behind 40 parked ones that are
+  // earlier in evaluated_at order; a claim that picked 15 rows first and tested evidence after
+  // would claim nothing, forever.
+  it("E30: claims an eligible task sitting behind 40 ineligible ones", async () => {
+    const statements: D1PreparedStatement[] = [insertStats({ modelKey: "M-THIN", count: 3, totalCents: 75_000 })];
+    for (let index = 0; index < 40; index += 1) {
+      statements.push(
+        ...parked({
+          listingId: `thin-${String(index).padStart(2, "0")}`,
+          priceCents: 25_000,
+          modelKey: "M-THIN",
+          evaluatedAt: T0 - 1000 + index,
+        }),
+      );
+    }
+    statements.push(
+      ...parked({ listingId: "ready", priceCents: 25_000, evaluatedAt: T0 }),
+      insertStats({ count: 6, totalCents: 150_000 }),
+    );
+    await db.batch(statements);
+
+    const claim = await claimNow();
+    expect(claim.tasks).toEqual([{ listingId: "ready" }]);
+  });
+
+  /**
+   * E31. THE PROPERTY: every task tier 3 admits ends COMPLETE -- so nothing it admits loops -- and
+   * every task it leaves parked is one `decide` would park again, so nothing eligible is missed.
+   * Randomised but SEEDED fixtures: aggregates absent, thin, sufficient, corrupt-total, REAL count
+   * and REAL total; candidates with and without their own observation, free and priced, VALID and
+   * not. The second half skips the deliberate exclusion (a positive-price listing with no
+   * observation) and the unreachable one (a non-VALID listing at NEEDS_REVIEW), named there.
+   */
+  it("E31: every task tier 3 admits ends COMPLETE, and every task it leaves decide would park", async () => {
+    let state = 0x5eed;
+    const random = () => {
+      state = (state + 0x6d2b79f5) | 0;
+      let t = Math.imul(state ^ (state >>> 15), 1 | state);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    const pick = <T,>(items: T[]): T => items[Math.floor(random() * items.length)];
+
+    let admittedTotal = 0;
+    let parkedTotal = 0;
+    for (let round = 0; round < 6; round += 1) {
+      await truncateAll(db);
+      const percent = pick([0, 10, 20, 50]);
+      const statements: D1PreparedStatement[] = [];
+      const models = Array.from({ length: 8 }, (_, index) => `PM-${index}`);
+      for (const modelKey of models) {
+        const shape = pick(["absent", "thin", "enough", "enough", "corrupt", "real-count", "real-total"]);
+        if (shape === "absent") continue;
+        const count = shape === "thin" ? pick([0, 1, 4, 5]) : pick([5, 6, 7, 12]);
+        const total = count === 0 ? 0 : count * 22_000;
+        statements.push(
+          insertStats({
+            modelKey,
+            count: shape === "real-count" ? count + 0.5 : count,
+            totalCents:
+              shape === "corrupt" ? 1_000 : shape === "real-total" && count > 0 ? total + 0.5 : total,
+          }),
+        );
+      }
+      const tasks: Array<{ id: string; observation: boolean; priceCents: number; validity: string }> = [];
+      for (let index = 0; index < 30; index += 1) {
+        const id = `p-${round}-${String(index).padStart(2, "0")}`;
+        const observation = random() < 0.7;
+        const priceCents = observation ? pick([5_000, 18_000, 25_000]) : pick([0, 0, 25_000]);
+        const validity = random() < 0.9 ? "VALID" : pick(["NEEDS_REVIEW", "INVALID_REFERENCE"]);
+        const modelKey = pick(models);
+        statements.push(
+          insertListing({ listingId: id, priceCents, validity, modelKey }),
+          insertTask({
+            listingId: id,
+            status: "NEEDS_REVIEW",
+            evaluatedRevision: CURRENT,
+            verdict: "NEEDS_REVIEW",
+            evaluatedAt: T0 - index,
+          }),
+          ...(observation ? [insertObservation({ listingId: id, priceCents, modelKey })] : []),
+        );
+        tasks.push({ id, observation, priceCents, validity });
+      }
+      await db.batch(statements);
+
+      const admitted = new Map<string, string>();
+      let calls = 0;
+      for (; calls < 10; calls += 1) {
+        const report = await evaluateBatch(db, {
+          source: SOURCE,
+          settings: settingsNow(percent),
+          now: T0 + 1000 + calls * 60,
+          batchSize: 7,
+          leaseToken: `token-e31-${round}-${calls}`,
+        });
+        if (report.claimed === 0) break;
+        for (const outcome of report.outcomes) {
+          expect(admitted.has(outcome.listingId), `${outcome.listingId} admitted twice`).toBe(false);
+          admitted.set(outcome.listingId, outcome.status);
+        }
+      }
+      expect(calls, `round ${round} did not reach an empty claim`).toBeLessThan(10);
+      for (const [id, status] of admitted) expect(status, id).toBe("COMPLETE");
+
+      // The other direction: what is still parked, decide would park again. Only VALID rows are
+      // asked: a non-VALID listing never reaches status NEEDS_REVIEW (decide completes it before
+      // the evidence gate), tier 3 does not test validity, and if one is admitted the first half
+      // above already holds it to COMPLETE.
+      const left = tasks.filter(
+        (task) =>
+          !admitted.has(task.id) &&
+          task.validity === "VALID" &&
+          (task.observation || task.priceCents === 0),
+      );
+      if (left.length > 0) {
+        const read = await db
+          .prepare(candidateReadSql(left.length))
+          .bind(SOURCE, ...left.map((task) => task.id))
+          .all<{
+            listing_id: string;
+            candidate_price_cents: number | null;
+            validity: string;
+            reference_count: number | null;
+            reference_total_cents: number | null;
+          }>();
+        const validated = validateSettings(settingsNow(percent));
+        for (const row of read.results) {
+          const verdict = decide(
+            {
+              candidatePriceCents: row.candidate_price_cents,
+              validity: row.validity,
+              referenceCount: row.reference_count,
+              referenceTotalCents: row.reference_total_cents,
+            },
+            validated,
+          );
+          expect(verdict.status, `${row.listing_id} was eligible and left parked`).toBe("NEEDS_REVIEW");
+        }
+      }
+      admittedTotal += admitted.size;
+      parkedTotal += left.length;
+    }
+    // Anchoring: both halves of the property were exercised.
+    expect(admittedTotal).toBeGreaterThan(20);
+    expect(parkedTotal).toBeGreaterThan(20);
   });
 });
 
@@ -1176,7 +1647,7 @@ describe("evaluateBatch -- no single listing can stall the queue", () => {
 });
 
 describe("evaluateBatch -- budget, isolation and guards", () => {
-  // E21. ALL FOUR CLAIM STATEMENTS RUN even when the first returns nothing. In the ordinary
+  // E21. ALL FIVE CLAIM STATEMENTS RUN even when the first returns nothing. In the ordinary
   // steady state nothing is PENDING, so `if (tier1.length === 0) return` would disable
   // expired-lease recovery, evidence re-checks and revision bumps ALL AT ONCE -- the most
   // expensive single line available in this design.
@@ -1209,6 +1680,7 @@ describe("evaluateBatch -- budget, isolation and guards", () => {
       CLAIM_PENDING,
       CLAIM_EXPIRED,
       CLAIM_STALE_REVISION,
+      CLAIM_STALE_REVISION_NEEDS_REVIEW,
       CLAIM_NEEDS_REVIEW,
     ]);
     expect(prepared.some((sql) => sql.includes("candidate_price_cents"))).toBe(false);
@@ -1320,8 +1792,10 @@ describe("evaluateBatch -- budget, isolation and guards", () => {
     expect(new Set(perCall.flat()).size).toBe(FIFO_SIZE);
   });
 
-  // E23. `source = ?1` scopes every tier -- including each OR term of the revision tier, where it
-  // is repeated. The other source's tasks are OLDER, so an unscoped tier would take them first.
+  // E23. `source = ?1` scopes every tier -- including each OR term of the two revision tiers,
+  // where it is repeated. The other source's tasks are OLDER, so an unscoped tier would take them
+  // first, and its NEEDS_REVIEW rows are each ELIGIBLE in their own tier: b-review has its own
+  // observation in a six-row aggregate, b-review-stale was judged under an older revision.
   it("E23: claims only the requested source's tasks, in every tier", async () => {
     await db.batch([
       // The other source, older, and one row for each of the three eligible statuses.
@@ -1344,6 +1818,22 @@ describe("evaluateBatch -- budget, isolation and guards", () => {
         evaluatedRevision: 2,
         source: OTHER_SOURCE,
       }),
+      insertObservation({ listingId: "b-review", priceCents: 25_000, source: OTHER_SOURCE }),
+      insertStats({ count: 6, totalCents: SIX_TOTAL }),
+      insertListing({
+        listingId: "b-review-stale",
+        priceCents: 25_000,
+        validity: "VALID",
+        source: OTHER_SOURCE,
+      }),
+      insertTask({
+        listingId: "b-review-stale",
+        status: "NEEDS_REVIEW",
+        createdAt: T0 - 500,
+        evaluatedAt: T0 - 500,
+        evaluatedRevision: 1,
+        source: OTHER_SOURCE,
+      }),
       // The requested source, newer.
       insertListing({ listingId: "a-pending", priceCents: 25_000, validity: "INVALID_REFERENCE" }),
       insertTask({ listingId: "a-pending", status: "PENDING", createdAt: T0 }),
@@ -1357,7 +1847,7 @@ describe("evaluateBatch -- budget, isolation and guards", () => {
     });
 
     expect(report.outcomes.map((outcome) => outcome.listingId)).toEqual(["a-pending"]);
-    for (const id of ["b-pending", "b-stale", "b-review"]) {
+    for (const id of ["b-pending", "b-stale", "b-review", "b-review-stale"]) {
       const row = await taskRow(id, OTHER_SOURCE);
       expect(row!.status).not.toBe("PROCESSING");
       expect(row!.lease_token).toBe("");

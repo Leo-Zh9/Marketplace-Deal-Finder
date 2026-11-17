@@ -101,12 +101,14 @@ const STATUS_RANK: Record<MonitorStatus, number> = {
  * WHY MORE THAN ONE BATCH PER STEP HERE, when `runCleanup` pins BATCHES_PER_STEP = 1. That
  * constant exists because cleanup's granule cost is UNBOUNDED -- superlinear in the stale set,
  * measured at 443,301 rows for one 25-group batch -- so a budget checked at a coarser granule
- * bounds nothing. The drain's granule is BOUNDED AND FLAT: the tiered claim measures 141 rows
- * at 200, 5,000 and 20,000 eligible alike, and a full 15-task batch measures 150 read / 120
- * written, a partial 121/80, an empty-queue batch 14/0. A bounded granule is safe to multiply.
+ * bounds nothing. The drain's granule is BOUNDED: the tiered claim measures 141 rows at 200,
+ * 5,000 and 20,000 eligible alike, and a full 15-task batch measures 150 read / 120 written, a
+ * partial 121/80, an empty-queue batch 14/0. A bounded granule is safe to multiply. (Tier 3's
+ * evidence walk reads in proportion to the parked population and writes nothing; see below.)
  *
  * THE READ FIGURE MOVES WITH HOW MANY CLAIM TIERS RUN, not with fixture size -- measured at 135
- * when tier 1 alone fills the batch, 146 across all four, and 14 on an empty queue, and measured
+ * when tier 1 alone fills the batch, 146 across the first four, and 14 on an empty queue
+ * (tier 3's evidence walk is the exception, below), and measured
  * IDENTICAL (135/120) with and without a model_stats row. Review measured 135 where the probe
  * above measured 150; the spread is the tier count, and it does not touch the argument, because
  * THE WRITES ARE WHAT BIND and they are exactly 120 in every fixture either party built.
@@ -121,9 +123,22 @@ const STATUS_RANK: Record<MonitorStatus, number> = {
  *   per day (48 runs)                   = 34,560         -> 34.6% of D1's 100,000/day
  *
  * and it is why DRAIN_STEPS is 3 and not 4: at 8 batches/run that is 46,080/day (46%), and
- * collection has not spent anything yet. The worst case is the STEADY STATE, not an outlier --
- * tier 3 (NEEDS_REVIEW) is unconditionally eligible on every call by design, so any standing
- * backlog means every run spends all six batches forever. runMonitor.test.ts R12 pins the sum.
+ * collection has not spent anything yet. runMonitor.test.ts R12 pins the sum.
+ *
+ * THAT WORST CASE NOW APPLIES ONLY WHILE REAL WORK EXISTS -- fresh, abandoned, stale-revision, or
+ * parked tasks whose evidence has just arrived, each of which completes and leaves. It used to be
+ * the steady state: tier 3 re-claimed every NEEDS_REVIEW task on every call, so any standing
+ * backlog spent all six batches every run forever. Measured in production: 90 claims and 721 rows
+ * written per run, 34.6k of the day's 41.9k D1 writes, with 333 parked tasks and not one of them
+ * able to resolve. Tier 3 is now gated on evidence, so a parked backlog costs no writes and the
+ * drain exhausts on its first empty batch.
+ *
+ * WHAT IT COSTS INSTEAD IS READS: to learn that nothing is eligible, tier 3 walks every
+ * current-revision NEEDS_REVIEW row -- about 4 rows read per parked row (a table lookup, since
+ * evaluation_tasks_attempt is not covering for evaluated_revision, and the listings,
+ * price_observations and model_stats probes; evaluationCpu.test.ts C3) -- once per batch that
+ * reaches it, which is one or two walks a run. At 333 parked rows that is about 1,300-2,700 reads
+ * a run, 65k-130k a day, against D1's 5M/day read allowance.
  */
 export const DRAIN_STEPS = 3;
 export const BATCHES_PER_DRAIN_STEP = 2;
@@ -649,7 +664,7 @@ export const runMonitor = async (
             usage.rowsWritten += report.usage.rowsWritten;
             stepDrained.push(source);
 
-            // `claimed === 0` -- the conjunction of ALL FOUR tiers -- is the only exhaustion
+            // `claimed === 0` -- the conjunction of ALL FIVE tiers -- is the only exhaustion
             // signal. Note the asymmetry with evaluateBatch's INTERNAL tier loop, which must
             // never break on a zero tier: in the ordinary steady state nothing is PENDING.
             if (report.claimed === 0) stepExhausted.push(source);

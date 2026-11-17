@@ -6,8 +6,9 @@
  * injected seams, and statement builders exported so tests re-issue the BYTE-IDENTICAL
  * statement rather than a hand-copy that would not carry a mutation.
  *
- * Round trips: 4 claims + 1 read + 1 write batch = 6, all O(batchSize) in rows read and
- * independent of corpus size, market size and history depth.
+ * Round trips: 5 claims + 1 read + 1 write batch = 7. Every tier but 3 is O(batchSize) in rows
+ * read and independent of corpus size, market size and history depth; tier 3 reads in proportion
+ * to the current-revision NEEDS_REVIEW population and writes only what it claims (see its comment).
  */
 
 import { decide, referenceAverageCents, validateSettings } from "./dealRules";
@@ -15,6 +16,7 @@ import {
   EVALUATION_BATCH_SIZE,
   EVALUATION_LEASE_SECONDS,
   MAX_EVALUATION_BATCH_SIZE,
+  MINIMUM_REFERENCE_COUNT,
   type CandidateReference,
   type DiscardedEvaluation,
   type EvaluationOutcome,
@@ -26,7 +28,7 @@ import {
 import type { D1Usage } from "../storage/types";
 
 /**
- * THE FOUR CLAIM TIERS. DO NOT SIMPLIFY into a single statement with a CASE in the ORDER BY.
+ * THE FIVE CLAIM TIERS. DO NOT SIMPLIFY into a single statement with a CASE in the ORDER BY.
  *
  * That form was built and measured. It works, and its cost GROWS WITH THE ELIGIBLE SET because
  * an ORDER BY cannot ride a MULTI-INDEX OR: EXPLAIN reports USE TEMP B-TREE FOR ORDER BY, so
@@ -38,10 +40,12 @@ import type { D1Usage } from "../storage/types";
  * for one call against the tiered form's 141, and the gap widens with the eligible set. The tiered
  * form is FLAT: 141 rows at 200, 5,000 and 20,000 eligible alike.
  *
- * The tiers are STATUS-DISJOINT, so the split costs nothing in correctness: no row is claimable
- * by two tiers and no eligible row is unreachable (verified exhaustively over all 48
+ * The tiers are DISJOINT -- by status, and tiers 4b and 3 by evaluated_revision -- so the split
+ * costs nothing in correctness: no row is claimable by two tiers. Test E25 checks it over all 48
  * combinations of 4 statuses x evaluated_revision in {NULL, below, equal, above} x lease in
- * {expired, exactly now, future}).
+ * {expired, exactly now, future}, every row carrying sufficient evidence and each tier run alone:
+ * every eligible row is claimed by exactly one tier and no ineligible row by any. (A
+ * current-revision NEEDS_REVIEW row WITHOUT usable evidence is claimed by none, by design: E14.)
  */
 
 /** Tier 1 -- fresh work. ?1 source, ?2 limit, ?3 lease_expires_at, ?4 lease_token */
@@ -96,21 +100,93 @@ export const CLAIM_STALE_REVISION = `UPDATE evaluation_tasks SET status='PROCESS
 RETURNING listing_id`;
 
 /**
- * Tier 3 -- waiting for market evidence. RUNS LAST. Unconditionally eligible: nothing requeues a
- * task when the MARKET changes, so re-checking is the only way `reference_count` can reach 5.
+ * Tier 4b -- NEEDS_REVIEW evaluated under a different revision. ?5 current searchRevision.
  *
- * ORDER BY evaluated_at, NOT created_at. Nothing ever advances created_at for a task that stays
- * in this queue -- COMPLETE_TASK does not write it, and QUEUE_TASK fires only on NEW or a
- * contribution change -- so ordering by it makes the claim a FIXED POINT on the same 15 rows,
- * forever, while every other NEEDS_REVIEW task is never re-examined (measured over five calls).
- * evaluated_at is rewritten by every completion, so the row that was just examined goes to the
- * back. A NULL evaluated_at (not reachable today: every NEEDS_REVIEW row got there via a
- * completion) sorts first, which is the safe direction.
+ * Every revision bump re-judges every NEEDS_REVIEW task exactly once. Tier 3 below only claims a
+ * NEEDS_REVIEW task whose evidence is now sufficient AT THE CURRENT REVISION, so without this tier
+ * a settings change (a new mode, a new threshold) would never reach a task parked for evidence.
+ * It is finite for the same reason tier 4 is: each row is claimed once and stamped with the
+ * current revision, which takes it out of these three ranges.
+ *
+ * The same three range terms as tier 4, with `source=?1` repeated in each, for the same reason:
+ * only this form SEEKS evaluation_tasks_revision instead of walking it. See tier 4.
+ */
+export const CLAIM_STALE_REVISION_NEEDS_REVIEW = `UPDATE evaluation_tasks SET status='PROCESSING', lease_expires_at=?3, lease_token=?4
+ WHERE rowid IN (SELECT rowid FROM evaluation_tasks
+                  WHERE (source=?1 AND status='NEEDS_REVIEW' AND evaluated_revision IS NULL)
+                     OR (source=?1 AND status='NEEDS_REVIEW' AND evaluated_revision < ?5)
+                     OR (source=?1 AND status='NEEDS_REVIEW' AND evaluated_revision > ?5)
+                  LIMIT ?2)
+RETURNING listing_id`;
+
+/**
+ * The model_stats join keys and the two reference expressions. SHARED by the candidate read and
+ * tier 3's evidence gate, so "is there enough evidence to claim it" and "what evidence will the
+ * verdict see" are the same SQL text and cannot disagree. candidateReadSql documents what they
+ * compute and why.
+ */
+const STATS_JOIN_KEYS = `s.market_key  = COALESCE(p.market_key,  l.market_key)
+        AND s.model_key   = COALESCE(p.model_key,   l.model_key)
+        AND s.variant_key = COALESCE(p.variant_key, l.variant_key)`;
+const REFERENCE_COUNT_SQL = `CASE WHEN p.listing_id IS NULL THEN s.count
+            ELSE s.count - 1 END`;
+const REFERENCE_TOTAL_SQL = `CASE WHEN p.listing_id IS NULL THEN s.total_price_cents
+            ELSE s.total_price_cents - p.price_cents END`;
+
+/**
+ * Tier 3 -- parked for market evidence, and the evidence has arrived. RUNS LAST.
+ * ?5 current searchRevision, ?6 MINIMUM_REFERENCE_COUNT, ?7 Number.MAX_SAFE_INTEGER.
+ *
+ * A NEEDS_REVIEW task is claimed only when the candidate read would now hand `decide` evidence
+ * that passes BOTH of its evidence gates: a reference count and total that are safe integers,
+ * the total >= 0 and the count >= MINIMUM_REFERENCE_COUNT. The predicate is the complement of
+ * `decide`'s corrupt and insufficient branches, so every task this tier admits ends COMPLETE and
+ * is never claimed here again (property test E31). THE COMPLEMENT MUST STAY EXACT IN THAT
+ * DIRECTION: admit one row `decide` still parks and that row loops forever, one claim and eight
+ * written rows per call, which is the defect this tier replaced -- it re-claimed EVERY
+ * NEEDS_REVIEW row on every call, 90 claims and 721 rows written per monitor run in production
+ * with not one of 333 rows having enough evidence.
+ *
+ * WHY EACH TERM IS THERE:
+ * - `CROSS JOIN` pins evaluation_tasks as the OUTER loop. A plain JOIN lets the planner start
+ *   from listings under ANALYZE statistics (reproduced: SCAN l, then a TEMP B-TREE for the
+ *   ORDER BY). claimPlan.test.ts asserts the plan.
+ * - `evaluated_revision=?5` keeps this tier disjoint from 4b, which owns every other revision.
+ * - `(p.listing_id IS NOT NULL OR l.price_cents = 0)`: the candidate either is its own
+ *   observation (so the read subtracts it) or is a FREE listing, which never contributes by
+ *   design (recordSightings) and is judged against the full aggregate. A positive-price listing
+ *   with no observation -- one whose observation was cleaned away as stale -- is NOT re-checked
+ *   here; a requeue or a revision bump reaches it.
+ * - `typeof(...)='integer'` on both reference expressions: INTEGER affinity keeps a 6.5 as REAL,
+ *   and an expression over a REAL is REAL, so this is the SQL side of `Number.isSafeInteger`.
+ *   Without it a REAL aggregate is admitted, parked as corrupt, and re-claimed forever.
+ * - `BETWEEN 0 AND ?7` on the total and `BETWEEN ?6 AND ?7` on the count: the negative and the
+ *   too-large halves of `decide`'s corrupt gate, and its thin-evidence gate. ?6 is bound from
+ *   MINIMUM_REFERENCE_COUNT, never written as a literal, so the two cannot drift.
+ * - The inner JOIN on model_stats: no aggregate row is NULL evidence, which `decide` parks.
+ *
+ * ORDER BY evaluated_at, listing_id rides evaluation_tasks_attempt, so there is no sort; the
+ * index is not covering for evaluated_revision, so each NEEDS_REVIEW row walked costs a table
+ * lookup and the joins. With NO eligible row the claim walks every current-revision
+ * NEEDS_REVIEW row and writes nothing -- a read cost linear in that population (test C3), in
+ * exchange for zero writes. Least-recently-evaluated first still matters: when more than a
+ * batch become eligible at once, the ones that waited longest go first.
  */
 export const CLAIM_NEEDS_REVIEW = `UPDATE evaluation_tasks SET status='PROCESSING', lease_expires_at=?3, lease_token=?4
- WHERE rowid IN (SELECT rowid FROM evaluation_tasks
-                  WHERE source=?1 AND status='NEEDS_REVIEW'
-                  ORDER BY evaluated_at, listing_id LIMIT ?2)
+ WHERE rowid IN (SELECT t.rowid FROM evaluation_tasks t
+                  CROSS JOIN listings l
+                          ON l.source = t.source AND l.listing_id = t.listing_id
+                   LEFT JOIN price_observations p
+                          ON p.source = l.source AND p.listing_id = l.listing_id
+                        JOIN model_stats s
+                          ON ${STATS_JOIN_KEYS}
+                  WHERE t.source=?1 AND t.status='NEEDS_REVIEW' AND t.evaluated_revision=?5
+                    AND (p.listing_id IS NOT NULL OR l.price_cents = 0)
+                    AND typeof(${REFERENCE_COUNT_SQL})='integer'
+                    AND typeof(${REFERENCE_TOTAL_SQL})='integer'
+                    AND (${REFERENCE_COUNT_SQL}) BETWEEN ?6 AND ?7
+                    AND (${REFERENCE_TOTAL_SQL}) BETWEEN 0 AND ?7
+                  ORDER BY t.evaluated_at, t.listing_id LIMIT ?2)
 RETURNING listing_id`;
 
 /**
@@ -148,17 +224,13 @@ export const candidateReadSql = (idCount: number): string => {
   return `SELECT l.listing_id,
        l.price_cents AS candidate_price_cents,
        l.validity    AS validity,
-       CASE WHEN p.listing_id IS NULL THEN s.count
-            ELSE s.count - 1 END                                AS reference_count,
-       CASE WHEN p.listing_id IS NULL THEN s.total_price_cents
-            ELSE s.total_price_cents - p.price_cents END        AS reference_total_cents
+       ${REFERENCE_COUNT_SQL} AS reference_count,
+       ${REFERENCE_TOTAL_SQL} AS reference_total_cents
   FROM listings l
   LEFT JOIN price_observations p
          ON p.source = l.source AND p.listing_id = l.listing_id
   LEFT JOIN model_stats s
-         ON s.market_key  = COALESCE(p.market_key,  l.market_key)
-        AND s.model_key   = COALESCE(p.model_key,   l.model_key)
-        AND s.variant_key = COALESCE(p.variant_key, l.variant_key)
+         ON ${STATS_JOIN_KEYS}
  WHERE l.source = ?1 AND l.listing_id IN (${placeholders})`;
 };
 
@@ -168,15 +240,15 @@ export const candidateReadSql = (idCount: number): string => {
  * ?7 lease_token.
  *
  * evaluated_at=?6 is bound to the call's `now` on EVERY completion, including
- * insufficient-evidence ones. That write is tier 3's rotation key; without it the NEEDS_REVIEW
- * queue is a fixed point.
+ * insufficient-evidence ones. That write is tier 3's ordering key: when more NEEDS_REVIEW tasks
+ * become eligible at once than a batch holds, the ones examined longest ago go first.
  *
  * The fence is `status='PROCESSING' AND lease_token=?7`. The lease VALUE cannot serve as the
  * token: claimant A claims at `now`, recordSightings requeues the row to PENDING (it never
  * touches lease_expires_at), claimant B claims it legally at the same `now` and writes the SAME
  * lease value -- A's stale completion then applies and B's fresh one is discarded, leaving a
- * COMPLETE row at the current revision carrying the stale verdict, ineligible under all four
- * tiers. Measured end to end. `created_at` closes the common case and still lets a task created
+ * COMPLETE row at the current revision carrying the stale verdict, ineligible under every
+ * tier. Measured end to end. `created_at` closes the common case and still lets a task created
  * and requeued within the same second through. A fresh UUID per claim does not.
  */
 export const COMPLETE_TASK = `UPDATE evaluation_tasks
@@ -201,15 +273,15 @@ interface CandidateRow {
 }
 
 /**
- * The four tiers, RUN IN THE ORDER 1, 2, 4, 3 -- finite work before infinite work.
+ * The five tiers, RUN IN THE ORDER 1, 2, 4, 4b, 3 -- finite revision work before evidence work.
  *
- * Tier 3 (NEEDS_REVIEW) is unbounded and perpetual: every row in it is eligible on every call,
- * forever, by design. Tier 4 (stale revision) is finite: each row is claimed once, stamped, and
- * stops being eligible. With tier 3 running third, tier 4 receives `batchSize - alreadyClaimed`,
- * which is ZERO whenever |NEEDS_REVIEW| >= batchSize -- measured with 40 NEEDS_REVIEW and 30
- * stale COMPLETE, the stale set was never claimed at all over five calls and the state was
- * stationary. That breaks "search revisions trigger reevaluation" AND the documented recovery
- * path for bad arithmetic, which would silently do nothing.
+ * Tier 3 used to be unbounded and perpetual: it re-claimed every NEEDS_REVIEW row on every call.
+ * With it running before tier 4, tier 4 received `batchSize - alreadyClaimed`, which was ZERO
+ * whenever |NEEDS_REVIEW| >= batchSize -- measured with 40 NEEDS_REVIEW and 30 stale COMPLETE,
+ * the stale set was never claimed at all over five calls. Tier 3 is now gated on evidence, so
+ * each row it admits completes and leaves, but the order stays: a revision bump is the documented
+ * recovery path for a bad verdict, and it must never wait behind a market that just filled in.
+ * Tier 4b is finite in exactly the way tier 4 is.
  *
  * THE LOOP BREAKS ONLY WHEN THE BATCH IS FULL. It must never break because a tier returned zero
  * rows: in the ordinary steady state nothing is PENDING, so `if (tier1.length === 0) return`
@@ -239,7 +311,22 @@ export const claimEvaluationTasks = async (
     (limit) => db.prepare(CLAIM_EXPIRED).bind(source, limit, leaseExpiresAt, leaseToken, now),
     (limit) =>
       db.prepare(CLAIM_STALE_REVISION).bind(source, limit, leaseExpiresAt, leaseToken, searchRevision),
-    (limit) => db.prepare(CLAIM_NEEDS_REVIEW).bind(source, limit, leaseExpiresAt, leaseToken),
+    (limit) =>
+      db
+        .prepare(CLAIM_STALE_REVISION_NEEDS_REVIEW)
+        .bind(source, limit, leaseExpiresAt, leaseToken, searchRevision),
+    (limit) =>
+      db
+        .prepare(CLAIM_NEEDS_REVIEW)
+        .bind(
+          source,
+          limit,
+          leaseExpiresAt,
+          leaseToken,
+          searchRevision,
+          MINIMUM_REFERENCE_COUNT,
+          Number.MAX_SAFE_INTEGER,
+        ),
   ];
 
   for (const tier of tiers) {
