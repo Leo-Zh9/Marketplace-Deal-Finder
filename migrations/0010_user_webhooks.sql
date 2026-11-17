@@ -1,0 +1,22 @@
+-- Per-user Discord webhooks (PR3 of the multi-user work, docs/multi-user.md). ADDITIVE ONLY: one
+-- nullable column. 0001-0009 are applied in production and nothing here alters or drops them.
+--
+-- THIS REVERSES 0007's "NOTHING HERE STORES THE WEBHOOK URL", AND THE REASON IS NAMED. With one
+-- user the destination could live in a Worker secret. With up to three, each person brings their
+-- own Discord channel, and a Worker secret per person would mean an operator redeploy -- and the
+-- operator holding a friend's webhook -- every time someone joins or changes channel. So the URL is
+-- stored, PLAINTEXT, on the owning user's row: D1 is already the trust boundary for everything else
+-- this Worker holds, and an encryption key would live in a secret beside it, buying nothing against
+-- anyone who can read both.
+--
+-- What keeps it contained, in code rather than here: `PUT /api/webhook` validates it with
+-- isValidWebhookUrl (worker/notify/config.ts) before storing it; `GET /api/webhook` answers
+-- `{configured}` only; no response, error body or log line ever carries it; and the URL that is
+-- fetched is rebuilt from the parse (sendableUrl), never the raw string. User 1 with no URL of its
+-- own still falls back to the DISCORD_WEBHOOK_URL secret, so applying this changes nothing for the
+-- owner.
+--
+-- The CHECK is a last-ditch bound on what a hand-written UPDATE can store, not the validation:
+-- SQLite applies a CHECK on an ADDed column to new writes only, and every existing row is NULL.
+ALTER TABLE users ADD COLUMN webhook_url TEXT
+  CHECK (webhook_url IS NULL OR (length(webhook_url) BETWEEN 1 AND 512));

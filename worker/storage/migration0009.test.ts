@@ -91,11 +91,14 @@ const statusFor = (verdict: string | null): string =>
         ? "NOT_DEAL"
         : "NEEDS_REVIEW";
 
+/** The index of 0009 in MIGRATIONS: everything before it is the pre-0009 install. */
+const NINE = 8;
+
 let database!: TestDatabase;
 let db!: D1Database;
 
 beforeAll(async () => {
-  database = await createTestDatabase(MIGRATIONS.length - 1);
+  database = await createTestDatabase(NINE);
   db = database.db;
 }, 120_000);
 
@@ -277,8 +280,10 @@ const query = (filtered: { all: string[]; pairs: string[] } | null) => {
 };
 
 const applyZeroZeroNine = async () => {
-  const sql = MIGRATIONS[MIGRATIONS.length - 1];
-  await db.batch(splitSqlStatements(sql).map((statement) => db.prepare(statement)));
+  // 0009, then everything after it, exactly as `wrangler d1 migrations apply` would run them.
+  for (const sql of MIGRATIONS.slice(NINE)) {
+    await db.batch(splitSqlStatements(sql).map((statement) => db.prepare(statement)));
+  }
   // The runbook's claim, verbatim.
   await db.prepare(`UPDATE users SET email = '${OWNER}' WHERE user_id = 1 AND email IS NULL`).run();
 };
@@ -451,7 +456,7 @@ describe("migration 0009 -- the evidence rule and the owner's rule", () => {
     ["BOTH", "BOTH", 23.5, 74_900, { mode: "BOTH", minimum_discount_bp: 2350, maximum_price_cents: 74_900 }, 23.5],
     ["DISCOUNT 4.35", "DISCOUNT", 4.35, null, { mode: "DISCOUNT", minimum_discount_bp: 435, maximum_price_cents: null }, -1],
   ])("M9b: a %s owner", async (_label, mode, percent, max, rule, bumpedPercent) => {
-    const fresh = await createTestDatabase(MIGRATIONS.length - 1);
+    const fresh = await createTestDatabase(NINE);
     try {
       await fresh.db.batch([
         fresh.db
@@ -463,7 +468,7 @@ describe("migration 0009 -- the evidence rule and the owner's rule", () => {
         fresh.db.prepare("INSERT INTO search_settings (id, current_revision) VALUES (1, 2)"),
       ]);
       await fresh.db.batch(
-        splitSqlStatements(MIGRATIONS[MIGRATIONS.length - 1]).map((statement) => fresh.db.prepare(statement)),
+        splitSqlStatements(MIGRATIONS[NINE]).map((statement) => fresh.db.prepare(statement)),
       );
       expect(
         await fresh.db
@@ -499,11 +504,11 @@ describe("migration 0009 -- the pool-key guard", () => {
     ["a moved market", "UPDATE watch_market SET location = 'waterloo', latitude = 43.4643, longitude = -80.5204", false],
     ["the same centre at 10 km", "UPDATE watch_market SET radius_km = 10", false],
   ])("M9c: %s", async (_label, change, migrates) => {
-    const fresh = await createTestDatabase(MIGRATIONS.length - 1);
+    const fresh = await createTestDatabase(NINE);
     try {
       if (change !== null) await fresh.db.prepare(change).run();
       const apply = fresh.db.batch(
-        splitSqlStatements(MIGRATIONS[MIGRATIONS.length - 1]).map((statement) => fresh.db.prepare(statement)),
+        splitSqlStatements(MIGRATIONS[NINE]).map((statement) => fresh.db.prepare(statement)),
       );
       if (migrates) {
         await apply;
