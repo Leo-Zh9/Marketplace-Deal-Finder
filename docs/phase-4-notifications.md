@@ -4,7 +4,9 @@
 > (`PRIMARY KEY (user_id, source, listing_id)`, the same state machine). A candidate is a deal under
 > **the user's own rule** applied to the live aggregate (`RULE_PREDICATE`), seen in **the user's
 > area** (`listing_markets`), judged and not re-queued, and judged in the last day **or** re-opened
-> by the user's last save. The PR2 step sends for user 1 only, to `DISCORD_WEBHOOK_URL`.
+> by the user's last save. Since migrations/0010 every active user is sent to, round-robin, at their
+> own `webhook_url` (user 1 falls back to `DISCORD_WEBHOOK_URL`); `NOTIFICATIONS=on` is the master
+> switch. `docs/multi-user.md` "Notifications" has the details.
 > `/api/status` counts the caller's own rows.
 
 This phase adds a `notify` step to the monitor Workflow. It runs after the drain steps and posts each
@@ -235,22 +237,27 @@ from the raw secret. A secret ending in `?` or `#` passes validation, and sent r
 | Limit | Free | This step, worst case |
 |---|---|---|
 | CPU per invocation | 10 ms | p95 **0.195 ms** for a 5-row step (Node, capture-and-replay, `cpuClock`; N17) |
-| D1 queries per invocation | 50 | **19**: sweep 1, watch-list read 1, saved-market read 1, enqueue 1, then 5 × (claim, re-check, result or cancel) |
-| Subrequests per invocation | 50 | 5 fetches to Discord |
+| D1 queries per invocation | 50 | **26** at 3 users: users read 1, sweep 1, 3 × (searches read, enqueue), at most one empty claim per user, then 5 × (claim, re-check, result or cancel). Measured with a full backlog for all three (N17): 23 |
+| Subrequests per invocation | 50 | **5** fetches to Discord |
 | Steps per instance | 1,024 | +1 (`notify`) |
 | Discord POSTs per day | | 5 per run × 48 runs = 240 at most. A rejected webhook costs 1 probe per run. |
 
-**Reads.** The enqueue scans every evaluation task once per run, because no index serves its
-predicate. This has been measured twice:
+**Reads.** The enqueue runs ONCE PER USER WITH A DESTINATION per run (migrations/0010), and each
+run scans the listings, because no index serves its predicate. Its cost depends on how many
+listings get past the cheap terms, so it has been measured at both ends:
 
-| Fixture | Rows read at 500 / 2,000 / 10,000 tasks | Per run |
+| Fixture | Rows read per enqueue | Per user per run |
 |---|---|---|
-| Review's | 603 / 2,309 | about 1.15× the corpus |
-| This PR's, after the evaluation gate (2 % DEALs) | 503 / 2,003 / 10,003 | about 1.0× the corpus |
+| Review's (a realistic mix: most listings stale, out of area or unwatched), 2,000 listings | 2,671 | about **1.34×** the corpus |
+| Worst case (every listing fresh, in the user's area, watched and judged), 500 / 2,000 listings | 2,410 / 9,684 | about **4.8×** the corpus |
 
-Using the larger coefficient: **≈ 1.15 × corpus per run, ≈ 55 × corpus per day** (48 runs). At a
-10,000-task corpus that is ≈ 0.55M reads a day, 11 % of D1 Free's 5M. Re-check this if the corpus
-grows past about 50,000 tasks.
+At 3 users and 48 runs a day that is **≈ 193 × corpus per day** typically, and up to ≈ 700 × corpus
+per day in the worst case. D1 Free allows 5M rows read a day, so **the notify enqueue alone reaches
+the limit near 25,000 listings typically, and near 7,000 in the worst case**. It arrives sooner once
+Preview loads (≈ 6 × corpus each) and ingest are counted. Re-measure before the corpus passes about
+5,000 listings; the lever is an index the enqueue can drive from (for example `listings
+(last_seen_at)` with the freshness term leading), not a narrower LIMIT, which bounds rows written,
+not rows read.
 
 ## Runbook
 

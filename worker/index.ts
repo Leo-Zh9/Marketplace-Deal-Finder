@@ -17,6 +17,7 @@ import { handleGetSettings, handlePutSettings } from "./api/settings";
 import { handleGetVerdicts } from "./api/verdicts";
 import { handleGetWatch, handlePutWatch } from "./api/watch";
 import { handleGetWatchTargets } from "./api/watchTargets";
+import { handleGetWebhook, handlePutWebhook } from "./api/webhook";
 import type { NotifyEnvironment } from "./notify/config";
 import { readNotificationsStatus } from "./notify/status";
 import { handleScheduled, type ScheduledEnvironment } from "./scheduling/scheduled";
@@ -79,6 +80,12 @@ export const ROUTE_METHODS = new Map<string, readonly string[]>([
    */
   ["/api/monitoring/start", ["POST"]],
   ["/api/monitoring/stop", ["POST"]],
+  /**
+   * THE CALLER'S DISCORD WEBHOOK (migrations/0010). A browser route behind `authenticateRequest`,
+   * so it needs its row for the same measured reason `/api/watch` does; PUT is a body method, so
+   * Content-Type is offered. A collector token buys nothing here (X4's rule).
+   */
+  ["/api/webhook", ["GET", "PUT"]],
 ]);
 
 const BODY_METHODS = new Set(["PUT", "POST", "PATCH"]);
@@ -165,6 +172,10 @@ const errorMessages: Record<string, string> = {
   // A 409: the request is valid and within the caller's own cap; the budget SHARED by every user is
   // full. `used`, `maximum` and `yours` say how much of it the caller can free.
   WATCH_BUDGET_FULL: "Every shared search is in use.",
+  // NEVER NAMES THE SUBMITTED VALUE: a near-miss webhook URL is still a credential.
+  INVALID_WEBHOOK: "The webhook is not a Discord webhook URL.",
+  WEBHOOK_FIELD_UNSUPPORTED: "The webhook request contains fields this API cannot store.",
+  WEBHOOK_STORAGE_FAILED: "The webhook could not be read or written.",
 };
 
 type ExtraHeaders = Record<string, string>;
@@ -479,7 +490,7 @@ export const handleRequest = async (
       environment.DB,
       environment,
       statusNow,
-      user === null ? null : user.userId,
+      user,
     );
     // The caller's own Start/Stop. Stopped overrides the health words (worker/api/monitoring.ts).
     const monitoring = user === null ? null : monitoringOf(user);
@@ -572,6 +583,25 @@ export const handleRequest = async (
       request.method === "GET"
         ? await handleGetWatch(db, caller.user)
         : await handlePutWatch(request, db, caller.user, now);
+
+    return result.ok
+      ? json(result.body, result.status, cors)
+      : errorResponse(result.code, result.status, cors, result.details);
+  }
+
+  /**
+   * `/api/webhook`: write-only, the caller's own. The DB guard first, as on `/api/watch`.
+   */
+  if (url.pathname === "/api/webhook" && (request.method === "GET" || request.method === "PUT")) {
+    const db = environment.DB;
+    if (db === undefined) return errorResponse("DATABASE_UNAVAILABLE", 503, cors);
+    const caller = await userFor(db);
+    if (!caller.ok) return caller.response;
+
+    const result =
+      request.method === "GET"
+        ? handleGetWebhook(caller.user)
+        : await handlePutWebhook(request, db, caller.user, environment, now);
 
     return result.ok
       ? json(result.body, result.status, cors)

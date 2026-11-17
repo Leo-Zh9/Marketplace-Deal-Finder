@@ -95,6 +95,8 @@ interface Wire {
   /** A refused save: the status and the error body PUT /api/watch answers. */
   watchPutError?: { status: number; error: Record<string, unknown> };
   watchStatus?: number;
+  /** What GET /api/webhook answers. */
+  webhookConfigured?: boolean;
   settings?: WireSettings | null;
   settingsStatus?: number;
   settingsPutStatus?: number;
@@ -161,6 +163,9 @@ const stubWire = (wire: Wire = {}) => {
         return wire.settingsStatus !== undefined && wire.settingsStatus !== 200
           ? reply({ error: { code: "SETTINGS_STORAGE_FAILED" } }, wire.settingsStatus)
           : reply({ settings: wire.settings ?? null });
+      }
+      if (path === "/api/webhook") {
+        return reply({ configured: method === "PUT" ? body?.url !== null : (wire.webhookConfigured ?? false) });
       }
       if (path === "/api/verdicts") {
         await wire.verdictsHold?.();

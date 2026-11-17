@@ -9,6 +9,7 @@ import healthSql from "../../migrations/0006_collector_health.sql?raw";
 import notificationsSql from "../../migrations/0007_notifications.sql?raw";
 import monitoringStateSql from "../../migrations/0008_monitoring_state.sql?raw";
 import multiUserSql from "../../migrations/0009_multi_user.sql?raw";
+import userWebhooksSql from "../../migrations/0010_user_webhooks.sql?raw";
 import { COMPONENT_TYPES } from "../api/listings";
 
 /**
@@ -1092,6 +1093,8 @@ describe("0009_multi_user.sql", () => {
         monitoring_changed_at: 0,
         alerts_reopened_at: null,
         created_at: 0,
+        // 0010: no webhook of its own -- the owner keeps the DISCORD_WEBHOOK_URL secret.
+        webhook_url: null,
       },
     ]);
     const targets = await database.db
@@ -1133,5 +1136,30 @@ describe("0009_multi_user.sql", () => {
       .prepare("SELECT sql FROM sqlite_master WHERE name = 'listing_markets'")
       .first<{ sql: string }>();
     expect(sql?.sql).toMatch(/WITHOUT ROWID/);
+  });
+});
+
+/** Per-user webhooks (migrations/0010). One nullable column, nothing else. */
+describe("0010_user_webhooks.sql", () => {
+  it("S-w1: is one ADD COLUMN and nothing destructive", () => {
+    const statements = splitSqlStatements(userWebhooksSql);
+    expect(statements).toHaveLength(1);
+    expect(statements[0]).toMatch(/^ALTER TABLE users ADD COLUMN webhook_url TEXT/);
+    expect(statements[0]).not.toMatch(/\b(DROP|DELETE|UPDATE)\b/);
+    expect(extractChecks(statements[0])).toEqual([
+      "webhook_url IS NULL OR (length(webhook_url) BETWEEN 1 AND 512)",
+    ]);
+  });
+
+  it("S-w2: webhook_url is nullable, last, and refuses an empty or oversized value", async () => {
+    const { results } = await database.db
+      .prepare("SELECT name, `notnull` FROM pragma_table_info('users') ORDER BY cid DESC LIMIT 1")
+      .all();
+    expect(results).toEqual([{ name: "webhook_url", notnull: 0 }]);
+    for (const bad of ["''", "'" + "x".repeat(513) + "'"]) {
+      await expect(
+        database.db.prepare(`UPDATE users SET webhook_url = ${bad} WHERE user_id = 1`).run(),
+      ).rejects.toThrow(/CHECK constraint failed/);
+    }
   });
 });

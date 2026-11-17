@@ -46,6 +46,11 @@ export interface User {
   monitoringEnabled: boolean;
   monitoringChangedAt: number;
   alertsReopenedAt: number | null;
+  /**
+   * The user's own Discord webhook (migrations/0010), PLAINTEXT. NEVER PUT THIS IN A RESPONSE OR A
+   * LOG LINE: `GET /api/webhook` answers `{configured}` and nothing else does more.
+   */
+  webhookUrl: string | null;
 }
 
 const COLUMNS = [
@@ -61,6 +66,7 @@ const COLUMNS = [
   "monitoring_enabled",
   "monitoring_changed_at",
   "alerts_reopened_at",
+  "webhook_url",
 ] as const;
 
 /** The columns `userFromRow` reads, optionally qualified by a table alias. */
@@ -82,6 +88,7 @@ export interface UserRow {
   monitoring_enabled: number;
   monitoring_changed_at: number;
   alerts_reopened_at: number | null;
+  webhook_url: string | null;
 }
 
 export const userFromRow = (row: UserRow): User => ({
@@ -109,6 +116,7 @@ export const userFromRow = (row: UserRow): User => ({
   monitoringEnabled: row.monitoring_enabled === 1,
   monitoringChangedAt: row.monitoring_changed_at,
   alertsReopenedAt: row.alerts_reopened_at,
+  webhookUrl: row.webhook_url,
 });
 
 const SELECT_BY_ID = `SELECT ${USER_COLUMNS} FROM users WHERE user_id = ?1`;

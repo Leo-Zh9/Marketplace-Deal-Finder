@@ -128,9 +128,14 @@ describe("notify CPU", () => {
          VALUES (2, 'second@example.com', 'toronto', 43.6532, -79.3832, 10, 'DISCOUNT', 1500, NULL, 1, 0, 0),
                 (3, 'third@example.com', 'waterloo', 43.4643, -80.5204, 25, 'MAXIMUM_PRICE', NULL, 50000, 1, 0, 0)`,
       ),
+      // PR3: everyone has a destination, so all three users enqueue and are rotated.
+      db.prepare(
+        `UPDATE users SET webhook_url = 'https://discord.com/api/webhooks/' || user_id || '00000/tok'
+          WHERE user_id IN (2, 3)`,
+      ),
       db.prepare(
         `INSERT INTO user_watch_targets (user_id, target_id, component_type, query)
-         VALUES (2, 'g', 'gpu', 'graphics card'), (3, 'c', 'cpu', 'cpu')`,
+         VALUES (2, 'g', 'gpu', 'graphics card'), (3, 'g', 'gpu', 'graphics card')`,
       ),
       // A full nine-target watch list, so `invert` does its real work.
       ...[
@@ -186,7 +191,8 @@ describe("notify CPU", () => {
         db
           .prepare(
             `INSERT INTO listing_markets (market_key, source, listing_id, last_seen_at)
-             VALUES (?1, ?2, ?3, 0), ('43.6532,-79.3832|10km', ?2, ?3, 0)`,
+             VALUES (?1, ?2, ?3, 0), ('43.6532,-79.3832|10km', ?2, ?3, 0),
+                    ('43.4643,-80.5204|25km', ?2, ?3, 0)`,
           )
           .bind(MARKET, SOURCE, id),
       ]);
@@ -202,13 +208,14 @@ describe("notify CPU", () => {
       fetch,
       leaseTokenPrefix: "cpu",
     });
-    expect(real).toMatchObject({ enqueued: 5, sent: 5, cancelled: 0 });
+    // Every user has five deals: fifteen enqueued, five claimed round-robin across the three.
+    expect(real).toMatchObject({ enqueued: 15, sent: 5, cancelled: 0 });
     console.warn(
       `notify step D1 (3 users, 5 sent): ${usage.queries} queries, ` +
         `${usage.rowsRead} rows read, ${usage.rowsWritten} rows written`,
     );
-    // The plan's budget: well inside 50 subrequests.
-    expect(usage.queries).toBeLessThanOrEqual(19);
+    // The plan's budget: <= 26 of 50 D1 queries (plus <= 5 of 50 Discord fetches) per invocation.
+    expect(usage.queries).toBeLessThanOrEqual(26);
 
     const replay = replayDatabase(capture);
     const sample = async () => {

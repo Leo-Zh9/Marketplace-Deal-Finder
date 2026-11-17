@@ -14,6 +14,7 @@ import collectorHealthSql from "../../migrations/0006_collector_health.sql?raw";
 import notificationsSql from "../../migrations/0007_notifications.sql?raw";
 import monitoringStateSql from "../../migrations/0008_monitoring_state.sql?raw";
 import multiUserSql from "../../migrations/0009_multi_user.sql?raw";
+import userWebhooksSql from "../../migrations/0010_user_webhooks.sql?raw";
 
 /**
  * Strip `--` line comments, split on `;`, trim, drop empties. The schema contains no
@@ -64,6 +65,7 @@ export const MIGRATIONS: readonly string[] = [
   notificationsSql,
   monitoringStateSql,
   multiUserSql,
+  userWebhooksSql,
 ];
 
 /**
