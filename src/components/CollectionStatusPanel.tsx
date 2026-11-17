@@ -53,6 +53,19 @@ import type { CollectionStatus, NotificationCounts } from "../types";
 const CANARY_TARGETS = 2;
 
 /**
+ * WHAT EACH EXIT CODE MEANS, in the words of `collector/run.ts`'s table, so the panel says who must
+ * act rather than a bare number. An unlisted code falls back to "The last run exited N.", because
+ * a newer collector may exit with a code this page has never heard of. P-7.
+ */
+const EXIT_WORDS: Record<string, string> = {
+  "2": "The collector is missing a required setting, so nothing was searched.",
+  "3": "A search came back empty.",
+  "4": "Facebook’s page changed shape, so nothing was saved. Someone needs to look.",
+  "5": "Facebook could not be reached, or the upload failed. The next run will retry.",
+  "6": "The server refused the upload or could not save some listings. Someone needs to look.",
+};
+
+/**
  * EVERY CAUSE THE SERVER CAN SEND, IN THE USER'S WORDS. The server sends machine strings
  * (`exit-code:6`, `feed-overlap:a+b`) and this is the only place they become English.
  *
@@ -79,12 +92,13 @@ const describeCause = (cause: string): string => {
   if (cause === "guard-blind") {
     return "The collector could not save its own guard state, so the next run will not remember this one.";
   }
+  if (cause === "status-unreadable") return "The collector’s status could not be read.";
 
   const colon = cause.indexOf(":");
   const kind = colon === -1 ? cause : cause.slice(0, colon);
   const rest = colon === -1 ? "" : cause.slice(colon + 1);
 
-  if (kind === "exit-code") return `The last run exited ${rest}.`;
+  if (kind === "exit-code") return EXIT_WORDS[rest] ?? `The last run exited ${rest}.`;
   if (kind === "source-empty") {
     return `“${rest}” has come back with no results several runs in a row. Facebook may have changed the page.`;
   }
@@ -252,8 +266,15 @@ export function CollectionStatusPanel({
               * is rendering the badge alone, whose failure shape is a page that says "Degraded"
               * with no way to tell a run from five minutes ago from one from last Tuesday.
               */}
+            {/*
+              * "NEVER REPORTED" ONLY WHEN THE SERVER COULD LOOK. A `status-unreadable` cause means
+              * the row could not be read at all, and saying no run has reported would be false;
+              * the cause list below says what is true instead. P-13.
+              */}
             {status.collector === null ? (
-              <p className="collection-timestamp">No collector run has reported yet.</p>
+              status.causes.includes("status-unreadable") ? null : (
+                <p className="collection-timestamp">No collector run has reported yet.</p>
+              )
             ) : (
               <p className="collection-timestamp">
                 Last reported {clockTime(status.reportedAt)}, {agePhrase(status.ageMinutes)}.

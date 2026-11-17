@@ -140,16 +140,21 @@ describe("the collection status panel", () => {
   });
 
   /**
-   * P-7: `degraded` WITH A NON-ZERO EXIT NAMES THE CODE.
+   * P-7: `degraded` WITH A NON-ZERO EXIT SAYS WHAT THE CODE MEANS.
    *
    * THE MUTATION IS DROPPING THE BRANCH, and this is the one case a persistent-exit-6 deploy
-   * produces: every run punctual, every run exiting 6, NOTHING stored. The exit code is what
-   * sends the operator to `collector/run.ts`'s table, which says who must act for each number.
+   * produces: every run punctual, every run exiting 6, NOTHING stored. Each sentence is
+   * `collector/run.ts`'s table in words, so the page says who must act instead of a bare number
+   * (a login wall exits 5 and used to read "The last run exited 5."). A code the table does not
+   * list keeps the number, because a newer collector may add one.
    */
   it.each<[number, string]>([
-    [2, "The last run exited 2."],
-    [3, "The last run exited 3."],
-    [6, "The last run exited 6."],
+    [2, "The collector is missing a required setting, so nothing was searched."],
+    [3, "A search came back empty."],
+    [4, "Facebook’s page changed shape, so nothing was saved. Someone needs to look."],
+    [5, "Facebook could not be reached, or the upload failed. The next run will retry."],
+    [6, "The server refused the upload or could not save some listings. Someone needs to look."],
+    [7, "The last run exited 7."],
   ])("P-7: exit code %i is named in words", (exitCode, sentence) => {
     render(
       <CollectionStatusPanel
@@ -243,6 +248,31 @@ describe("the collection status panel", () => {
   });
 
   /**
+   * P-13: AN UNREADABLE STATUS SAYS SO, AND NEVER "No collector run has reported yet".
+   *
+   * THE MUTATION IS DROPPING THE `status-unreadable` CHECK, under which a Worker whose D1 is
+   * unavailable tells the user no run has ever reported -- a claim it could not have checked.
+   * Both halves are asserted, because a panel that renders both sentences passes either alone.
+   */
+  it("P-13: status-unreadable says the status could not be read, not that nothing reported", () => {
+    render(
+      <CollectionStatusPanel
+        status={status({
+          status: "unknown",
+          causes: ["status-unreadable"],
+          reportedAt: 0,
+          ageMinutes: 0,
+          collector: null,
+        })}
+        pending={false}
+      />,
+    );
+
+    expect(screen.getByText("The collector’s status could not be read.")).toBeInTheDocument();
+    expect(screen.queryByText("No collector run has reported yet.")).not.toBeInTheDocument();
+  });
+
+  /**
    * P-9: A READ THAT FAILED SAYS SO, AND SAYS THE SEARCHES ARE UNAFFECTED.
    *
    * The second half matters because of what the page's OTHER failed read means: a failed
@@ -304,7 +334,8 @@ describe("the collection status panel", () => {
     ["canary-expired", /searched everything once to re-measure/, null],
     ["guard-blind", /could not save its own guard state/, null],
     ["alarms-unreadable", /stored alarm list could not be read/, null],
-    ["exit-code:4", /The last run exited 4\./, null],
+    ["exit-code:4", /Facebook’s page changed shape/, null],
+    ["status-unreadable", /status could not be read/, null],
     ["source-empty:mobo-toronto", /no results several runs in a row/, "mobo-toronto"],
     ["transient:gpu-rtx", /has failed several runs in a row/, "gpu-rtx"],
     ["refused:storage-ssd", /Facebook refused/, "storage-ssd"],

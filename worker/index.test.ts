@@ -313,7 +313,7 @@ describe("protected Worker API", () => {
      */
     await expect(response.json()).resolves.toEqual({
       status: "unknown",
-      causes: [],
+      causes: ["status-unreadable"],
       reportedAt: 0,
       ageMinutes: 0,
       collector: null,
@@ -384,7 +384,7 @@ describe("protected Worker API", () => {
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual({
       status: "unknown",
-      causes: [],
+      causes: ["status-unreadable"],
       reportedAt: 0,
       ageMinutes: 0,
       collector: null,

@@ -450,9 +450,14 @@ describe("the collector health row", () => {
     });
   });
 
-  it("H-7b: no row at all is unknown too", async () => {
-    await expect(readCollectorHealth(database.db, now)).resolves.toMatchObject({
+  // H-7b: A READABLE TABLE WITH NO ROW IS "never reported", NOT "unreadable" -- the read worked,
+  // so `causes` stays empty and the panel says no run has reported yet (H-8 is the other side).
+  it("H-7b: no row at all is unknown too, with no causes", async () => {
+    await expect(readCollectorHealth(database.db, now)).resolves.toEqual({
       status: "unknown",
+      causes: [],
+      reportedAt: 0,
+      ageMinutes: 0,
       collector: null,
     });
   });
@@ -469,10 +474,11 @@ describe("the collector health row", () => {
   it.each<[string, D1Database | undefined]>([
     ["an unbound DB", undefined],
     ["a read that threw", brokenDb()],
-  ])("H-8: %s is unknown, not an error", async (_label, db) => {
+  ])("H-8: %s is unknown with status-unreadable, not an error", async (_label, db) => {
+    // THE CAUSE IS WHAT TELLS THE PANEL "could not read" APART FROM "never reported" (H-7, H-7b).
     await expect(readCollectorHealth(db, now)).resolves.toEqual({
       status: "unknown",
-      causes: [],
+      causes: ["status-unreadable"],
       reportedAt: 0,
       ageMinutes: 0,
       collector: null,

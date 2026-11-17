@@ -315,14 +315,19 @@ export const readCollectorHealth = async (
     collector: null,
   };
 
-  if (db === undefined) return unknown;
+  // UNREADABLE IS NOT "NEVER REPORTED". A missing binding or a throwing read means this endpoint
+  // cannot see the row, so it says so; the panel must not tell the user no run has reported when
+  // it simply could not look. H-8.
+  const unreadable: CollectorStatusBody = { ...unknown, causes: ["status-unreadable"] };
+
+  if (db === undefined) return unreadable;
 
   let row: HealthRow | undefined;
   try {
     const read = await db.prepare(SELECT).all<HealthRow>();
     row = read.results[0];
   } catch {
-    return unknown;
+    return unreadable;
   }
 
   // THE SEEDED ROW IS `unknown`, NEVER `stale`. Without this branch a freshly migrated database
