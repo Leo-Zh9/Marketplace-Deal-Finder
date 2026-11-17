@@ -164,13 +164,13 @@ export const hasOwnMarket = (raw: unknown): raw is Record<string, unknown> & { m
   isRecord(raw) && "market" in raw;
 
 /**
- * THE MARKET ONE TARGET SEARCHES: its own when the row carries one, else the shared top-level
- * market. A row whose own market is malformed is REFUSED, never sent to the shared market --
- * that would collect one person's searches into another person's area, silently.
+ * THE MARKET ONE TARGET SEARCHES: its own when the row carries one, else `shared`. A row whose own
+ * market is malformed is REFUSED, never sent to the shared market -- that would collect one
+ * person's searches into another person's area, silently.
  *
- * `shared` is null when the top-level `market` was null. `runAllTargets` refuses the whole run
- * before the loop when any row needs a fallback that is not there, so the last branch is
- * unreachable from it; it is here so this function stays total.
+ * `shared` is the fallback the CALLER allows. `runAllTargets` passes the top-level market only on
+ * the old wire (no row carries a market) and null on the per-target wire, so there a row without
+ * a market of its own is refused by the last branch rather than given someone else's area.
  */
 export const resolveTargetMarket = (
   raw: unknown,
@@ -181,7 +181,7 @@ export const resolveTargetMarket = (
     return own.ok ? own : { ok: false, reason: `the target's market is unusable: ${own.reason}` };
   }
   if (shared !== null) return { ok: true, value: shared };
-  return { ok: false, reason: "the target has no market and there is no shared market" };
+  return { ok: false, reason: "the target has no market of its own and no shared market applies" };
 };
 
 export const parseTarget = (raw: unknown): ParseResult<WatchTarget> => {

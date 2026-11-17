@@ -543,28 +543,30 @@ export const runAllTargets = async (
   }
 
   /**
-   * THE SHARED MARKET IS CHECKED EXACTLY AS BEFORE, WITH ONE RELAXATION: a null top-level market
-   * is accepted when EVERY row carries its own. A Worker that sends no per-target markets (every
-   * Worker before them) therefore takes this branch on every input exactly as it always did. A
-   * non-null top-level market is always validated, whether or not any row falls back to it.
+   * TWO WIRES, DECIDED ONCE FOR THE WHOLE LIST.
+   *
+   * NO ROW CARRIES A `market` KEY: every Worker before per-target markets. The top-level market is
+   * checked exactly as it always was (a null or malformed one is the whole run's exit 2) and every
+   * target searches it. `perTarget` is false and nothing below differs from before.
+   *
+   * ANY ROW CARRIES ONE: the per-target wire. Every target must bring its own market, and a row
+   * without one is THAT target's exit 2 -- it never silently takes the top-level market, which is
+   * only a summary of the rows. A null top-level market is normal here; a non-null one is still
+   * validated, because a malformed one says the two sides disagree about the wire.
+   *
+   * `perTarget` IS DECIDED BY KEY PRESENCE (`hasOwnMarket`), so one row's `market: null` is that
+   * row's exit 2 and can never turn the list back into the old wire and refuse the whole run.
    */
-  const lacking = fetched.targets.filter((raw) => !hasOwnMarket(raw)).length;
+  const perTarget = fetched.targets.some((raw) => hasOwnMarket(raw));
   let shared: WatchMarket | null = null;
-  if (fetched.market !== null || lacking > 0) {
+  if (fetched.market !== null || !perTarget) {
     const market = parseMarket(fetched.market);
     if (!market.ok) {
       // NO DEFAULT MARKET IS EVER INVENTED. A wrong market collects into the wrong `market_key`
       // silently, and `targets` still reports the returned count so the operator is not told
       // they have zero targets when they have two.
-      const mixed =
-        lacking < returned ? ` (${lacking} of ${returned} targets carry no market of their own)` : "";
       return await emit(
-        wholeRunFailure(
-          config,
-          returned,
-          EXIT_CONFIG,
-          `the watch market is unusable: ${market.reason}${mixed}`,
-        ),
+        wholeRunFailure(config, returned, EXIT_CONFIG, `the watch market is unusable: ${market.reason}`),
       );
     }
     shared = market.value;
@@ -616,11 +618,11 @@ export const runAllTargets = async (
 
     const target = parsed.value;
 
-    // A ROW WHOSE OWN MARKET IS MALFORMED IS THAT TARGET'S EXIT 2, NEVER A FALLBACK TO THE
-    // SHARED MARKET (that would search one person's query in another person's area) and never a
-    // whole-run failure (one bad area must not stop every other search). Same validation, same
-    // exit code as the top-level market.
-    const targetMarket = resolveTargetMarket(raw, shared);
+    // A ROW WHOSE OWN MARKET IS MALFORMED OR MISSING (on the per-target wire) IS THAT TARGET'S
+    // EXIT 2, NEVER A FALLBACK TO THE TOP-LEVEL MARKET (that would search one person's query in
+    // another person's area) and never a whole-run failure (one bad area must not stop every
+    // other search). Same validation, same exit code as the top-level market.
+    const targetMarket = resolveTargetMarket(raw, perTarget ? null : shared);
     if (!targetMarket.ok) {
       const failed: TargetOutcome = {
         target: target.targetId,

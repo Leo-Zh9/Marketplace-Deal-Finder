@@ -506,7 +506,7 @@ describe("a market per watch target", () => {
   it("C-t6: no own market and no shared market is refused, never defaulted", () => {
     expect(resolveTargetMarket(body.targets[0], null)).toEqual({
       ok: false,
-      reason: "the target has no market and there is no shared market",
+      reason: "the target has no market of its own and no shared market applies",
     });
   });
 });

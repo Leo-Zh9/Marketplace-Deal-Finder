@@ -859,19 +859,21 @@ wrong `market_key` silently.
 
 **A target may carry its own market** (`targets[i].market`, same four fields), for the
 multi-user Worker where each person searches their own area. The top-level `market` is then
-present only when every target shares one, and `null` otherwise. The collector searches each
-target in its own market and falls back to the top-level one only for a row with **no `market`
-key at all** — which is every row today's Worker sends, so against it nothing changes:
+present only when every target shares one, and `null` otherwise. The collector reads the list as
+one of two wires, decided by whether **any** row has a `market` key:
 
-- an own market is validated exactly like the top-level one; a malformed one (including
-  `market: null` on the row) is **that target's exit 2**, never searched in the shared market
-  and never a whole-run failure;
-- a non-null top-level market is always validated; a `null` one is accepted only when every row
-  carries its own, and otherwise is the same whole-run exit 2 as before (the error names how many
-  targets lack a market when some do carry one);
-- the cap, the refusal guard and its state file, the overlap check and the health post are
-  unchanged. `collector/testing/fixtures/watchTargetsPerTargetMarket.json` is the wire, and
-  `collector/runTargets.test.ts` M-1 runs it through the real fetcher and loop with no Worker.
+- **No row has one** (every row today's Worker sends): exactly as before. The top-level market
+  is validated, a null or malformed one is the whole run's exit 2, and every target searches it.
+- **Any row has one**: every target searches its own market. A row with no market, or a
+  malformed one (including `market: null` on the row), is **that target's exit 2**. It never
+  falls back to the top-level market and never fails the whole run. A null top-level market is
+  normal here. A non-null one is still validated.
+
+The cap, the refusal guard and its state file, the overlap check and the health post are
+unchanged. The overlap check still skips a same-query pair even when the two targets are in
+different markets, because overlapping areas legitimately share listings.
+`collector/testing/fixtures/watchTargetsPerTargetMarket.json` is the wire, and
+`collector/runTargets.test.ts` M-1 runs it through the real fetcher and loop with no Worker.
 
 It lives in `watch_market` and `watch_targets` (migration `0005`) and **deliberately not in
 `search_revisions`.** That table is the append-only revision log and its revision number is

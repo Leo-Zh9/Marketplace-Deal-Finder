@@ -248,11 +248,13 @@ export interface TargetRun {
   ids: readonly string[];
   /**
    * THE SEARCH TEXT, AND IT IS HERE FOR EXACTLY ONE REASON: two watch rows can carry the SAME
-   * query under DIFFERENT component types, and `buildSearchUrl` does not read the component type
-   * -- so those two targets make the IDENTICAL request and must overlap 1.000 by construction.
-   * Without this field the pair trips every single run and can never clear, which is a permanent
-   * volume cut with the page blaming a generic feed for what is a duplicate configuration. It is
-   * `""` for a row that failed validation, and two empty strings are never treated as equal.
+   * query, and their overlap then says nothing about the feed. In ONE market (two component
+   * types, since `buildSearchUrl` does not read the type) they make the IDENTICAL request and
+   * overlap 1.000 by construction. In TWO markets (per-target markets) they are two requests, but
+   * overlapping areas legitimately return the same listings for the same query, so a high overlap
+   * is still expected rather than evidence. Either way, without this field the pair trips and can
+   * never clear: a permanent volume cut with the page blaming a generic feed. It is `""` for a row
+   * that failed validation, and two empty strings are never treated as equal.
    */
   query: string;
 }
@@ -442,13 +444,17 @@ export const maxPairOverlap = (ran: readonly TargetRun[]): PairOverlap | null =>
     for (let j = i + 1; j < ran.length; j += 1) {
       const a = ran[i];
       const b = ran[j];
-      // TWO ROWS WITH THE SAME QUERY ARE NOT A PAIR, THEY ARE ONE SEARCH RUN TWICE.
-      // `collector/searchUrl.ts`'s `buildSearchUrl` reads the query, the location, the limit, the
-      // radius and the day window -- NOT the component type -- so `('gpu','rtx')` and
-      // `('cpu','rtx')` fetch the same URL and their id sets are identical by construction. The
-      // overlap would be 1.000 on every run, so the cause would latch immediately and could
-      // never be re-measured clean: a permanent 78 % cut explained to the operator as a generic
-      // feed. The real fault is two watch rows that should be one, and nothing here can say so.
+      // TWO ROWS WITH THE SAME QUERY ARE NOT A PAIR THIS CHECK CAN JUDGE.
+      // In ONE market they are one search run twice: `collector/searchUrl.ts`'s `buildSearchUrl`
+      // reads the query, the location, the limit, the radius and the day window -- NOT the
+      // component type -- so `('gpu','rtx')` and `('cpu','rtx')` fetch the same URL and their id
+      // sets are identical by construction. The overlap would be 1.000 on every run, so the cause
+      // would latch immediately and could never be re-measured clean: a permanent 78 % cut
+      // explained to the operator as a generic feed.
+      // In TWO markets (per-target markets) they ARE two requests, and the skip is still right:
+      // the check detects the feed serving one page to DIFFERENT queries, and the same query in
+      // two overlapping areas (two GTA users) legitimately shares listings. Keying the skip on
+      // the market too would latch a false feed-overlap whenever two people's areas overlap.
       // `""` is excluded because an unvalidated row has no query to compare and two broken rows
       // are not the same search. Belt-and-braces: `runTargets` cannot reach it, because an
       // unvalidated target has no ids (skipped below) and `parseTarget` rejects an empty query.
