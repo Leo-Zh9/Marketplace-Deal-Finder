@@ -122,8 +122,9 @@ state machine).
   `isValidWebhookUrl` at use and sent by the rebuilt URL.
 - **The webhook is write-only.** `PUT /api/webhook {url | null}` validates and stores it;
   `GET /api/webhook` answers `{configured}` and nothing else; no response, error body or log line
-  carries it. It is stored plaintext on the user's row (0010's header says why). Setting a NEW URL
-  re-opens that user's alerts, like a new search.
+  carries it. It is stored plaintext on the user's row (0010's header says why). A URL re-opens that
+  user's alerts ONLY if they had no working destination before it (a new user's first webhook);
+  switching channels, or the owner moving off the secret, does not re-open anything.
 - **Round-robin.** Each step reads the active users once, sweeps once, then per user with a
   destination reads their searches and enqueues their candidates. Sends go **one claim per user per
   pass** until 5 claims in total, starting at a different user each 30-minute run, so a big backlog
@@ -131,11 +132,12 @@ state machine).
   timeout) removes **only that user** from this step's rotation.
 - **A user with no destination is skipped entirely**: nothing is enqueued for them and their existing
   PENDING rows stay PENDING. Building rows that cannot be sent would only grow a backlog to flood the
-  channel they configure later; the stamp on setting a webhook lets their current deals alert then.
+  channel they configure later; the stamp on their first webhook lets their current deals alert then.
 - **Budget**, worst case at 3 users: users read 1 + sweep 1 + 3 x (searches, enqueue) + at most one
-  empty claim per user + 5 x (claim, recheck, result) = 26 of the 50 D1 queries an invocation may
-  make. Measured (`notifyCpu.test.ts` N17, all three users with a backlog): 23 queries, 269 rows
-  read, 65 written.
+  empty claim per user + 5 x (claim, recheck, result) = **26 of 50 D1 queries, plus 5 of 50 Discord
+  fetches** per invocation. Measured (`notifyCpu.test.ts` N17, all three users with a backlog): 23
+  queries, 269 rows read, 65 written. The daily READ cost grows with the corpus per user; see
+  docs/phase-4-notifications.md "Reads".
 - **`/api/status`** reports the caller's own state: `unconfigured` (no destination), `invalid-url`
   (a stored or secret URL that does not validate), `off` (the master switch), else `on` or
   `webhook-rejected` from the caller's own rows.

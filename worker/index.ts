@@ -601,7 +601,7 @@ export const handleRequest = async (
     const result =
       request.method === "GET"
         ? handleGetWebhook(caller.user)
-        : await handlePutWebhook(request, db, caller.user, environment.APP_ENV, now);
+        : await handlePutWebhook(request, db, caller.user, environment, now);
 
     return result.ok
       ? json(result.body, result.status, cors)

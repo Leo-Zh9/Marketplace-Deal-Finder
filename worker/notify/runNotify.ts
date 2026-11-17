@@ -20,7 +20,7 @@
  * EVERY ACTIVE USER, ROUND-ROBIN (multi-user PR3). A user who is not ACTIVE (worker/users/users.ts:
  * allowlisted and Started) gets nothing. A user with NO DESTINATION is skipped entirely -- no
  * enqueue, no claim -- so nothing is built that cannot be sent and their existing PENDING rows stay
- * PENDING; setting a webhook re-opens their alerts (worker/api/webhook.ts). The others are served
+ * PENDING; their first webhook re-opens their alerts (worker/api/webhook.ts). The others are served
  * ONE CLAIM PER USER PER PASS, until MAX_SENDS_PER_STEP claims in total, so one user's backlog
  * cannot starve another. The pass starts at a different user each run (by `now`), so with a
  * sustained backlog no user is always last. A response that STOPS a step (429, 401/403/404, 5xx,
@@ -28,8 +28,8 @@
  * webhook never blocks another user's sends.
  *
  * BUDGET, per step, worst case at MAX_USERS = 3: user read 1 + sweep 1 + 3 x (selection read,
- * enqueue) + at most one empty claim per user (3) + 5 x (claim, recheck, result-or-cancel) = 26
- * D1 queries, against 50 per invocation on Workers Free; at most 5 subrequests to Discord.
+ * enqueue) + at most one empty claim per user (3) + 5 x (claim, recheck, result-or-cancel) = 26 of
+ * 50 D1 queries, plus 5 of 50 Discord fetches, per invocation on Workers Free.
  * notifyCpu.test.ts N17 measures it. No unbounded loop: every iteration spends a claim or removes
  * a user.
  *

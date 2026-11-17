@@ -10,15 +10,18 @@
  * this route accepts is a URL the step will send to. `{url: null}` clears it; user 1 then falls back
  * to the DISCORD_WEBHOOK_URL secret (worker/notify/config.ts destinationFor).
  *
- * SETTING A NEW URL RE-OPENS THE CALLER'S ALERTS (`alerts_reopened_at`). The notify step skips a user
- * with no destination entirely -- it builds no rows it cannot send -- so without the stamp, deals
- * that qualified while a new user was still setting up would never alert. Clearing it, or saving the
- * same URL again, does not stamp.
+ * A URL RE-OPENS THE CALLER'S ALERTS (`alerts_reopened_at`) ONLY IF THEY HAD NO WORKING DESTINATION
+ * BEFORE IT. The notify step skips a user with no destination entirely -- it builds no rows it cannot
+ * send -- so without the stamp, deals that qualified while a new user was still setting up would
+ * never alert. A user who already had one was already being alerted: switching channels, re-pasting
+ * the same webhook in another spelling (discordapp.com / discord.com), or the owner moving from the
+ * DISCORD_WEBHOOK_URL secret to the field must NOT re-open a day of backlog into the channel.
+ * Clearing never stamps.
  *
  * Returns a RESULT, never a Response, like every file in worker/api/.
  */
 
-import { isValidWebhookUrl } from "../notify/config";
+import { destinationFor, isValidWebhookUrl, type NotifyEnvironment } from "../notify/config";
 import type { User } from "../users/users";
 
 /** A Discord webhook URL is ~120 bytes; the bound and its two-step are worker/api/settings.ts's. */
@@ -43,7 +46,8 @@ export const handleGetWebhook = (user: User): WebhookResult => ({
 });
 
 /**
- * Scoped to the caller. ?1 the URL or NULL, ?2 now, ?3 user_id, ?4 1 when this sets a NEW URL.
+ * Scoped to the caller. ?1 the URL or NULL, ?2 now, ?3 user_id, ?4 1 when this gives a user with no
+ * working destination their first one.
  * RETURNING only whether one is stored -- the value itself is never read back.
  */
 const SET_WEBHOOK = `UPDATE users
@@ -56,9 +60,10 @@ export const handlePutWebhook = async (
   request: Request,
   db: D1Database,
   user: User,
-  appEnv: string | undefined,
+  environment: NotifyEnvironment,
   now: number,
 ): Promise<WebhookResult> => {
+  const appEnv = environment.APP_ENV;
   const mediaType = (request.headers.get("Content-Type") ?? "").split(";")[0].trim().toLowerCase();
   if (mediaType !== "application/json") return fail(415, "UNSUPPORTED_MEDIA_TYPE");
   const declared = Number.parseInt(request.headers.get("Content-Length") ?? "", 10);
@@ -97,7 +102,8 @@ export const handlePutWebhook = async (
     return fail(400, "INVALID_WEBHOOK");
   }
 
-  const reopens = url !== null && url !== user.webhookUrl;
+  // destinationFor reads the row AS IT WAS: the owner's secret counts as a working destination.
+  const reopens = url !== null && destinationFor(user, environment).state !== "ok";
   try {
     const written = await db
       .prepare(SET_WEBHOOK)

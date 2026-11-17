@@ -214,7 +214,7 @@ describe("notify CPU", () => {
       `notify step D1 (3 users, 5 sent): ${usage.queries} queries, ` +
         `${usage.rowsRead} rows read, ${usage.rowsWritten} rows written`,
     );
-    // The plan's budget: <= 26 of the 50 subrequests a Workers Free invocation allows.
+    // The plan's budget: <= 26 of 50 D1 queries (plus <= 5 of 50 Discord fetches) per invocation.
     expect(usage.queries).toBeLessThanOrEqual(26);
 
     const replay = replayDatabase(capture);

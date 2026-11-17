@@ -36,16 +36,22 @@ beforeEach(async () => {
   await truncateAll(database.db);
 });
 
-const environment = (): Environment => ({
+const environment = (overrides: Partial<Environment> = {}): Environment => ({
   APP_ENV: "production",
   FIREBASE_PROJECT_ID: projectId,
   ALLOWED_ORIGINS: JSON.stringify([appOrigin]),
   APPROVED_EMAILS: JSON.stringify([TEST_OWNER_EMAIL, "second@example.com"]),
   COLLECTOR_TOKEN: COLLECTOR,
   DB: database.db,
+  ...overrides,
 });
 
-const call = async (email: string | null, init: RequestInit = {}, headers: Record<string, string> = {}) =>
+const call = async (
+  email: string | null,
+  init: RequestInit = {},
+  headers: Record<string, string> = {},
+  env: Environment = environment(),
+) =>
   handleRequest(
     new Request(`${workerOrigin}/api/webhook`, {
       ...init,
@@ -56,11 +62,12 @@ const call = async (email: string | null, init: RequestInit = {}, headers: Recor
         ...headers,
       },
     }),
-    environment(),
+    env,
     dependencies,
   );
 
-const put = (email: string, url: unknown) => call(email, { method: "PUT", body: JSON.stringify({ url }) });
+const put = (email: string, url: unknown, env: Environment = environment()) =>
+  call(email, { method: "PUT", body: JSON.stringify({ url }) }, {}, env);
 
 const stored = async (userId: number) =>
   database.db
@@ -139,16 +146,32 @@ describe("the webhook API", () => {
   });
 
   /**
-   * WH-reopen. SETTING A NEW URL RE-OPENS THE CALLER'S ALERTS; the same URL again, or a clear, does
-   * not. A user with no destination builds no rows, so this is what lets their current deals alert.
+   * WH-reopen. A URL RE-OPENS ALERTS ONLY FOR A USER WHO HAD NO WORKING DESTINATION. Kills, each on
+   * its own case: stamping on any change of value (the owner moving off the secret, and a channel
+   * switch, re-open a day of backlog); never stamping (a new user's current deals never alert); and
+   * reading the destination AFTER the write (the first set looks already-configured).
    */
-  it("WH-reopen: a new URL stamps alerts_reopened_at; the same URL and a clear do not", async () => {
+  it("WH-reopen: a user with no destination is stamped when they set one", async () => {
+    await put("second@example.com", HOOK_B);
+    expect((await stored(2))?.alerts_reopened_at).toBe(NOW);
     await put(TEST_OWNER_EMAIL, HOOK);
     expect((await stored(1))?.alerts_reopened_at).toBe(NOW);
-    await database.db.prepare("UPDATE users SET alerts_reopened_at = 5 WHERE user_id = 1").run();
-    await put(TEST_OWNER_EMAIL, HOOK);
-    await put(TEST_OWNER_EMAIL, null);
-    expect((await stored(1))?.alerts_reopened_at).toBe(5);
+  });
+
+  it("WH-reopen: the owner already on the DISCORD_WEBHOOK_URL secret is not stamped", async () => {
+    const withSecret = environment({ DISCORD_WEBHOOK_URL: HOOK_B });
+    expect((await put(TEST_OWNER_EMAIL, HOOK, withSecret)).status).toBe(200);
+    expect(await stored(1)).toEqual({ webhook_url: HOOK, alerts_reopened_at: null });
+  });
+
+  it("WH-reopen: switching from one working URL to another, or re-spelling it, is not stamped", async () => {
+    await put("second@example.com", HOOK_B);
+    await database.db.prepare("UPDATE users SET alerts_reopened_at = 5 WHERE user_id = 2").run();
+    await put("second@example.com", HOOK);
+    await put("second@example.com", HOOK.replace("discord.com", "discordapp.com"));
+    await put("second@example.com", HOOK.replace("discord.com", "discordapp.com"));
+    await put("second@example.com", null);
+    expect(await stored(2)).toEqual({ webhook_url: null, alerts_reopened_at: 5 });
   });
 
   /** WH-cred. The collector's token opens nothing here, and there is no tokenless access. */
