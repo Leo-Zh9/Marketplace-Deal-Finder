@@ -107,7 +107,10 @@ export interface PreviewResult {
 export interface CollectionStatus {
   /** `stopped` is the operator's own Stop, and it outranks every health word. */
   status: "ok" | "stale" | "degraded" | "unknown" | "stopped";
-  /** Whichever `degraded` clauses fired, as a set. Empty on `ok`, `stale` and `unknown`. */
+  /**
+   * Whichever `degraded` clauses fired, as a set. Empty on `ok` and `stale`. On `unknown` it is
+   * empty when nothing has reported, and `["status-unreadable"]` when the row could not be read.
+   */
   causes: string[];
   /** Unix SECONDS, the SERVER's clock. 0 when nothing has reported. */
   reportedAt: number;

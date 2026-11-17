@@ -94,7 +94,8 @@ running, and an absent row also reads as running.
   finalizes and releases like `NO_SETTINGS`. Stop is checked first, so a stopped install with no
   rule reads `STOPPED`. It writes no `console.warn`, because it is the operator's choice and not a
   fault.
-- **`/api/status`.** It reads `status: "stopped"` with `causes: []`. `reportedAt`, `ageMinutes`
+- **`/api/status`.** It reads `status: "stopped"` with `causes: []`, except that
+  `status-unreadable` is kept when the health row could not be read. `reportedAt`, `ageMinutes`
   and `collector` stay, so the page still says when the last run was. It also carries a new
   `monitoring: {state, changedAt}` field. That field is `null` when the read fails or there is
   no DB binding, and then nothing is overridden.
