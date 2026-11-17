@@ -368,6 +368,36 @@ describe("Marketplace Deal Finder", () => {
   });
 
   /**
+   * A-saved-stopped: A SAVE WHILE STOPPED DOES NOT PROMISE A NEXT RUN. Found in the live UI pass:
+   * the Saved line said "picks this up on its next run" with monitoring stopped. Kills: the
+   * unconditional running-state sentence.
+   */
+  it("A-saved-stopped: the Saved line says to start monitoring while it is stopped", async () => {
+    const user = userEvent.setup();
+    stubWire({
+      verdicts: { listings: [], truncated: false },
+      status: {
+        ...HEALTHY_STATUS,
+        status: "stopped",
+        monitoring: { state: "stopped", changedAt: 1_800_000_240 },
+      },
+    });
+    render(<App getToken={noToken} />);
+    await waitForLoad("0 of 9 searches used");
+    await screen.findByRole("button", { name: "Start monitoring" });
+
+    await user.click(screen.getByRole("checkbox", { name: /^GPU:/i }));
+    await user.type(screen.getByLabelText("Search location"), "Toronto");
+    await user.click(screen.getByRole("button", { name: "Toronto, ON" }));
+    await user.click(screen.getByRole("button", { name: "Save searches" }));
+
+    expect(
+      await screen.findByText("Saved. Monitoring is stopped — press Start monitoring to collect."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/picks this up on its next run/)).not.toBeInTheDocument();
+  });
+
+  /**
    * A-pending: THE PREVIEW BUTTON SAYS "Loading…" WHILE THE READ IS IN FLIGHT, and is disabled. It
    * reads stored listings; nothing is searched at the click. Kills: the old "Searching…" label.
    */

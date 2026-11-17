@@ -901,7 +901,10 @@ function App({ identity, onSignOut, getToken }: AppProps) {
             </p>
             {savedAt && (
               <p className="action-help" role="status">
-                Saved. Your collector picks this up on its next run.
+                {/* WHILE STOPPED THERE IS NO NEXT RUN to pick the save up, so name the control. */}
+                {displayedCollection?.monitoring?.state === "stopped"
+                  ? "Saved. Monitoring is stopped — press Start monitoring to collect."
+                  : "Saved. Your collector picks this up on its next run."}
               </p>
             )}
           </section>
