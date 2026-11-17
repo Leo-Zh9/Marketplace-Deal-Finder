@@ -122,6 +122,11 @@ re-check uses word for word):
   server's own `invert`, bound into the same `json_each` predicate as `GET /api/verdicts`, in storage
   ids (`case_fan`, not `case_fans`). A type watched without a catalog model means every model of
   that type. An empty watch list means nothing.
+- It was collected in the saved market: `listings.market_key` equals the key `marketKey()` builds
+  from the `watch_market` row (`readSavedMarketKey`, the same term `GET /api/verdicts` filters on).
+  Nothing deletes from `listings`, so without this a fresh DEAL from the market the user just moved
+  away from would still alert. No market row binds NULL, which matches nothing. At re-check, a
+  claimed row whose market is no longer the saved one is cancelled (N-m).
 - **Enqueue only:** the task was judged within the last day (`t.evaluated_at >= now -
   NOTIFY_RECENT_EVALUATION_SECONDS`, 86,400 s). This makes alerts "new deals from now on" rather
   than a dump of every fresh DEAL when sending is first turned on. It gates on the *judgment*, not
@@ -130,6 +135,8 @@ re-check uses word for word):
   still re-arms. A `first_seen_at` gate was measured to break that path (mutation R6 turns N8 red).
   A settings change re-judges every task, so deals under a new rule do alert. The cost: a row
   cancelled as stale or un-watched does not re-arm once its judgment is more than a day old. The
+  same holds for a row cancelled because the saved market moved: if the user moves back to that
+  market, the row does not re-arm once its judgment is more than a day old. The
   same holds for a DEAL judged while its type was not watched: if the user starts watching that
   type more than a day later, it never alerts, which matches "new deals from now on". The
   re-check does not apply this gate, so a row that waits longer than a day (for example, during a
@@ -221,7 +228,7 @@ from the raw secret. A secret ending in `?` or `#` passes validation, and sent r
 | Limit | Free | This step, worst case |
 |---|---|---|
 | CPU per invocation | 10 ms | p95 **0.195 ms** for a 5-row step (Node, capture-and-replay, `cpuClock`; N17) |
-| D1 queries per invocation | 50 | **18**: sweep 1, watch-list read 1, enqueue 1, then 5 × (claim, re-check, result or cancel) |
+| D1 queries per invocation | 50 | **19**: sweep 1, watch-list read 1, saved-market read 1, enqueue 1, then 5 × (claim, re-check, result or cancel) |
 | Subrequests per invocation | 50 | 5 fetches to Discord |
 | Steps per instance | 1,024 | +1 (`notify`) |
 | Discord POSTs per day | | 5 per run × 48 runs = 240 at most. A rejected webhook costs 1 probe per run. |

@@ -97,6 +97,8 @@ interface Wire {
   settingsStatus?: number;
   settingsPutStatus?: number;
   verdicts?: { listings: Listing[]; truncated: boolean };
+  /** Awaited before `/api/verdicts` answers, so a test can see the pending Preview button. */
+  verdictsHold?: () => Promise<void>;
   /** What `GET /api/status` answers. The default is a healthy nine-target collector. */
   status?: CollectionStatus;
   /** A raw `/api/status` body, served exactly as given. Wins over `status`. */
@@ -156,6 +158,7 @@ const stubWire = (wire: Wire = {}) => {
           : reply({ settings: wire.settings ?? null });
       }
       if (path === "/api/verdicts") {
+        await wire.verdictsHold?.();
         return reply(wire.verdicts ?? { listings: [], truncated: false });
       }
       /**
@@ -331,6 +334,62 @@ describe("Marketplace Deal Finder", () => {
     expect(await screen.findByText("No matching listings found")).toBeInTheDocument();
     expect(screen.getByText(/wait for the next collection run/)).toBeInTheDocument();
     expect(screen.getByText("0 results")).toBeInTheDocument();
+  });
+
+  /**
+   * A-empty-stopped: WHILE MONITORING IS STOPPED THERE IS NO NEXT RUN, so the empty state names
+   * the control instead of telling the user to wait. The state comes from `/api/status`. Kills:
+   * the unconditional "wait for the next collection run" sentence.
+   */
+  it("A-empty-stopped: the empty state says to start monitoring while it is stopped", async () => {
+    const user = userEvent.setup();
+    stubWire({
+      verdicts: { listings: [], truncated: false },
+      status: {
+        ...HEALTHY_STATUS,
+        status: "stopped",
+        monitoring: { state: "stopped", changedAt: 1_800_000_240 },
+      },
+    });
+    render(<App getToken={noToken} />);
+    await waitForLoad("0 of 9 searches used");
+    await screen.findByRole("button", { name: "Start monitoring" });
+
+    await user.click(screen.getByRole("checkbox", { name: /^GPU:/i }));
+    await user.type(screen.getByLabelText("Search location"), "Toronto");
+    await user.click(screen.getByRole("button", { name: "Toronto, ON" }));
+    await user.click(screen.getByRole("button", { name: "Preview listings" }));
+
+    expect(await screen.findByText("No matching listings found")).toBeInTheDocument();
+    expect(
+      screen.getByText("Monitoring is stopped — press Start monitoring to collect."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/wait for the next collection run/)).not.toBeInTheDocument();
+  });
+
+  /**
+   * A-pending: THE PREVIEW BUTTON SAYS "Loading…" WHILE THE READ IS IN FLIGHT, and is disabled. It
+   * reads stored listings; nothing is searched at the click. Kills: the old "Searching…" label.
+   */
+  it("A-pending: the Preview button reads Loading… while /api/verdicts is held", async () => {
+    const user = userEvent.setup();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    stubWire({ verdicts: { listings: [], truncated: false }, verdictsHold: () => held });
+    render(<App getToken={noToken} />);
+    await waitForLoad("0 of 9 searches used");
+
+    await user.click(screen.getByRole("checkbox", { name: /^GPU:/i }));
+    await user.type(screen.getByLabelText("Search location"), "Toronto");
+    await user.click(screen.getByRole("button", { name: "Toronto, ON" }));
+    await user.click(screen.getByRole("button", { name: "Preview listings" }));
+
+    expect(await screen.findByRole("button", { name: "Loading…" })).toBeDisabled();
+    release();
+    expect(await screen.findByRole("button", { name: "Preview listings" })).toBeEnabled();
+    expect(screen.getByText("No matching listings found")).toBeInTheDocument();
   });
 
   /**
@@ -952,7 +1011,9 @@ describe("the control panel", () => {
     const scope = screen.getByTestId("preview-scope");
     expect(scope).toHaveTextContent("for your saved location and radius");
     expect(scope).toHaveTextContent("judged by your saved deal rule");
-    expect(scope).toHaveTextContent("takes effect after you Save and the collector's next run");
+    expect(scope).toHaveTextContent(
+      "takes effect after you Save and the collector's next run (while monitoring is on)",
+    );
     for (const claim of ["Monitoring", "Not running", "Stopped", "Last successful scan", "Next scan"]) {
       expect(screen.queryByText(claim), claim).not.toBeInTheDocument();
     }
@@ -1504,7 +1565,7 @@ describe("Start/Stop monitoring", () => {
     expect(await screen.findByRole("button", { name: "Start monitoring" })).toBeEnabled();
     expect(screen.getByText("Stopped")).toBeInTheDocument();
     expect(
-      screen.getByText("Stopped. Your collector skips its next run and no alerts are sent."),
+      screen.getByText("Monitoring stopped."),
     ).toBeInTheDocument();
     const post = calls.findIndex((call) => call.method === "POST" && call.url === "/api/monitoring/stop");
     expect(post).toBeGreaterThan(-1);
@@ -1525,7 +1586,7 @@ describe("Start/Stop monitoring", () => {
 
     await user.click(await screen.findByRole("button", { name: "Stop monitoring" }));
 
-    await screen.findByText("Stopped. Your collector skips its next run and no alerts are sent.");
+    await screen.findByText("Monitoring stopped.");
     expect(screen.getByRole("button", { name: "Stop monitoring" })).toBeEnabled();
     expect(screen.queryByRole("button", { name: "Start monitoring" })).not.toBeInTheDocument();
   });

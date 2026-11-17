@@ -372,7 +372,9 @@ function App({ identity, onSignOut, getToken }: AppProps) {
         text:
           next === "start"
             ? "Started. Your collector picks this up on its next run."
-            : "Stopped. Your collector skips its next run and no alerts are sent.",
+            : // SHORT ON PURPOSE: the panel's own "Stopped at ..." line, directly below, already
+              // says the collector skips its runs and no alerts are sent.
+              "Monitoring stopped.",
       });
     } catch (error: unknown) {
       setMonitoringNotice({
@@ -895,7 +897,7 @@ function App({ identity, onSignOut, getToken }: AppProps) {
             <p className="action-help" data-testid="preview-scope">
               Preview shows listings your collector has already found for your saved location and
               radius, judged by your saved deal rule. An unsaved location or radius change takes
-              effect after you Save and the collector's next run.
+              effect after you Save and the collector's next run (while monitoring is on).
             </p>
             {savedAt && (
               <p className="action-help" role="status">
@@ -987,7 +989,16 @@ function App({ identity, onSignOut, getToken }: AppProps) {
                 <div className="empty-state">
                   <div className="empty-icon" aria-hidden="true">0</div>
                   <h3>No matching listings found</h3>
-                  <p>Try selecting more components or models, or wait for the next collection run.</p>
+                  {/*
+                    * WHILE MONITORING IS STOPPED THERE IS NO NEXT RUN to wait for, so the page
+                    * names the control that starts one. The state comes from the status read,
+                    * never from the last click, as the Start/Stop button's label does.
+                    */}
+                  <p>
+                    {displayedCollection?.monitoring?.state === "stopped"
+                      ? "Monitoring is stopped — press Start monitoring to collect."
+                      : "Try selecting more components or models, or wait for the next collection run."}
+                  </p>
                 </div>
               ) : (
                 <>

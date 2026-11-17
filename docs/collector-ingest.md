@@ -381,7 +381,7 @@ evidenced type is the declared one, resolving to it changes nothing, so the clau
 equivalent mutant.
 
 **What reads the stored type, checked:** the dashboard's server-side component filter
-(`worker/api/verdicts.ts` `WHERE_SELECTION`) now shows a card found by a cpu search under gpu,
+(`worker/api/verdicts.ts` `WHERE_MARKET_AND_SELECTION`) now shows a card found by a cpu search under gpu,
 which is the point; the `(component_type, model_key)` pair stays consistent with the catalog,
 because a model key is only ever produced from the resolved type's own index; evaluation does
 not read the column; and the watch list is a different table. **No migration**: existing rows
