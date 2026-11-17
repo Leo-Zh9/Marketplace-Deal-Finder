@@ -96,7 +96,8 @@ fi
 # their searches dropped, so a previous run's alice and bob cannot widen the collector's list.
 sql "UPDATE users SET email = 'local-dev@localhost' WHERE user_id = 1 AND email IS NULL;
      UPDATE users SET monitoring_enabled = 1 WHERE user_id = 1;
-     UPDATE users SET monitoring_enabled = 0 WHERE user_id <> 1;
+     UPDATE users SET monitoring_enabled = 0, webhook_url = NULL WHERE user_id <> 1;
+     UPDATE users SET webhook_url = NULL WHERE user_id = 1;
      DELETE FROM user_watch_targets WHERE user_id <> 1;" >/dev/null
 
 # THE FROZEN EVIDENCE RULE (migrations/0009): a DISCOUNT revision the drain evaluates under. No API
@@ -1427,8 +1428,70 @@ is "alice reads the shared budget"            200 "$(as alice "$BASE/api/watch")
 has "  ...nine in use, eight of them hers"     '"budget":{"used":9,"maximum":9,"yours":8}' "$(body)"
 is "  ...so the budget reads nine"             9 "$(val "SELECT COUNT(*) FROM (SELECT DISTINCT t.component_type, t.query, u.latitude, u.longitude, u.radius_km FROM user_watch_targets t JOIN users u ON u.user_id = t.user_id)")"
 
+# PER-USER ALERTS (migrations/0010): each user's own webhook, on its own stub path, receives only
+# that user's deals. Needs the notifications-on worker the Discord section restarted.
+if [ -z "$SERVER_PID" ]; then
+  echo "  SKIP  per-user alerts need --serve (the notifications-on worker)"
+else
+  rm -f "$STUB_LOG"; answer '[]'
+  node scripts/e2e-discord-stub.mjs "$STUB_SCRIPT" "$STUB_LOG" "$STUB_PORT" >/tmp/e2e-discord-stub.out 2>&1 &
+  STUB_PID=$!
+  for _ in $(seq 1 20); do $CURL -sf -o /dev/null "http://127.0.0.1:$STUB_PORT/health" --max-time 1 && break; sleep 0.25; done
+  ALICE_HOOK="http://127.0.0.1:$STUB_PORT/api/webhooks/2/alice"
+  BOB_HOOK="http://127.0.0.1:$STUB_PORT/api/webhooks/3/bob"
+  is "alice reads no webhook yet"              200 "$(as alice "$BASE/api/webhook")"
+  is "  ...as not configured"                  '{"configured":false}' "$(body)"
+  is "alice saves her webhook"                 200 "$(aput alice /api/webhook "{\"url\":\"$ALICE_HOOK\"}")"
+  is "  ...answering configured and NO URL"    '{"configured":true}' "$(body)"
+  is "bob saves his"                           200 "$(aput bob /api/webhook "{\"url\":\"$BOB_HOOK\"}")"
+  is "bob cannot see alice's (his own only)"   200 "$(as bob "$BASE/api/webhook")"
+  is "  ...and his GET carries no URL"         '{"configured":true}' "$(body)"
+  is "a non-Discord URL is refused"            400 "$(aput bob /api/webhook '{"url":"https://evil.example/api/webhooks/9/x"}')"
+  is "  ...without repeating it"               0 "$(grep -c 'evil' /tmp/e2e.body)"
+  is "the stored URLs are the two given"       "$ALICE_HOOK|$BOB_HOOK" \
+     "$(val "SELECT group_concat(webhook_url, '|') FROM (SELECT webhook_url FROM users WHERE email IN ('alice@localhost','bob@localhost') ORDER BY user_id)")"
+
+  # One deal only alice watches (a psu model she narrowed to), one only bob watches (cpu), both in
+  # the shared Toronto 25 km area now; the shared 5080 above is also alice's deal and not bob's.
+  sql "INSERT INTO listings (source, listing_id, market_key, component_type, model_key, variant_key, title,
+                             price_cents, location_text, url, validity, content_hash, first_seen_at, last_seen_at)
+       VALUES ('facebook-marketplace', '8900000000000001', '43.6532,-79.3832|25km', 'psu', 'Corsair RM850x', '',
+               'psu for alice', 15000, 'Toronto, ON', 'https://www.facebook.com/marketplace/item/8900000000000001', 'VALID', 'h',
+               CAST(strftime('%s','now') AS INTEGER), CAST(strftime('%s','now') AS INTEGER)),
+              ('facebook-marketplace', '8900000000000002', '43.6532,-79.3832|25km', 'cpu', 'Ryzen 7 9800X3D', '',
+               'cpu for bob', 40000, 'Toronto, ON', 'https://www.facebook.com/marketplace/item/8900000000000002', 'VALID', 'h',
+               CAST(strftime('%s','now') AS INTEGER), CAST(strftime('%s','now') AS INTEGER));
+       INSERT INTO evaluation_tasks (source, listing_id, status, created_at, evaluated_revision, verdict,
+                                     evaluated_at, lease_expires_at, lease_token)
+       VALUES ('facebook-marketplace', '8900000000000001', 'COMPLETE', 1, 0, 'NEEDS_REVIEW', CAST(strftime('%s','now') AS INTEGER), 0, ''),
+              ('facebook-marketplace', '8900000000000002', 'COMPLETE', 1, 0, 'NEEDS_REVIEW', CAST(strftime('%s','now') AS INTEGER), 0, '');
+       INSERT OR IGNORE INTO listing_markets (market_key, source, listing_id, last_seen_at)
+       VALUES ('43.6532,-79.3832|25km', 'facebook-marketplace', '8900000000000001', 0),
+              ('43.6532,-79.3832|25km', 'facebook-marketplace', '8900000000000002', 0),
+              ('43.6532,-79.3832|25km', 'facebook-marketplace', '8800000000000001', 0);" >/dev/null
+  fire_monitor
+  by_path() { python3 -c "
+import json,sys
+lines=[json.loads(l) for l in open('$STUB_LOG') if l.strip()]
+ids=sorted(l['body']['content'].split('/')[-1] for l in lines if l['method']=='POST' and l['path'].startswith(sys.argv[1]))
+print(','.join(ids))" "$1"; }
+  is "alice's path got exactly her two deals"  '8800000000000001,8900000000000001' "$(by_path /api/webhooks/2/alice)"
+  is "bob's path got exactly his one"          '8900000000000002' "$(by_path /api/webhooks/3/bob)"
+  is "  ...and the owner's secret path nothing" '' "$(by_path /api/webhooks/1/e2e)"
+  is "each user's rows are their own"          '2|1' \
+     "$(val "SELECT (SELECT COUNT(*) FROM user_notifications n JOIN users u USING (user_id) WHERE u.email='alice@localhost' AND n.status='SENT') || '|' || (SELECT COUNT(*) FROM user_notifications n JOIN users u USING (user_id) WHERE u.email='bob@localhost' AND n.status='SENT')")"
+  as alice "$BASE/api/status" >/dev/null
+  has "alice's status counts her own sends"    '"sent24h":2' "$(body)"
+  is "  ...and never carries a webhook URL"    0 "$(grep -c 'webhooks' /tmp/e2e.body)"
+  fire_monitor
+  is "a second fire sends nothing more"        3 "$(posts)"
+  is "alice clears her webhook"                200 "$(aput alice /api/webhook '{"url":null}')"
+  is "  ...answering not configured"           '{"configured":false}' "$(body)"
+  kill "$STUB_PID" 2>/dev/null; STUB_PID=
+fi
+
 # Leave the two identities stopped and empty, so a later run of this gate starts as the top expects.
-sql "UPDATE users SET monitoring_enabled = 0 WHERE user_id <> 1; DELETE FROM user_watch_targets WHERE user_id <> 1;" >/dev/null
+sql "UPDATE users SET monitoring_enabled = 0, webhook_url = NULL WHERE user_id <> 1; DELETE FROM user_watch_targets WHERE user_id <> 1; DELETE FROM user_notifications WHERE user_id <> 1;" >/dev/null
 
 ingest_tables
 
