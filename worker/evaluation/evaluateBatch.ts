@@ -154,9 +154,13 @@ const REFERENCE_TOTAL_SQL = `CASE WHEN p.listing_id IS NULL THEN s.total_price_c
  * - `evaluated_revision=?5` keeps this tier disjoint from 4b, which owns every other revision.
  * - `(p.listing_id IS NOT NULL OR l.price_cents = 0)`: the candidate either is its own
  *   observation (so the read subtracts it) or is a FREE listing, which never contributes by
- *   design (recordSightings) and is judged against the full aggregate. A positive-price listing
- *   with no observation -- one whose observation was cleaned away as stale -- is NOT re-checked
- *   here; a requeue or a revision bump reaches it.
+ *   design (recordSightings) and is judged against the full aggregate. Two other kinds of
+ *   listing have no observation and are NOT admitted here. One whose observation was cleaned
+ *   away has gone unseen for the retention window; its next sighting restores the observation,
+ *   which is a contribution change, and recordSightings requeues it -- until then it stays
+ *   parked even if its market fills in. One with no model key has no aggregate at all and never
+ *   will; recordSightings requeues it when its validity or price changes, the only inputs that
+ *   can move its verdict. A revision bump (tier 4b) reaches both.
  * - `typeof(...)='integer'` on both reference expressions: INTEGER affinity keeps a 6.5 as REAL,
  *   and an expression over a REAL is REAL, so this is the SQL side of `Number.isSafeInteger`.
  *   Without it a REAL aggregate is admitted, parked as corrupt, and re-claimed forever.

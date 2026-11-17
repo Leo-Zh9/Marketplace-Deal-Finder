@@ -1073,6 +1073,16 @@ describe("evaluateBatch -- tier 3 claims a parked task only once its evidence ha
            VALUES (?1, 'M-HUGE', '', 9007199254740993, 150000)`,
         )
         .bind(MARKET_A_KEY),
+      // A total past Number.MAX_SAFE_INTEGER, the same way: the upper half of the total's gate.
+      // Past it AFTER the candidate's own 25,000 is subtracted -- the gate tests the reference
+      // total `decide` will see, and 2^53 + 1 minus 25,000 is a safe integer `decide` accepts.
+      ...parked({ listingId: "huge-total", priceCents: 25_000, modelKey: "M-HUGET" }),
+      db
+        .prepare(
+          `INSERT INTO model_stats (market_key, model_key, variant_key, count, total_price_cents)
+           VALUES (?1, 'M-HUGET', '', 6, 9007199254800000)`,
+        )
+        .bind(MARKET_A_KEY),
     ]);
 
     const claim = await claimNow();
@@ -1192,9 +1202,12 @@ describe("evaluateBatch -- tier 3 claims a parked task only once its evidence ha
    * E31. THE PROPERTY: every task tier 3 admits ends COMPLETE -- so nothing it admits loops -- and
    * every task it leaves parked is one `decide` would park again, so nothing eligible is missed.
    * Randomised but SEEDED fixtures: aggregates absent, thin, sufficient, corrupt-total, REAL count
-   * and REAL total; candidates with and without their own observation, free and priced, VALID and
-   * not. The second half skips the deliberate exclusion (a positive-price listing with no
-   * observation) and the unreachable one (a non-VALID listing at NEEDS_REVIEW), named there.
+   * and REAL total; candidates with and without their own observation, free and priced.
+   *
+   * Every parked candidate is VALID, because that is the only state that exists: `decide` writes
+   * status NEEDS_REVIEW only past its validity branch, and recordSightings requeues the task to
+   * PENDING on any later validity change (E32). The second half skips one deliberate exclusion,
+   * a positive-price listing with no observation, named there.
    */
   it("E31: every task tier 3 admits ends COMPLETE, and every task it leaves decide would park", async () => {
     let state = 0x5eed;
@@ -1227,15 +1240,14 @@ describe("evaluateBatch -- tier 3 claims a parked task only once its evidence ha
           }),
         );
       }
-      const tasks: Array<{ id: string; observation: boolean; priceCents: number; validity: string }> = [];
+      const tasks: Array<{ id: string; observation: boolean; priceCents: number }> = [];
       for (let index = 0; index < 30; index += 1) {
         const id = `p-${round}-${String(index).padStart(2, "0")}`;
         const observation = random() < 0.7;
         const priceCents = observation ? pick([5_000, 18_000, 25_000]) : pick([0, 0, 25_000]);
-        const validity = random() < 0.9 ? "VALID" : pick(["NEEDS_REVIEW", "INVALID_REFERENCE"]);
         const modelKey = pick(models);
         statements.push(
-          insertListing({ listingId: id, priceCents, validity, modelKey }),
+          insertListing({ listingId: id, priceCents, validity: "VALID", modelKey }),
           insertTask({
             listingId: id,
             status: "NEEDS_REVIEW",
@@ -1245,7 +1257,7 @@ describe("evaluateBatch -- tier 3 claims a parked task only once its evidence ha
           }),
           ...(observation ? [insertObservation({ listingId: id, priceCents, modelKey })] : []),
         );
-        tasks.push({ id, observation, priceCents, validity });
+        tasks.push({ id, observation, priceCents });
       }
       await db.batch(statements);
 
@@ -1268,15 +1280,12 @@ describe("evaluateBatch -- tier 3 claims a parked task only once its evidence ha
       expect(calls, `round ${round} did not reach an empty claim`).toBeLessThan(10);
       for (const [id, status] of admitted) expect(status, id).toBe("COMPLETE");
 
-      // The other direction: what is still parked, decide would park again. Only VALID rows are
-      // asked: a non-VALID listing never reaches status NEEDS_REVIEW (decide completes it before
-      // the evidence gate), tier 3 does not test validity, and if one is admitted the first half
-      // above already holds it to COMPLETE.
+      // The other direction: what is still parked, decide would park again. Skipped: a
+      // positive-price listing with no observation. Tier 3 leaves it by design (evaluateBatch.ts,
+      // tier 3's comment): its observation was cleaned away because it went unseen, and the next
+      // sighting restores the observation and requeues the task.
       const left = tasks.filter(
-        (task) =>
-          !admitted.has(task.id) &&
-          task.validity === "VALID" &&
-          (task.observation || task.priceCents === 0),
+        (task) => !admitted.has(task.id) && (task.observation || task.priceCents === 0),
       );
       if (left.length > 0) {
         const read = await db
@@ -1309,6 +1318,160 @@ describe("evaluateBatch -- tier 3 claims a parked task only once its evidence ha
     // Anchoring: both halves of the property were exercised.
     expect(admittedTotal).toBeGreaterThan(20);
     expect(parkedTotal).toBeGreaterThan(20);
+  });
+});
+
+/**
+ * A LISTING THAT NEVER CONTRIBUTES -- no model key, or a free item -- has a null contribution
+ * before and after every sighting, so a contribution change can never requeue it, and tier 3 has
+ * no evidence to wait on. Its validity and asking price are the inputs `decide` still reads, and
+ * recordSightings requeues the task when either changes. Every fixture here goes through real
+ * recordSightings and real evaluateBatch.
+ */
+describe("evaluateBatch -- a parked non-contributor is re-judged when its listing changes", () => {
+  const both = (percent: number, maximumCents: number): EvaluationSettings => ({
+    mode: "BOTH",
+    minimumDiscountPercent: percent,
+    maximumPriceCents: maximumCents,
+    searchRevision: 1,
+  });
+
+  const judge = (settings: EvaluationSettings, now: number, label: string) =>
+    evaluateBatch(db, { source: SOURCE, settings, now, leaseToken: `token-${label}-${now}` });
+
+  // E32 (S1). DISCOUNT; a model-less listing parks for evidence, then is re-sighted as a WANTED
+  // post. Before the requeue existed it stayed NEEDS_REVIEW until a revision bump.
+  it("E32: a parked model-less listing re-sighted as INVALID_REFERENCE is judged NOT_DEAL", async () => {
+    await sight([valid({ listingId: "wanted", modelKey: null, title: "RTX 4070 Super" })], T0);
+    expect(outcomeFor((await judge(discount(20), T0, "e32")).outcomes, "wanted")).toMatchObject({
+      status: "NEEDS_REVIEW",
+      reason: "insufficient-evidence",
+    });
+
+    await sight(
+      [
+        {
+          listing: listing({ listingId: "wanted", modelKey: null, title: "WANTED: gpu" }),
+          validity: "INVALID_REFERENCE",
+        },
+      ],
+      T0 + 60,
+    );
+    expect(await taskRow("wanted")).toMatchObject({ status: "PENDING" });
+
+    expect(outcomeFor((await judge(discount(20), T0 + 120, "e32")).outcomes, "wanted")).toMatchObject({
+      verdict: "NOT_DEAL",
+      reason: "invalid-reference",
+      status: "COMPLETE",
+    });
+  });
+
+  // E33 (S2). BOTH; under the maximum the model-less listing parks on the discount leg. Its price
+  // then rises above the maximum, which is final without any evidence.
+  it("E33: a parked model-less listing whose price rises above the maximum is judged NOT_DEAL", async () => {
+    await sight([valid({ listingId: "rising", modelKey: null, priceCents: 25_000 })], T0);
+    expect(outcomeFor((await judge(both(20, 30_000), T0, "e33")).outcomes, "rising")).toMatchObject({
+      status: "NEEDS_REVIEW",
+    });
+
+    await sight([valid({ listingId: "rising", modelKey: null, priceCents: 35_000 })], T0 + 60);
+
+    expect(outcomeFor((await judge(both(20, 30_000), T0 + 120, "e33")).outcomes, "rising")).toMatchObject({
+      verdict: "NOT_DEAL",
+      reason: "above-maximum-price",
+      status: "COMPLETE",
+    });
+  });
+
+  // E34 (S3). A free listing (model keyed, price 0, no observation by design) parks in a market
+  // with no evidence; its price then disappears, which no evidence can repair.
+  it("E34: a parked free listing whose price becomes null is judged no-price", async () => {
+    await sight([valid({ listingId: "gone-free", priceCents: 0 })], T0);
+    expect(outcomeFor((await judge(discount(20), T0, "e34")).outcomes, "gone-free")).toMatchObject({
+      status: "NEEDS_REVIEW",
+    });
+
+    await sight([valid({ listingId: "gone-free", priceCents: null })], T0 + 60);
+
+    expect(outcomeFor((await judge(discount(20), T0 + 120, "e34")).outcomes, "gone-free")).toMatchObject({
+      reason: "no-price",
+      status: "COMPLETE",
+    });
+  });
+
+  // E35 (S4). A miss that predates tier 3's gate: MAXIMUM_PRICE, a model-less listing above the
+  // maximum is NOT_DEAL / COMPLETE, and a price drop below the maximum must make it a DEAL.
+  // Without the requeue the drop changed nothing and the real deal was never seen.
+  it("E35: a model-less listing whose price drops under the maximum becomes a DEAL", async () => {
+    await sight([valid({ listingId: "dropping", modelKey: null, priceCents: 25_000 })], T0);
+    expect(outcomeFor((await judge(maximum(20_000), T0, "e35")).outcomes, "dropping")).toMatchObject({
+      verdict: "NOT_DEAL",
+      status: "COMPLETE",
+    });
+
+    await sight([valid({ listingId: "dropping", modelKey: null, priceCents: 15_000 })], T0 + 60);
+
+    expect(outcomeFor((await judge(maximum(20_000), T0 + 120, "e35")).outcomes, "dropping")).toMatchObject({
+      verdict: "DEAL",
+      reason: "within-maximum",
+    });
+  });
+
+  // E36. THE WRITE BUDGET DOES NOT CREEP BACK. An identical re-sighting and a cosmetic change
+  // (a new title, which changes the content hash but neither validity nor price) leave the parked
+  // task alone: nothing is queued, and the next call claims and writes nothing.
+  it("E36: an unchanged or cosmetic re-sighting does not requeue a parked task", async () => {
+    await sight([valid({ listingId: "still", modelKey: null })], T0);
+    await judge(discount(20), T0, "e36");
+    expect(await taskRow("still")).toMatchObject({ status: "NEEDS_REVIEW", created_at: T0 });
+
+    const same = await sight([valid({ listingId: "still", modelKey: null })], T0 + 60);
+    expect(same.results[0]).toMatchObject({ outcome: "UNCHANGED" });
+    const cosmetic = await sight(
+      [valid({ listingId: "still", modelKey: null, title: "RTX 4070 Super, retitled" })],
+      T0 + 120,
+    );
+    expect(cosmetic.results[0]).toMatchObject({ outcome: "CHANGED" });
+
+    expect(await taskRow("still")).toMatchObject({ status: "NEEDS_REVIEW", created_at: T0 });
+    const after = await judge(discount(20), T0 + 180, "e36");
+    expect(after.claimed).toBe(0);
+    expect(after.usage.rowsWritten).toBe(0);
+  });
+
+  // E37. THE REQUEUE KEEPS QUEUE_TASK'S SEMANTICS FOR A TASK IN FLIGHT: it moves a PROCESSING task
+  // back to PENDING, and the claimant's completion, computed from the old listing, is fenced out
+  // (E15's race, reached through a validity change instead of a contribution change).
+  it("E37: a validity change during a claim requeues the task and fences out the stale verdict", async () => {
+    await sight([valid({ listingId: "inflight", modelKey: null })], T0);
+    await judge(discount(20), T0, "e37");
+    const claim = await claimEvaluationTasks(db, {
+      source: SOURCE,
+      batchSize: 15,
+      now: T0 + 60,
+      leaseSeconds: 300,
+      leaseToken: "token-e37-stale",
+      searchRevision: 2,
+    });
+    expect(claim.tasks).toEqual([{ listingId: "inflight" }]);
+
+    await sight(
+      [{ listing: listing({ listingId: "inflight", modelKey: null }), validity: "INVALID_REFERENCE" }],
+      T0 + 90,
+    );
+    expect(await taskRow("inflight")).toMatchObject({ status: "PENDING" });
+
+    const stale = await completionStatement(db, {
+      source: SOURCE,
+      listingId: "inflight",
+      status: "NEEDS_REVIEW",
+      verdict: "NEEDS_REVIEW",
+      searchRevision: 2,
+      now: T0 + 100,
+      leaseToken: "token-e37-stale",
+    }).run();
+    expect(stale.meta.changes).toBe(0);
+    expect(await taskRow("inflight")).toMatchObject({ status: "PENDING" });
   });
 });
 

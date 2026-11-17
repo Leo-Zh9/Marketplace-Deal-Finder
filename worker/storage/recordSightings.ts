@@ -99,6 +99,8 @@ const classifySql = (idCount: number): string => {
   // one read -- not just "does a row exist" but "what exactly does it hold".
   return `SELECT l.listing_id,
        l.content_hash,
+       l.validity     AS listing_validity,
+       l.price_cents  AS listing_price_cents,
        p.listing_id   AS obs_listing_id,
        p.market_key   AS obs_market_key,
        p.model_key    AS obs_model_key,
@@ -115,6 +117,8 @@ const classifySql = (idCount: number): string => {
 interface StoredRow {
   listing_id: string;
   content_hash: string;
+  listing_validity: string;
+  listing_price_cents: number | null;
   obs_listing_id: string | null;
   obs_market_key: string;
   obs_model_key: string;
@@ -409,10 +413,23 @@ export const recordSightings = async (
             ),
         );
 
-        // A task is queued on NEW, and on any change where the CONTRIBUTION changed
-        // (ARCHITECTURE.md section 8: "each new or relevantly changed listing"). A purely
-        // cosmetic change does not queue one; refining "relevant" further is 3D's.
-        if (outcome === "NEW" || !contributionMatchesStored) {
+        // A task is queued on NEW, on any change where the CONTRIBUTION changed, and on any change
+        // to the two listing fields `decide` reads that a contribution does not carry: validity
+        // and the asking price (ARCHITECTURE.md section 8: "each new or relevantly changed
+        // listing"). A purely cosmetic change does not queue one.
+        //
+        // THE SECOND TERM IS NOT COVERED BY THE FIRST for a listing that never contributes -- no
+        // model key, a free item, or one whose observation was cleaned away -- because its stored
+        // and desired contributions are both null and compare equal however its validity or price
+        // moves. Parked at NEEDS_REVIEW, such a task has no evidence for 3D's tier 3 to wait on,
+        // so this requeue is the only thing that re-judges it short of a revision bump: a "WANTED"
+        // re-sighting would stay parked instead of NOT_DEAL, and under MAXIMUM_PRICE a price drop
+        // below the maximum would never become the DEAL it is. Strict equality is the NULL rule
+        // wanted: null to null is unchanged, null to a value or back is a change.
+        const decisionInputsChanged =
+          row !== undefined &&
+          (row.listing_validity !== validity || row.listing_price_cents !== listing.priceCents);
+        if (outcome === "NEW" || !contributionMatchesStored || decisionInputsChanged) {
           statements.push(db.prepare(QUEUE_TASK).bind(source, listing.listingId, now));
         }
       }

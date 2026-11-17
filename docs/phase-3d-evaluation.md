@@ -159,8 +159,10 @@ and it is why `listing_id` is the fourth column of the index.
   complement of `decide`'s corrupt and insufficient branches, so everything it admits completes.
   Without the gate it re-claimed all 333 parked production tasks every run for 721 rows written,
   with none able to resolve. It covers a candidate that is its own observation, and a free listing
-  (which never contributes); a positive-price listing whose observation was cleaned away is
-  reached by a requeue or a revision bump instead.
+  (which never contributes). Two other listings without an observation are not admitted. One
+  whose observation was cleaned away has gone unseen; its next sighting restores the observation
+  and `recordSightings` requeues it. One with no model key never has evidence; `recordSightings`
+  requeues it when its validity or asking price changes. A revision bump reaches both.
 - **Tier 4b re-judges every `NEEDS_REVIEW` task once per revision bump.** Tier 3 only looks at
   the current revision, so without 4b a settings change would never reach a parked task.
 - **The tier loop breaks only when the batch is full**, never because a tier returned zero rows. In
