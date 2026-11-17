@@ -11,6 +11,7 @@
 
 import { evaluateBatch } from "../evaluation/evaluateBatch";
 import { createTestDatabase, truncateAll, type TestDatabase } from "../testing/d1";
+import { addMember, setArea, setRule, TEST_ALLOWLIST } from "../testing/users";
 import type { NotifyEnvironment } from "./config";
 import { NOTIFY_FRESH_SECONDS } from "./enqueue";
 import { runNotify, WRITE_RESULT, type NotifyCounts } from "./runNotify";
@@ -23,10 +24,11 @@ const MARKET = "43.6532,-79.3832|25km";
 const REVISION = 11;
 const MODEL = "GeForce RTX 4070 Super";
 const WEBHOOK = "https://discord.com/api/webhooks/123456789/tok-en_X";
-const ON: NotifyEnvironment = {
+const ON: NotifyEnvironment & { APPROVED_EMAILS: string } = {
   DISCORD_WEBHOOK_URL: WEBHOOK,
   NOTIFICATIONS: "on",
   APP_ENV: "production",
+  APPROVED_EMAILS: TEST_ALLOWLIST,
 };
 
 let database!: TestDatabase;
@@ -79,24 +81,30 @@ const settings = async (
     )
     .bind(revision)
     .run();
+  // THE OWNER'S OWN RULE (migrations/0009), which is what enqueue and the re-check apply. The
+  // evidence rule above is what the drain judges under when a test runs evaluateBatch.
+  const mode = input.mode ?? "DISCOUNT";
+  const percent = input.percent === undefined ? 20 : input.percent;
+  await setRule(db, {
+    mode,
+    bp: mode === "MAXIMUM_PRICE" || percent === null ? null : Math.round(percent * 100),
+    max: mode === "DISCOUNT" ? null : (input.maxCents ?? null),
+  });
 };
 
 /** Watch targets in STORAGE vocabulary, exactly as `PUT /api/watch` writes them. */
 const watch = async (targets: Array<[componentType: string, query: string]>) => {
-  await db.prepare("DELETE FROM watch_targets").run();
+  await db.prepare("DELETE FROM user_watch_targets WHERE user_id = 1").run();
   for (const [index, [componentType, query]] of targets.entries()) {
     await db
-      .prepare("INSERT INTO watch_targets (target_id, component_type, query) VALUES (?1, ?2, ?3)")
+      .prepare(
+        "INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, ?1, ?2, ?3)",
+      )
       .bind(`t-${index}`, componentType, query)
       .run();
   }
-  await db
-    .prepare(
-      `INSERT INTO watch_market (id, location, latitude, longitude, radius_km)
-       VALUES (1, 'toronto', 43.6532, -79.3832, 25)
-       ON CONFLICT(id) DO UPDATE SET radius_km = 25`,
-    )
-    .run();
+  // The owner's AREA, whose key is MARKET.
+  await setArea(db, { location: "toronto", latitude: 43.6532, longitude: -79.3832, radiusKm: 25 });
 };
 
 interface DealInput {
@@ -156,6 +164,8 @@ const deal = async (id: string, input: DealInput = {}) => {
       input.evaluatedAt ?? T - 1_000,
     )
     .run();
+  // Seen in the area its `market` names (migrations/0009 membership).
+  await addMember(db, input.market ?? MARKET, id, SOURCE);
 };
 
 /** The market aggregate for a model: `count` references averaging `averageCents`. */
@@ -195,7 +205,7 @@ const rows = async (): Promise<Row[]> =>
       .prepare(
         `SELECT listing_id, status, attempts, next_attempt_at, lease_token, lease_expires_at,
                 last_attempt_at, sent_price_cents, sent_at, last_error
-           FROM notifications ORDER BY listing_id`,
+           FROM user_notifications WHERE user_id = 1 ORDER BY listing_id`,
       )
       .all<Row>()
   ).results;
@@ -218,10 +228,10 @@ const notification = async (
 ) => {
   await db
     .prepare(
-      `INSERT INTO notifications (source, listing_id, model_key, status, created_at, updated_at,
-                                  attempts, next_attempt_at, lease_token, lease_expires_at,
-                                  last_attempt_at, last_error)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11)`,
+      `INSERT INTO user_notifications (user_id, source, listing_id, model_key, status, created_at,
+                                  updated_at, attempts, next_attempt_at, lease_token,
+                                  lease_expires_at, last_attempt_at, last_error)
+       VALUES (1, ?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11)`,
     )
     .bind(
       SOURCE,
@@ -559,7 +569,15 @@ describe("enqueue", () => {
    * N7b. The rest of the predicate at enqueue time: not VALID, not COMPLETE, not DEAL, an older
    * revision, stale. Kills: dropping any one of those five terms.
    */
-  it("N7b: only a VALID, COMPLETE, DEAL, current-revision, fresh listing is enqueued", async () => {
+  /**
+   * N7b. THE OWNER'S RULE AGAINST THE LIVE AGGREGATE DECIDES, NOT THE STORED VERDICT (migrations/
+   * 0009). The world is DISCOUNT 20% against 7 references averaging 60,000, so the threshold is
+   * 48,000. A judged (COMPLETE or NEEDS_REVIEW) task qualifies whatever its stored verdict or
+   * revision; a re-queued (PENDING) one, a non-VALID one, a stale one and one above the threshold
+   * do not. Kills: dropping the t.status gate (712), the validity term (711), the freshness term
+   * (715) or RULE_PREDICATE (718).
+   */
+  it("N7b: only a VALID, judged, fresh listing that is a deal under the owner's rule is enqueued", async () => {
     await world();
     await deal("711", { validity: "NEEDS_REVIEW" });
     await deal("712", { status: "PENDING" });
@@ -567,10 +585,15 @@ describe("enqueue", () => {
     await deal("714", { revision: REVISION - 1 });
     await deal("715", { lastSeenAt: T - NOTIFY_FRESH_SECONDS - 1 });
     await deal("716", { lastSeenAt: T - NOTIFY_FRESH_SECONDS });
+    await deal("717", { status: "NEEDS_REVIEW", verdict: "NEEDS_REVIEW" });
+    await deal("718", { price: 48_001 });
+    await deal("719", { price: 48_000 });
 
     await notify(discord(), T, { maxSends: 0 });
 
-    expect((await rows()).map((row) => row.listing_id)).toEqual(["716"]);
+    expect((await rows()).map((row) => row.listing_id)).toEqual([
+      "713", "714", "716", "717", "719",
+    ]);
   });
 
   /**
@@ -632,9 +655,7 @@ describe("the saved market", () => {
     // listing becomes eligible by the move.
     await deal("m-moved");
     expect((await notify(fake, T, { maxSends: 0 })).enqueued).toBe(1);
-    await db
-      .prepare("UPDATE watch_market SET latitude = 45.4215, longitude = -75.6972, radius_km = 20 WHERE id = 1")
-      .run();
+    await setArea(db, { location: "ottawa", latitude: 45.4215, longitude: -75.6972, radiusKm: 20 });
     const second = await notify(fake);
     expect(second).toMatchObject({ enqueued: 0, cancelled: 1, sent: 0 });
     expect(fake.calls).toHaveLength(1);
@@ -699,15 +720,15 @@ describe("re-check", () => {
   });
 
   /**
-   * N8b. THE OTHER CANCELS: the revision moved, the listing went stale, the user stopped watching
-   * it. Kills: dropping `t.evaluated_revision = ss.current_revision`, `l.last_seen_at >= ?4`, or
-   * the selection term from CANDIDATE_PREDICATE (each case then posts).
+   * N8b. THE OTHER CANCELS: the owner tightened their rule, the listing went stale, the user
+   * stopped watching it. Kills: binding the evidence rule instead of the user's in RECHECK,
+   * `l.last_seen_at >= ?4`, or the selection term from CANDIDATE_PREDICATE (each case then posts).
    */
   it.each<[string, () => Promise<void>, number]>([
     [
-      "the revision changed",
+      "the owner's rule tightened",
       async () => {
-        await settings({ revision: REVISION + 1 });
+        await setRule(db, { mode: "DISCOUNT", bp: 5000 });
       },
       T,
     ],
@@ -749,7 +770,7 @@ describe("re-check", () => {
     await notification("903", "CANCELLED", { createdAt: T - 7_000 });
     await notification("904", "PENDING", { createdAt: T - 6_000 });
     // 903 qualifies, so enqueue re-arms it; make it not qualify so it stays out of the way.
-    await db.prepare("UPDATE evaluation_tasks SET verdict = 'NOT_DEAL' WHERE listing_id = '903'").run();
+    await db.prepare("UPDATE listings SET price_cents = 59000 WHERE listing_id = '903'").run();
     const fake = discord();
 
     const counts = await notify(fake);
@@ -774,7 +795,7 @@ describe("re-check", () => {
     await deal("911");
     await deal("912", { evaluatedAt: T - 2_000 });
     await notify(discord(), T, { maxSends: 0 });
-    await db.prepare("UPDATE evaluation_tasks SET verdict = 'NOT_DEAL' WHERE listing_id = '911'").run();
+    await db.prepare("UPDATE listings SET price_cents = 59000 WHERE listing_id = '911'").run();
     const fake = discord();
 
     const counts = await notify(fake);
@@ -886,7 +907,7 @@ describe("/api/status notifications", () => {
       lastError: "rate-limited",
     });
 
-    const status = await readNotificationsStatus(db, ON, T);
+    const status = await readNotificationsStatus(db, ON, T, 1);
 
     expect(status).toEqual({
       state: "webhook-rejected",
@@ -902,13 +923,13 @@ describe("/api/status notifications", () => {
     await world();
     await deal("1311");
     await notify(discord([404]));
-    expect(await readNotificationsStatus(db, ON, T)).toMatchObject({ state: "webhook-rejected" });
+    expect(await readNotificationsStatus(db, ON, T, 1)).toMatchObject({ state: "webhook-rejected" });
 
-    await db.prepare("UPDATE evaluation_tasks SET verdict = 'NOT_DEAL' WHERE listing_id = '1311'").run();
+    await db.prepare("UPDATE listings SET price_cents = 59000 WHERE listing_id = '1311'").run();
     await notify(discord(), T + 1_800);
     expect(await statusOf("1311")).toBe("CANCELLED");
 
-    expect(await readNotificationsStatus(db, ON, T + 1_800)).toMatchObject({
+    expect(await readNotificationsStatus(db, ON, T + 1_800, 1)).toMatchObject({
       state: "webhook-rejected",
       pending: 0,
     });
@@ -923,9 +944,9 @@ describe("/api/status notifications", () => {
     await deal("1321");
     await deal("1322", { evaluatedAt: T - 2_000 });
     await notify(discord([404]));
-    expect(await readNotificationsStatus(db, ON, T)).toMatchObject({ state: "webhook-rejected" });
+    expect(await readNotificationsStatus(db, ON, T, 1)).toMatchObject({ state: "webhook-rejected" });
 
-    await db.prepare("UPDATE evaluation_tasks SET verdict = 'NOT_DEAL' WHERE listing_id = '1321'").run();
+    await db.prepare("UPDATE listings SET price_cents = 59000 WHERE listing_id = '1321'").run();
     const counts = await notify(discord([200]), T + 1_800);
     expect(counts).toMatchObject({ cancelled: 1, sent: 1 });
     expect(await rows()).toMatchObject([
@@ -933,7 +954,7 @@ describe("/api/status notifications", () => {
       { listing_id: "1322", status: "SENT" },
     ]);
 
-    expect(await readNotificationsStatus(db, ON, T + 1_800)).toEqual({
+    expect(await readNotificationsStatus(db, ON, T + 1_800, 1)).toEqual({
       state: "on",
       pending: 0,
       sent24h: 1,
@@ -952,7 +973,7 @@ describe("/api/status notifications", () => {
     await deal("1331");
     await deal("1332", { evaluatedAt: T - 2_000 });
     await notify(discord([200, 404]));
-    expect(await readNotificationsStatus(db, ON, T)).toMatchObject({ state: "webhook-rejected", sent24h: 1 });
+    expect(await readNotificationsStatus(db, ON, T, 1)).toMatchObject({ state: "webhook-rejected", sent24h: 1 });
   });
 
   /** N13e. The counts. Kills: counting SENDING out of `pending`, or a sent24h window not bounded. */
@@ -964,13 +985,13 @@ describe("/api/status notifications", () => {
     await notification("1344", "FAILED");
     await db
       .prepare(
-        `INSERT INTO notifications (source, listing_id, model_key, status, created_at, updated_at, sent_at)
-         VALUES (?1, '1345', ?2, 'SENT', 1, 1, ?3), (?1, '1346', ?2, 'SENT', 1, 1, ?4)`,
+        `INSERT INTO user_notifications (user_id, source, listing_id, model_key, status, created_at, updated_at, sent_at)
+         VALUES (1, ?1, '1345', ?2, 'SENT', 1, 1, ?3), (1, ?1, '1346', ?2, 'SENT', 1, 1, ?4)`,
       )
       .bind(SOURCE, MODEL, T - 86_400, T - 86_401)
       .run();
 
-    expect(await readNotificationsStatus(db, ON, T)).toEqual({
+    expect(await readNotificationsStatus(db, ON, T, 1)).toEqual({
       state: "on",
       pending: 2,
       sent24h: 1,
@@ -1058,7 +1079,7 @@ describe("inert states", () => {
     const fake = discord();
 
     const counts = await notify(fake, T, { environment, database: stub });
-    const status = await readNotificationsStatus(stub, environment, T);
+    const status = await readNotificationsStatus(stub, environment, T, 1);
 
     expect(counts).toEqual({
       state,
@@ -1141,7 +1162,7 @@ describe("round 2", () => {
             run: async () => {
               // Another run, far enough ahead that A's lease has expired, sweeps first.
               await db
-                .prepare("UPDATE notifications SET status = 'DELIVERY_UNKNOWN', lease_token = NULL WHERE status = 'SENDING'")
+                .prepare("UPDATE user_notifications SET status = 'DELIVERY_UNKNOWN', lease_token = NULL WHERE status = 'SENDING'")
                 .run();
               return real.bind(...args).run();
             },
@@ -1188,5 +1209,112 @@ describe("round 2", () => {
 
     expect(counts).toMatchObject({ sent: 1, cancelled: 0 });
     expect(await statusOf("1711")).toBe("SENT");
+  });
+});
+
+/**
+ * MULTI-USER (migrations/0009). PR2 sends for the owner only, through DISCORD_WEBHOOK_URL; every
+ * statement is scoped to the owner's rule, area, searches and rows.
+ */
+describe("per user", () => {
+  const second = async () => {
+    await db
+      .prepare(
+        `INSERT INTO users (user_id, email, location, latitude, longitude, radius_km, mode,
+                            maximum_price_cents, monitoring_enabled, monitoring_changed_at, created_at)
+         VALUES (2, 'second@example.com', 'waterloo', 43.4643, -80.5204, 25, 'MAXIMUM_PRICE',
+                 1000000, 1, 0, 0)`,
+      )
+      .run();
+    await db
+      .prepare(
+        "INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (2, 'g', 'gpu', 'graphics card')",
+      )
+      .run();
+  };
+
+  /**
+   * N-reopen. THE WINDOW IS "JUDGED IN THE LAST DAY" OR "THE OWNER RE-OPENED ALERTS IN THE LAST
+   * DAY". A deal judged two days ago is not enqueued until the owner saves; then it is -- and a SENT
+   * row for the same owner is still never re-enqueued. Kills: dropping the `u.alerts_reopened_at`
+   * half (the second run enqueues nothing), and dropping NOT EXISTS's status filter (1102 returns).
+   */
+  it("N-reopen: a save re-opens old deals once; a SENT row never comes back", async () => {
+    await world();
+    await deal("1101", { evaluatedAt: T - 2 * 86_400 });
+    await deal("1102", { evaluatedAt: T - 2 * 86_400 });
+    await notification("1102", "SENT");
+
+    expect((await notify(discord(), T, { maxSends: 0 })).enqueued).toBe(0);
+
+    await db.prepare("UPDATE users SET alerts_reopened_at = ?1 WHERE user_id = 1").bind(T - 60).run();
+    expect((await notify(discord(), T, { maxSends: 0 })).enqueued).toBe(1);
+    expect((await rows()).map((row) => `${row.listing_id}:${row.status}`)).toEqual([
+      "1101:PENDING",
+      "1102:SENT",
+    ]);
+  });
+
+  /**
+   * N-owner-only. ANOTHER USER'S AREA, SEARCHES AND RULE PRODUCE NO ROW, AND THEIR ROWS ARE NEVER
+   * CLAIMED. The second user's deal (Waterloo, MAXIMUM_PRICE) is not in the owner's area; their
+   * own PENDING row is not sent by this step. Kills: dropping `user_id = ?4` from CLAIM_ONE, or the
+   * `u.user_id = ?8` term from ENQUEUE.
+   */
+  it("N-owner-only: the step enqueues and sends for user 1 only", async () => {
+    await world();
+    await second();
+    await deal("1201", { market: "43.4643,-80.5204|25km", price: 900_000 });
+    await db
+      .prepare(
+        `INSERT INTO user_notifications (user_id, source, listing_id, model_key, status, created_at, updated_at)
+         VALUES (2, ?1, '1201', ?2, 'PENDING', 1, 1)`,
+      )
+      .bind(SOURCE, MODEL)
+      .run();
+    await deal("1202");
+    const fake = discord();
+
+    const counts = await notify(fake);
+
+    expect(counts).toMatchObject({ enqueued: 1, sent: 1 });
+    expect(fake.calls.map((call) => call.body.content.split("\n").at(-1))).toEqual([
+      "https://www.facebook.com/marketplace/item/1202",
+    ]);
+    const all = await db
+      .prepare("SELECT user_id, listing_id, status FROM user_notifications ORDER BY user_id, listing_id")
+      .all();
+    expect(all.results).toEqual([
+      { user_id: 1, listing_id: "1202", status: "SENT" },
+      { user_id: 2, listing_id: "1201", status: "PENDING" },
+    ]);
+  });
+
+  /**
+   * N-inactive. AN OWNER WHO IS STOPPED, OR NOT ON THE ALLOWLIST, GETS NOTHING -- and the step then
+   * makes no query beyond the one user read: no sweep, no enqueue, no claim.
+   */
+  it.each<[string, () => Promise<void>, NotifyEnvironment & { APPROVED_EMAILS?: string }]>([
+    ["stopped", async () => void (await db.prepare("UPDATE users SET monitoring_enabled = 0").run()), ON],
+    ["off the allowlist", async () => {}, { ...ON, APPROVED_EMAILS: JSON.stringify(["x@example.com"]) }],
+  ])("N-inactive: an owner who is %s is sent nothing and costs one read", async (_label, change, environment) => {
+    await world();
+    await deal("1301");
+    await change();
+    const prepared: string[] = [];
+    const spy = {
+      prepare: (sql: string) => {
+        prepared.push(sql);
+        return db.prepare(sql);
+      },
+    } as unknown as D1Database;
+    const fake = discord();
+
+    const counts = await notify(fake, T, { environment, database: spy });
+
+    expect(counts).toMatchObject({ state: "on", enqueued: 0, sent: 0, swept: 0 });
+    expect(fake.calls).toHaveLength(0);
+    expect(prepared).toHaveLength(1);
+    expect(prepared[0]).toMatch(/FROM users WHERE user_id = \?1/);
   });
 });

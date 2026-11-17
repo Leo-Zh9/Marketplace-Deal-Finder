@@ -10,10 +10,15 @@
  * due row. Oldest `created_at` first; rowid breaks ties so the order is total.
  */
 
-export const CLAIM_ONE = `UPDATE notifications
+/**
+ * ONE USER'S queue (`user_id = ?4`, migrations/0009): a row is only ever claimed by the step that
+ * re-checks it against ITS user's rule and area and sends it to ITS user. It rides
+ * user_notifications_due (user_id, status, next_attempt_at).
+ */
+export const CLAIM_ONE = `UPDATE user_notifications
    SET status = 'SENDING', lease_token = ?1, lease_expires_at = ?2, updated_at = ?3
- WHERE rowid = (SELECT rowid FROM notifications
-                 WHERE status = 'PENDING'
+ WHERE rowid = (SELECT rowid FROM user_notifications
+                 WHERE user_id = ?4 AND status = 'PENDING'
                    AND (next_attempt_at IS NULL OR next_attempt_at <= ?3)
                  ORDER BY created_at, rowid
                  LIMIT 1)
@@ -28,11 +33,11 @@ export interface ClaimedNotification {
 
 export const claimOne = async (
   db: D1Database,
-  input: { now: number; leaseSeconds: number; leaseToken: string },
+  input: { now: number; leaseSeconds: number; leaseToken: string; userId: number },
 ): Promise<ClaimedNotification | null> => {
   const read = await db
     .prepare(CLAIM_ONE)
-    .bind(input.leaseToken, input.now + input.leaseSeconds, input.now)
+    .bind(input.leaseToken, input.now + input.leaseSeconds, input.now, input.userId)
     .all<{ row_id: number; source: string; listing_id: string; attempts: number }>();
   const row = read.results[0];
   if (row === undefined) return null;

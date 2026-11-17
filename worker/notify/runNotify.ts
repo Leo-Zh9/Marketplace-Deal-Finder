@@ -16,7 +16,12 @@
  *      DELIVERY_UNKNOWN -- never back to PENDING. A human decides whether to resend.
  * Rows that were still PENDING behind the failure are untouched by it and the retry sends them.
  *
- * BUDGET, per step, worst case: sweep 1 + selection read 1 + market read 1 + enqueue 1 + 5 x
+ * ONE USER PER STEP IN PR2 (migrations/0009): the owner, `OWNER_USER_ID`, through the owner's
+ * fallback webhook DISCORD_WEBHOOK_URL -- exactly today's behaviour. A user who is not ACTIVE
+ * (worker/users/users.ts: allowlisted and Started) gets nothing, and the step then makes no other
+ * D1 query: that is the single-user STOPPED skip, per user. PR3 adds the round-robin over users.
+ *
+ * BUDGET, per step, worst case: user read 1 + sweep 1 + selection read 1 + enqueue 1 + 5 x
  * (claim, recheck, result-or-cancel) = 19 D1 queries, against 50 per invocation on Workers Free;
  * at most 5 subrequests to Discord. No unbounded loop: every iteration spends a claim.
  *
@@ -30,9 +35,10 @@ import { deliver, NOTIFY_FETCH_TIMEOUT_MS, type NotifyFetch } from "./deliver";
 import { enqueueCandidates } from "./enqueue";
 import { formatMessage } from "./format";
 import { cancelClaimed, recheck } from "./recheck";
-import { readSavedMarketKey } from "../api/verdicts";
 import { readSelection } from "./selection";
+import { areaMarketKey, isActive, loadUser, OWNER_USER_ID, readAllowlist } from "../users/users";
 import { NOTIFY_LEASE_SECONDS, sweepExpiredLeases } from "./sweep";
+import type { D1Usage } from "../storage/types";
 
 export const MAX_SENDS_PER_STEP = 5;
 
@@ -41,7 +47,7 @@ export const MAX_SENDS_PER_STEP = 5;
  * swept or re-claimed by anyone else is not overwritten. `sent_at` / `sent_price_cents` are only
  * ever SET (COALESCE keeps them otherwise), and `last_attempt_at` is written on every outcome.
  */
-export const WRITE_RESULT = `UPDATE notifications
+export const WRITE_RESULT = `UPDATE user_notifications
    SET status = ?1, attempts = attempts + ?2, next_attempt_at = ?3, last_attempt_at = ?4,
        last_error = ?5, sent_at = COALESCE(?6, sent_at),
        sent_price_cents = COALESCE(?7, sent_price_cents),
@@ -69,7 +75,15 @@ export interface NotifyCounts {
 }
 
 export interface NotifyInput {
-  environment: NotifyEnvironment;
+  /** APPROVED_EMAILS decides who is ACTIVE; see worker/users/users.ts. */
+  environment: NotifyEnvironment & { APPROVED_EMAILS?: string };
+  /** Whose alerts this step sends. PR2: always the owner. */
+  userId?: number;
+  /**
+   * Where the user read's cost is spent, so a monitoring run's row-count telemetry stays exact for
+   * the read that decides whether the step does anything at all (runMonitor R-s5).
+   */
+  usage?: D1Usage;
   now: number;
   fetch: NotifyFetch;
   /** Prefixed onto each claim's fresh UUID so a stranded SENDING row names its run. */
@@ -115,26 +129,38 @@ export const runNotify = async (db: D1Database, input: NotifyInput): Promise<Not
   }
 
   const { now } = input;
+  const userId = input.userId ?? OWNER_USER_ID;
   const maxSends = input.maxSends ?? MAX_SENDS_PER_STEP;
   const leaseSeconds = input.leaseSeconds ?? NOTIFY_LEASE_SECONDS;
   const counts = zeroCounts("on");
 
+  // AFTER the inert return above, so an inert step still makes no D1 query. Read INSIDE the step,
+  // so a Stop pressed while this run was draining sends nothing: alerting after the user pressed
+  // Stop is the one thing Stop promises not to do. A throwing allowlist fails the step (DEGRADED).
+  const allowlist = readAllowlist(input.environment);
+  const user = await loadUser(db, userId, input.usage);
+  if (user === null || !isActive(user, allowlist)) {
+    console.log(countsLine(counts));
+    return counts;
+  }
+
   counts.swept = await sweepExpiredLeases(db, now);
-  const selection = await readSelection(db);
-  // AFTER the inert return above, so an inert step still makes no D1 query. The same key the
-  // dashboard's read filters on: an alert is never sent for a listing that page would not show.
-  const marketKey = await readSavedMarketKey(db);
-  counts.enqueued = await enqueueCandidates(db, now, selection, marketKey);
+  const selection = await readSelection(db, userId);
+  // The same key the dashboard's read filters on: an alert is never sent for a listing that the
+  // user's own page would not show.
+  const marketKey = areaMarketKey(user.area);
+  counts.enqueued = await enqueueCandidates(db, now, selection, marketKey, userId);
 
   for (let index = 0; index < maxSends; index += 1) {
     const leaseToken = `${input.leaseTokenPrefix}:${crypto.randomUUID()}`;
-    const claimed = await claimOne(db, { now, leaseSeconds, leaseToken });
+    const claimed = await claimOne(db, { now, leaseSeconds, leaseToken, userId });
     if (claimed === null) break;
 
     const listing = await recheck(db, {
       now,
       selection,
       marketKey,
+      userId,
       source: claimed.source,
       listingId: claimed.listingId,
     });
