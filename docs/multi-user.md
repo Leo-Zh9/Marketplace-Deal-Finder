@@ -1,9 +1,9 @@
-# Multi-user (migrations/0009)
+# Multi-user (migrations/0009, 0010)
 
 Up to `MAX_USERS = 3` approved people share one deployment. Each has their **own** area (any catalog
-location and radius), searches, deal rule and Start/Stop. Areas may overlap. Per-user Discord
-webhooks and the round-robin notify loop are PR3; until then alerts go to the owner only, through
-`DISCORD_WEBHOOK_URL`, exactly as before.
+location and radius), searches, deal rule, Start/Stop and Discord webhook. Areas may overlap. The
+owner (user 1) with no webhook of their own keeps the `DISCORD_WEBHOOK_URL` secret, exactly as
+before.
 
 ## Users
 
@@ -112,8 +112,61 @@ the NOT EXISTS excludes every non-CANCELLED row, so a SENT row never comes back.
 ## Notifications
 
 `user_notifications` is 0007's table per user (`PRIMARY KEY (user_id, source, listing_id)`, same
-state machine). In PR2 the notify step runs for user 1 only, sends to `DISCORD_WEBHOOK_URL`, and
-does nothing (one user read) when user 1 is not active. `/api/status` counts the caller's own rows.
+state machine).
+
+- **The master switch is `NOTIFICATIONS=on`.** Anything else makes the notify step and the status
+  field inert, with no D1 query. `DISCORD_WEBHOOK_URL` is no longer the switch: it is user 1's
+  fallback destination only.
+- **Each user's destination** is their own `users.webhook_url` (migrations/0010, set on the
+  dashboard), else -- for user 1 only -- the `DISCORD_WEBHOOK_URL` secret. It is re-validated with
+  `isValidWebhookUrl` at use and sent by the rebuilt URL.
+- **The webhook is write-only.** `PUT /api/webhook {url | null}` validates and stores it;
+  `GET /api/webhook` answers `{configured}` and nothing else; no response, error body or log line
+  carries it. It is stored plaintext on the user's row (0010's header says why). Setting a NEW URL
+  re-opens that user's alerts, like a new search.
+- **Round-robin.** Each step reads the active users once, sweeps once, then per user with a
+  destination reads their searches and enqueues their candidates. Sends go **one claim per user per
+  pass** until 5 claims in total, starting at a different user each 30-minute run, so a big backlog
+  for one user does not starve another. A response that stops a step (429, 401/403/404, 5xx,
+  timeout) removes **only that user** from this step's rotation.
+- **A user with no destination is skipped entirely**: nothing is enqueued for them and their existing
+  PENDING rows stay PENDING. Building rows that cannot be sent would only grow a backlog to flood the
+  channel they configure later; the stamp on setting a webhook lets their current deals alert then.
+- **Budget**, worst case at 3 users: users read 1 + sweep 1 + 3 x (searches, enqueue) + at most one
+  empty claim per user + 5 x (claim, recheck, result) = 26 of the 50 D1 queries an invocation may
+  make. Measured (`notifyCpu.test.ts` N17, all three users with a backlog): 23 queries, 269 rows
+  read, 65 written.
+- **`/api/status`** reports the caller's own state: `unconfigured` (no destination), `invalid-url`
+  (a stored or secret URL that does not validate), `off` (the master switch), else `on` or
+  `webhook-rejected` from the caller's own rows.
+
+**Deploying 0010:** apply it (`npm run db:migrate`) BEFORE deploying the Worker that reads it --
+every `users` read names `webhook_url`, so the new Worker against a database without the column
+answers 503 on every browser route. The column is NULL for everyone, so the owner keeps the secret
+and nothing else changes until someone saves a webhook.
+
+## Adding a friend
+
+The shared budget is 9 distinct searches across everyone. **The owner must free searches first**:
+if the owner already uses all 9, the friend's first save is refused `409 WATCH_BUDGET_FULL`.
+
+1. Free searches on the owner's dashboard (remove searches until "N of 9 shared searches used"
+   leaves room for what the friend wants; a search both of you run in the same area counts once).
+2. Add the friend's email to the allowlist. It is the whole JSON array, every time:
+   ```sh
+   npx wrangler secret put APPROVED_EMAILS
+   # paste, then Enter:
+   ["owner@example.com","friend@example.com"]
+   ```
+   Lowercase, exactly as their Google account spells it. The Worker re-reads it on every request; no
+   deploy is needed.
+3. The friend signs in. Their account is created on that first request, **stopped**, with no area,
+   no searches, no rule and no webhook (`MAX_USERS = 3`; a fourth person gets 403).
+4. The friend sets their location and radius, picks their searches and saves; sets their deal rule;
+   pastes their own Discord webhook (Server Settings -> Integrations -> Webhooks -> New Webhook ->
+   Copy Webhook URL) and saves it; then presses **Start**.
+5. Their searches join the collector's list on its next run, and their alerts go to their own
+   channel.
 
 ## Operator pre-flight (read-only, before deploying)
 
