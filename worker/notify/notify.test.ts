@@ -1409,4 +1409,40 @@ describe("per user", () => {
     expect((await notify(discord(), T, { maxSends: 0 })).enqueued).toBe(1);
     expect(await statusOf("1501")).toBe("PENDING");
   });
+
+  /**
+   * N-drift. THE RULE IS APPLIED TO THE LIVE AVERAGE (migrations/0009), so the average moving -- in
+   * this user's area or any other user's, since the pool is shared -- can turn a listing judged
+   * NOT_DEAL into a deal, and back. Whatever it does, a listing alerts AT MOST ONCE per user:
+   * 1602 starts above the threshold and alerts once when the average rises; 1601 alerts once and
+   * never again however often the average crosses back. Kills: the NOT EXISTS's status filter
+   * widened to re-arm SENT rows.
+   */
+  it("N-drift: an average that moves back and forth alerts each listing at most once", async () => {
+    await world();
+    await deal("1601", { price: 45_000 });
+    await deal("1602", { price: 52_000 });
+    const fake = discord();
+    const average = (cents: number) =>
+      db.prepare("UPDATE model_stats SET total_price_cents = count * ?1").bind(cents).run();
+
+    expect(await notify(fake)).toMatchObject({ enqueued: 1, sent: 1 });
+    for (const cents of [50_000, 70_000, 50_000, 70_000, 60_000]) {
+      await average(cents);
+      await notify(fake);
+    }
+
+    const sentTo = fake.calls.map((call) => call.body.content.split("\n").at(-1));
+    expect(sentTo).toEqual([
+      "https://www.facebook.com/marketplace/item/1601",
+      "https://www.facebook.com/marketplace/item/1602",
+    ]);
+    const rows = await db
+      .prepare("SELECT listing_id, COUNT(*) AS n FROM user_notifications GROUP BY listing_id ORDER BY listing_id")
+      .all();
+    expect(rows.results).toEqual([
+      { listing_id: "1601", n: 1 },
+      { listing_id: "1602", n: 1 },
+    ]);
+  });
 });

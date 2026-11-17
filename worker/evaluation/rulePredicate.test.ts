@@ -29,6 +29,7 @@
  */
 
 import { decide, type ValidatedSettings } from "./dealRules";
+import { REFERENCE_COUNT_SQL, REFERENCE_TOTAL_SQL } from "./evaluateBatch";
 import {
   NOT_DEAL_PREDICATE,
   RULE_MAX_PRICE_CENTS,
@@ -147,26 +148,35 @@ describe("RULE_PREDICATE parity with decide", () => {
       await db.prepare(`INSERT INTO parity VALUES ${values}`).run();
     }
 
-    // The aliases the predicate names, as self-joins on the one fixture row; `p` is an absent
-    // observation, so C and T are the aggregate's own columns.
-    const read = await db
-      .prepare(
-        `SELECT l.id, l.validity, l.price_cents, u.mode, u.minimum_discount_bp, u.maximum_price_cents,
-                s.count, s.total_price_cents,
-                (${RULE_PREDICATE}) AS deal, (${NOT_DEAL_PREDICATE}) AS not_deal
-           FROM parity l
-           JOIN parity u ON u.id = l.id
-           JOIN parity s ON s.id = l.id
-           LEFT JOIN (SELECT NULL AS listing_id, NULL AS price_cents) p ON 1 = 1
-          ORDER BY l.id`,
-      )
-      .all<Row>();
-    expect(read.results).toHaveLength(cases.length);
+    // The aliases the predicate names, as self-joins on the one fixture row. TWO PASSES over `p`:
+    // an absent observation (C and T are the aggregate's own columns) and the candidate's OWN
+    // observation at 1,000 cents (C = count - 1, T = total - 1000 -- the exclusion arithmetic of
+    // REFERENCE_COUNT_SQL / REFERENCE_TOTAL_SQL). `decide` is fed what each pass's expressions read.
+    const passes: Row[] = [];
+    for (const observation of [
+      "SELECT NULL AS listing_id, NULL AS price_cents",
+      "SELECT 'self' AS listing_id, 1000 AS price_cents",
+    ]) {
+      const read = await db
+        .prepare(
+          `SELECT l.id, l.validity, l.price_cents, u.mode, u.minimum_discount_bp, u.maximum_price_cents,
+                  (${REFERENCE_COUNT_SQL}) AS count, (${REFERENCE_TOTAL_SQL}) AS total_price_cents,
+                  (${RULE_PREDICATE}) AS deal, (${NOT_DEAL_PREDICATE}) AS not_deal
+             FROM parity l
+             JOIN parity u ON u.id = l.id
+             JOIN parity s ON s.id = l.id
+             LEFT JOIN (${observation}) p ON 1 = 1
+            ORDER BY l.id`,
+        )
+        .all<Row>();
+      expect(read.results).toHaveLength(cases.length);
+      passes.push(...read.results);
+    }
 
     const failures: string[] = [];
     let deals = 0;
     let equalChecked = 0;
-    for (const row of read.results) {
+    for (const row of passes) {
       if (row.mode === null) {
         if (row.deal === 1 || row.not_deal === 1) failures.push(`a rule-less row judged ${JSON.stringify(row)}`);
         continue;

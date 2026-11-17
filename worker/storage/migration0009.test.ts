@@ -19,7 +19,7 @@ import { createTestDatabase, MIGRATIONS, splitSqlStatements, type TestDatabase }
 import { evaluateBatch } from "../evaluation/evaluateBatch";
 import { SELECTION_PREDICATE, handleGetVerdicts } from "../api/verdicts";
 import { handleGetSettings } from "../api/settings";
-import { handleGetWatch, invert, type StoredTarget } from "../api/watch";
+import { handleGetWatch, handlePutWatch, invert, type StoredTarget } from "../api/watch";
 import { handleGetWatchTargets } from "../api/watchTargets";
 import { enqueueCandidates, freshnessCutoff, ENQUEUE_LIMIT, NOTIFY_RECENT_EVALUATION_SECONDS } from "../notify/enqueue";
 import { readSelection, selectionFromTargets } from "../notify/selection";
@@ -211,6 +211,9 @@ const seedPreZeroZeroNine = async () => {
     await listing(`old-${index}`, { market: OLD, price: index === 0 ? 100_000 : 300_000 });
   }
 
+  // Judged with everything else, then aged below (deal-backlog).
+  await listing("deal-backlog", { price: 205_000 });
+
   // THE REAL DRAIN, under the saved rule, judges everything above.
   const report = await evaluateBatch(db, {
     source: SOURCE,
@@ -218,10 +221,20 @@ const seedPreZeroZeroNine = async () => {
     now: NOW - 1_000,
     batchSize: 98,
   });
-  expect(report.claimed).toBe(21);
+  expect(report.claimed).toBe(22);
+
+  // A DEAL judged THREE DAYS AGO: outside the old enqueue's one-day window, so the old code never
+  // alerts it. A no-op Save after cutover must not either (the review's measured backlog re-open).
+  await db
+    .prepare("UPDATE evaluation_tasks SET evaluated_at = ?1 WHERE listing_id = 'deal-backlog'")
+    .bind(NOW - 3 * 86_400)
+    .run();
 
   // Collected after the drain: never judged, PENDING on both sides.
-  await listing("pending", { price: 180_000, lastSeenAt: NOW - 60 });
+  // Another model's group, so its observation moves no aggregate the judged rows were judged against
+  // (a contribution to theirs is exactly the live-aggregate drift `migration0009` does NOT claim
+  // away -- docs/multi-user.md, "Labels follow the live average").
+  await listing("pending", { model: "GeForce RTX 4070", price: 180_000, lastSeenAt: NOW - 60 });
 
   await db.batch([
     db
@@ -334,6 +347,47 @@ describe("migration 0009 -- the owner sees no change", () => {
     // ---- The selection the notify step reads is the same.
     expect(await readSelection(db, 1)).toEqual(selection);
 
+    // ---- The watch list and the area.
+    const watch = await handleGetWatch(db, owner);
+    expect(watch).toEqual({
+      ok: true,
+      status: 200,
+      body: {
+        selection: {
+          components: inverted.components,
+          models: inverted.models,
+          location: { slug: market!.location, latitude: market!.latitude, longitude: market!.longitude },
+          radiusKm: market!.radius_km,
+        },
+        storedTargets,
+        keptSearches: inverted.residue,
+        budget: { used: storedTargets.length, maximum: 9, yours: storedTargets.length },
+      },
+    });
+
+    // ---- A NO-OP SAVE: the dashboard's Save with nothing changed, the body built from the GET
+    //      exactly as the form builds it. It must not re-open the backlog (deal-backlog stays out).
+    const loaded = await handleGetWatch(db, owner);
+    if (!loaded.ok) throw new Error(loaded.code);
+    const untouched = await handlePutWatch(
+      new Request("https://worker.example.test/api/watch", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          components: loaded.body.selection.components,
+          models: loaded.body.selection.models,
+          location: loaded.body.selection.location,
+          radiusKm: loaded.body.selection.radiusKm,
+          preservedTargetIds: loaded.body.keptSearches.map((row) => row.targetId),
+        }),
+      }),
+      db,
+      owner,
+      NOW,
+    );
+    expect(untouched.ok).toBe(true);
+    expect((await loadUser(db, 1))!.alertsReopenedAt).toBeNull();
+
     // ---- Alerts: the same listings are enqueued, and the SENT one is not among them.
     expect(await enqueueCandidates(db, NOW, selection, areaMarketKey(owner.area), 1)).toBe(
       enqueueBefore.length,
@@ -352,23 +406,6 @@ describe("migration 0009 -- the owner sees no change", () => {
       .prepare("SELECT status, sent_price_cents FROM user_notifications WHERE listing_id = 'deal-sent'")
       .all();
     expect(sent.results).toEqual([{ status: "SENT", sent_price_cents: 200_000 }]);
-
-    // ---- The watch list and the area.
-    const watch = await handleGetWatch(db, owner);
-    expect(watch).toEqual({
-      ok: true,
-      status: 200,
-      body: {
-        selection: {
-          components: inverted.components,
-          models: inverted.models,
-          location: { slug: market!.location, latitude: market!.latitude, longitude: market!.longitude },
-          radiusKm: market!.radius_km,
-        },
-        storedTargets,
-        keptSearches: inverted.residue,
-      },
-    });
 
     // ---- The rule and Start/Stop.
     expect(handleGetSettings(owner)).toEqual({
@@ -449,3 +486,37 @@ describe("migration 0009 -- the evidence rule and the owner's rule", () => {
     }
   });
 });
+
+describe("migration 0009 -- the pool-key guard", () => {
+  /**
+   * M9c. 0009 REFUSES AN INSTALL WHOSE SAVED MARKET IS NOT EVIDENCE_POOL_KEY, and leaves nothing
+   * behind; the shipped seed and an absent market row both migrate. Kills: deleting the guard
+   * (the moved market migrates).
+   */
+  it.each<[string, string | null, boolean]>([
+    ["the shipped seed (toronto, 25 km)", null, true],
+    ["no market row at all", "DELETE FROM watch_market", true],
+    ["a moved market", "UPDATE watch_market SET location = 'waterloo', latitude = 43.4643, longitude = -80.5204", false],
+    ["the same centre at 10 km", "UPDATE watch_market SET radius_km = 10", false],
+  ])("M9c: %s", async (_label, change, migrates) => {
+    const fresh = await createTestDatabase(MIGRATIONS.length - 1);
+    try {
+      if (change !== null) await fresh.db.prepare(change).run();
+      const apply = fresh.db.batch(
+        splitSqlStatements(MIGRATIONS[MIGRATIONS.length - 1]).map((statement) => fresh.db.prepare(statement)),
+      );
+      if (migrates) {
+        await apply;
+        expect(await fresh.db.prepare("SELECT COUNT(*) AS n FROM users").first()).toEqual({ n: 1 });
+      } else {
+        await expect(apply).rejects.toThrow(/watch_budget/);
+        expect(
+          await fresh.db.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE name = 'users'").first(),
+        ).toEqual({ n: 0 });
+      }
+    } finally {
+      await fresh.dispose();
+    }
+  });
+});
+
