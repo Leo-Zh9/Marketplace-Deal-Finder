@@ -196,7 +196,17 @@ Worker back.
    SELECT (SELECT MAX(revision) FROM search_revisions) + 1, mode,
           CASE WHEN minimum_discount_bp IS NULL THEN NULL ELSE minimum_discount_bp / 100.0 END,
           maximum_price_cents, unixepoch()
-     FROM users WHERE user_id = 1 AND mode IS NOT NULL;
+     FROM users WHERE user_id = 1 AND mode IS NOT NULL
+      -- ONLY WHEN IT DIFFERS. An unconditional bump makes the old drain re-judge every task (fresh
+      -- evaluated_at), and the old enqueue would then send first alerts for every fresh DEAL with no
+      -- notifications row. `IS` compares NULLs as equal.
+      AND NOT EXISTS (SELECT 1 FROM search_settings s
+                        JOIN search_revisions r ON r.revision = s.current_revision
+                       WHERE s.id = 1 AND r.mode = users.mode
+                         AND r.minimum_discount_percent IS (CASE WHEN users.minimum_discount_bp IS NULL
+                                                                 THEN NULL ELSE users.minimum_discount_bp / 100.0 END)
+                         AND r.maximum_price_cents IS users.maximum_price_cents);
+   -- A no-op when nothing was inserted: MAX(revision) is already the current one.
    UPDATE search_settings SET current_revision = (SELECT MAX(revision) FROM search_revisions) WHERE id = 1;
    ```
 3. Watch list:
@@ -218,14 +228,15 @@ Worker back.
           radius_km = (SELECT radius_km FROM users WHERE user_id = 1)
     WHERE id = 1 AND (SELECT location FROM users WHERE user_id = 1) IS NOT NULL;
    ```
-5. Notifications: user 1's non-CANCELLED rows back into `notifications`, every column:
+5. Notifications: ALL of user 1's rows back into `notifications`, every column and every status, so a row
+   the new code CANCELLED is not left PENDING for the old code to send:
    ```sql
    INSERT INTO notifications (source, listing_id, model_key, status, created_at, updated_at,
                               attempts, next_attempt_at, lease_token, lease_expires_at,
                               last_attempt_at, sent_price_cents, sent_at, last_error)
    SELECT source, listing_id, model_key, status, created_at, updated_at, attempts, next_attempt_at,
           lease_token, lease_expires_at, last_attempt_at, sent_price_cents, sent_at, last_error
-     FROM user_notifications WHERE user_id = 1 AND status <> 'CANCELLED'
+     FROM user_notifications WHERE user_id = 1
    ON CONFLICT (source, listing_id) DO UPDATE SET
      model_key = excluded.model_key, status = excluded.status, created_at = excluded.created_at,
      updated_at = excluded.updated_at, attempts = excluded.attempts,
