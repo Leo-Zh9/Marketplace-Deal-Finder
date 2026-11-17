@@ -133,6 +133,20 @@ CREATE TABLE watch_cap_guard (
   CONSTRAINT watch_budget CHECK (ok = 1)
 );
 
+-- THE MIGRATION REFUSES AN INSTALL WHOSE SAVED MARKET IS NOT THE EVIDENCE POOL. EVIDENCE_POOL_KEY
+-- (worker/storage/marketKey.ts) is 43.6532,-79.3832|25km because that is the market every stored
+-- hash, observation and aggregate was written under. On any other saved market the pool constant
+-- would re-key every listing on its next sighting -- a write storm -- and orphan the aggregates. So
+-- the same CHECK trick as the cap: a 0 into watch_cap_guard, refused, and the whole file rolls back
+-- (measured with `wrangler d1 execute --local --file`: no table of a failing file survives). The
+-- error names `watch_budget`; docs/multi-user.md says what it means here. A fresh install passes:
+-- 0005 seeds exactly that row. An install with no market row passes too: there is nothing to re-key.
+INSERT INTO watch_cap_guard (ok)
+SELECT 0
+ WHERE EXISTS (SELECT 1 FROM watch_market
+                WHERE id = 1
+                  AND NOT (latitude = 43.6532 AND longitude = -79.3832 AND radius_km = 25));
+
 -- USER 1 IS THE EXISTING INSTALL: its area is watch_market, its rule is the rule in force, its
 -- Start/Stop is monitoring_state. LEFT JOINs, so an absent singleton seeds NULLs rather than no user
 -- at all. SEEDED BEFORE THE EVIDENCE-RULE BUMP BELOW, so it copies the owner's rule, not the bump.
