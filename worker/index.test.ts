@@ -7,8 +7,8 @@ import worker, {
   ROUTE_METHODS,
   type Environment,
 } from "./index";
-import { SELECT_MARKET } from "./api/verdicts";
 import { createTestDatabase, truncateAll, type TestDatabase } from "./testing/d1";
+import { addMember, addTarget, setArea } from "./testing/users";
 import { createTokenFactory, type TokenClaims } from "./testing/firebaseTokens";
 
 const projectId = "deal-finder-test";
@@ -1049,16 +1049,8 @@ describe("the watch-list route's credential boundary", () => {
   beforeAll(async () => {
     watchDatabase = await createTestDatabase();
     await truncateAll(watchDatabase.db);
-    await watchDatabase.db
-      .prepare(
-        "INSERT INTO watch_market (id, location, latitude, longitude, radius_km) VALUES (1, 'toronto', 43.6532, -79.3832, 25)",
-      )
-      .run();
-    await watchDatabase.db
-      .prepare(
-        "INSERT INTO watch_targets (target_id, component_type, query) VALUES ('gpu-toronto', 'gpu', 'graphics card')",
-      )
-      .run();
+    await setArea(watchDatabase.db, { location: "toronto", latitude: 43.6532, longitude: -79.3832, radiusKm: 25 });
+    await addTarget(watchDatabase.db, "gpu-toronto", "gpu", "graphics card");
   }, 120_000);
 
   afterAll(async () => {
@@ -1168,9 +1160,12 @@ describe("the watch-list route's credential boundary", () => {
     );
 
     expect(response.status).toBe(200);
+    const market = { location: "toronto", latitude: 43.6532, longitude: -79.3832, radiusKm: 25 };
     await expect(response.json()).resolves.toEqual({
-      market: { location: "toronto", latitude: 43.6532, longitude: -79.3832, radiusKm: 25 },
-      targets: [{ targetId: "gpu-toronto", componentType: "gpu", query: "graphics card" }],
+      market,
+      targets: [
+        { targetId: "gpu-graphics-card@toronto-25", componentType: "gpu", query: "graphics card", market },
+      ],
       monitoring: "running",
     });
   });
@@ -1283,15 +1278,11 @@ describe("the browser read route's boundary", () => {
   beforeAll(async () => {
     database = await createTestDatabase();
     await truncateAll(database.db);
-    // THE SAVED MARKET, which the read filters on and `truncateAll` deletes. Its key is
-    // `43.5000,-79.8000|18km`: `marketKey()` always writes four decimals, so the listing below
+    // THE CALLER'S AREA, which the read filters on and `truncateAll` clears. Its key is
+    // `43.5000,-79.8000|18km`: `marketKey()` always writes four decimals, so the membership below
     // must carry that spelling and not `43.5,-79.8|18km`.
-    await database.db
-      .prepare(
-        `INSERT INTO watch_market (id, location, latitude, longitude, radius_km)
-         VALUES (1, 'toronto', 43.5, -79.8, 18)`,
-      )
-      .run();
+    await setArea(database.db, { latitude: 43.5, longitude: -79.8, radiusKm: 18 });
+    await addMember(database.db, "43.5000,-79.8000|18km", "L1");
     await database.db
       .prepare(
         `INSERT INTO listings (source, listing_id, market_key, component_type, model_key,
@@ -1451,8 +1442,10 @@ describe("the browser read route's boundary", () => {
    * unexplained failure rather than a diagnosable one.
    */
   it("V-10: a storage failure is its own code, its own message, and readable by the browser", async () => {
+    // The caller resolves; only the verdict read fails.
     const broken = {
-      prepare: () => {
+      prepare: (sql: string) => {
+        if (sql.includes("FROM users WHERE email")) return database.db.prepare(sql);
         throw new Error("no such table: listings");
       },
     } as unknown as D1Database;
@@ -1481,16 +1474,13 @@ describe("the browser read route's boundary", () => {
    */
   it("V-10b: a page where every row is unusable is its own code and message", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    // THE MARKET READ ANSWERS A VALID ROW, so the handler reaches the verdict read below.
+    // THE CALLER RESOLVES WITH AN AREA, so the handler reaches the verdict read below.
     const unusableRows = () =>
       ({
-        prepare: (sql: string) => ({
-          all: () =>
-            Promise.resolve(
-              sql === SELECT_MARKET
-                ? { results: [{ latitude: 43.5, longitude: -79.8, radius_km: 18 }], meta: {} }
-                : { results: [], meta: {} },
-            ),
+        prepare: (sql: string) =>
+          sql.includes("FROM users WHERE email")
+            ? database.db.prepare(sql)
+            : {
           bind: () => ({
             all: () =>
               Promise.resolve({
@@ -1514,7 +1504,7 @@ describe("the browser read route's boundary", () => {
                 meta: { rows_read: 1, rows_written: 0 },
               }),
           }),
-        }),
+        },
       }) as unknown as D1Database;
 
     const response = await call(
@@ -1609,21 +1599,13 @@ describe("the browser watch route", () => {
 
   beforeEach(async () => {
     await truncateAll(database.db);
-    await database.db
-      .prepare(
-        "INSERT INTO watch_market (id, location, latitude, longitude, radius_km) VALUES (1,'toronto',43.6532,-79.3832,25)",
-      )
-      .run();
+    await setArea(database.db, { location: "toronto", latitude: 43.6532, longitude: -79.3832, radiusKm: 25 });
     // A row whose `component_type` is OUTSIDE the catalog: the inversion cannot place it, so it
     // is both preservable and always part of the residue. A broad row of a CATALOG type would be
     // preserved just as well, but it would come back as a SELECTED TYPE on the next read rather
     // than as a kept search -- which is the inversion working as designed, and would make this
     // row assert something other than what it says.
-    await database.db
-      .prepare(
-        "INSERT INTO watch_targets (target_id, component_type, query) VALUES ('legacy-ebay','ebay','gpu deals')",
-      )
-      .run();
+    await addTarget(database.db, "legacy-ebay", "ebay", "gpu deals");
   });
 
   const watchEnvironment = (overrides: Partial<Environment> = {}): Environment =>
@@ -1741,7 +1723,7 @@ describe("the browser watch route", () => {
     expect(written.headers.get("X-Content-Type-Options")).toBe("nosniff");
 
     const stored = await database.db
-      .prepare("SELECT target_id, component_type, query FROM watch_targets ORDER BY target_id")
+      .prepare("SELECT target_id, component_type, query FROM user_watch_targets ORDER BY target_id")
       .all<{ target_id: string; component_type: string; query: string }>();
     expect(stored.results).toEqual([
       { target_id: "case_fans-case-fan", component_type: "case_fan", query: "case fan" },
@@ -2269,7 +2251,9 @@ describe("the monitoring start/stop routes", () => {
       .bind(now - 600)
       .run();
     await database.db
-      .prepare("INSERT INTO watch_targets (target_id, component_type, query) VALUES ('gpu-x', 'gpu', 'gpu')")
+      .prepare(
+        "INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'gpu-x', 'gpu', 'gpu')",
+      )
       .run();
     expect(await status()).toMatchObject({ status: "degraded", monitoring: { state: "running" } });
 
@@ -2323,16 +2307,16 @@ describe("the monitoring start/stop routes", () => {
   });
 
   /**
-   * X-m5: A FAILED FLAG READ ON `/api/status` IS `monitoring: null` AND OVERRIDES NOTHING. The row
+   * X-m5: A FAILED USER READ ON `/api/status` IS `monitoring: null` AND OVERRIDES NOTHING. The row
    * says stopped and the read of it fails, so a route that defaulted the failure to either word
    * would show it. The health read itself succeeds here.
    */
-  it("X-m5: a monitoring_state read that throws leaves status alone and answers null", async () => {
+  it("X-m5: a users read that throws leaves status alone and answers null", async () => {
     await post(stopPath);
     const real = database.db;
     const flagFails = {
       prepare: (sql: string) => {
-        if (sql.includes("monitoring_state")) throw new Error("D1_ERROR: no such table");
+        if (sql.includes("FROM users")) throw new Error("D1_ERROR: no such table");
         return real.prepare(sql);
       },
       batch: real.batch.bind(real),

@@ -8,14 +8,19 @@
 
 import type { AuthDependencies } from "../auth/verifyFirebaseToken";
 import { handleRequest, type Environment } from "../index";
-import { createTestDatabase, truncateAll, type TestDatabase } from "../testing/d1";
+import {
+  createTestDatabase,
+  TEST_OWNER_EMAIL,
+  truncateAll,
+  type TestDatabase,
+} from "../testing/d1";
 import { createTokenFactory } from "../testing/firebaseTokens";
 import { MAX_SETTINGS_BODY_BYTES } from "./settings";
 
 const projectId = "settings-api-test";
 const appOrigin = "https://deals.pages.dev";
 const workerOrigin = "https://api.example.workers.dev";
-const owner = "operator@example.com";
+const owner = TEST_OWNER_EMAIL;
 const REQUEST_CLOCK = 1_800_000_000;
 
 let database!: TestDatabase;
@@ -75,14 +80,28 @@ const put = (body: string, headers: Record<string, string> = {}) =>
 const putJson = (payload: unknown, headers: Record<string, string> = {}) =>
   put(JSON.stringify(payload), headers);
 
+/** The CALLER's rule, on their `users` row (migrations/0009). */
+const ruleRow = async (userId = 1) =>
+  database.db
+    .prepare(
+      `SELECT mode, minimum_discount_bp, maximum_price_cents, alerts_reopened_at
+         FROM users WHERE user_id = ?1`,
+    )
+    .bind(userId)
+    .first();
+
+/** A refused PUT leaves the caller's rule exactly as `truncateAll` left it. */
+const expectNothingWritten = async () =>
+  expect(await ruleRow()).toEqual({
+    mode: null,
+    minimum_discount_bp: null,
+    maximum_price_cents: null,
+    alerts_reopened_at: null,
+  });
+
+/** The frozen evidence rule. No settings PUT may touch it. */
 const revisionRows = async () =>
-  (
-    await database.db
-      .prepare(
-        "SELECT revision, mode, minimum_discount_percent, maximum_price_cents, created_at FROM search_revisions ORDER BY revision",
-      )
-      .all()
-  ).results;
+  (await database.db.prepare("SELECT * FROM search_revisions ORDER BY revision").all()).results;
 
 /**
  * Deliberately unlike anything else in the suite: BOTH mode, a fractional percent that is not
@@ -100,61 +119,49 @@ describe("the settings API", () => {
     expect(response.headers.get("Access-Control-Allow-Origin")).toBe(appOrigin);
   });
 
-  it("A2: PUT creates revision 0, stamps the request clock, and GET reads it back", async () => {
+  it("A2: PUT stores the caller's rule, stamps the re-open clock, and GET reads it back", async () => {
     const written = await putJson(FIRST);
 
     expect(written.status).toBe(200);
     await expect(written.json()).resolves.toEqual({
-      settings: {
-        mode: "BOTH",
-        minimumDiscountPercent: 23.5,
-        maximumPriceCents: 74_900,
-        searchRevision: 0,
-      },
+      settings: { mode: "BOTH", minimumDiscountPercent: 23.5, maximumPriceCents: 74_900 },
       changed: true,
     });
-    expect(await revisionRows()).toEqual([
-      {
-        revision: 0,
-        mode: "BOTH",
-        minimum_discount_percent: 23.5,
-        maximum_price_cents: 74_900,
-        created_at: REQUEST_CLOCK,
-      },
-    ]);
+    expect(await ruleRow()).toEqual({
+      mode: "BOTH",
+      minimum_discount_bp: 2350,
+      maximum_price_cents: 74_900,
+      alerts_reopened_at: REQUEST_CLOCK,
+    });
+    // THE EVIDENCE RULE IS FROZEN: the settings API no longer writes it.
+    expect(await revisionRows()).toEqual([]);
 
     const read = await get();
     expect(read.status).toBe(200);
     await expect(read.json()).resolves.toEqual({
-      settings: {
-        mode: "BOTH",
-        minimumDiscountPercent: 23.5,
-        maximumPriceCents: 74_900,
-        searchRevision: 0,
-      },
+      settings: { mode: "BOTH", minimumDiscountPercent: 23.5, maximumPriceCents: 74_900 },
     });
   });
 
-  it("A3: an identical PUT reports changed:false and writes no revision; a different one bumps", async () => {
+  it("A3: an identical PUT reports changed:false and keeps the re-open stamp; a different one moves it", async () => {
     await putJson(FIRST);
+    await database.db.prepare("UPDATE users SET alerts_reopened_at = 5 WHERE user_id = 1").run();
 
     const again = await putJson(FIRST);
     expect(again.status).toBe(200);
     await expect(again.json()).resolves.toMatchObject({ changed: false });
-    expect(await revisionRows()).toHaveLength(1);
+    expect(await ruleRow()).toMatchObject({ alerts_reopened_at: 5 });
 
     const moved = await putJson({ ...FIRST, maximumPriceCents: 61_250 });
     expect(moved.status).toBe(200);
     await expect(moved.json()).resolves.toEqual({
-      settings: {
-        mode: "BOTH",
-        minimumDiscountPercent: 23.5,
-        maximumPriceCents: 61_250,
-        searchRevision: 1,
-      },
+      settings: { mode: "BOTH", minimumDiscountPercent: 23.5, maximumPriceCents: 61_250 },
       changed: true,
     });
-    expect(await revisionRows()).toHaveLength(2);
+    expect(await ruleRow()).toMatchObject({
+      maximum_price_cents: 61_250,
+      alerts_reopened_at: REQUEST_CLOCK,
+    });
   });
 
   it("A4: the response reports the stored value, so a field the mode made inert comes back null", async () => {
@@ -166,23 +173,46 @@ describe("the settings API", () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual({
-      settings: {
-        mode: "DISCOUNT",
-        minimumDiscountPercent: 41.25,
-        maximumPriceCents: null,
-        searchRevision: 0,
-      },
+      settings: { mode: "DISCOUNT", minimumDiscountPercent: 41.25, maximumPriceCents: null },
       changed: true,
     });
-    expect(await revisionRows()).toEqual([
-      {
-        revision: 0,
-        mode: "DISCOUNT",
-        minimum_discount_percent: 41.25,
-        maximum_price_cents: null,
-        created_at: REQUEST_CLOCK,
-      },
-    ]);
+    expect(await ruleRow()).toMatchObject({
+      mode: "DISCOUNT",
+      minimum_discount_bp: 4125,
+      maximum_price_cents: null,
+    });
+  });
+
+  /**
+   * A-iso: THE RULE IS THE CALLER'S. A second user's PUT writes their own row and nobody else's,
+   * and each GET reads back only its own. Mutation: dropping `WHERE user_id = ?5` from UPDATE_RULE.
+   */
+  it("A-iso: one user's rule never reaches another user's row", async () => {
+    const second = `Bearer ${await factory.sign({ now: REQUEST_CLOCK, email: "second@example.com" })}`;
+    const env = environment({ APPROVED_EMAILS: JSON.stringify([owner, "second@example.com"]) });
+    const as = (auth: string, init: RequestInit = {}) =>
+      handleRequest(
+        new Request(`${workerOrigin}/api/settings`, {
+          ...init,
+          headers: { Authorization: auth, Origin: appOrigin, "Content-Type": "application/json" },
+        }),
+        env,
+        dependencies,
+      );
+    await as(authorization, { method: "PUT", body: JSON.stringify(FIRST) });
+    const theirs = await as(second, {
+      method: "PUT",
+      body: JSON.stringify({ mode: "MAXIMUM_PRICE", maximumPriceCents: 10_000 }),
+    });
+    expect(theirs.status).toBe(200);
+
+    await expect((await as(authorization)).json()).resolves.toEqual({
+      settings: { mode: "BOTH", minimumDiscountPercent: 23.5, maximumPriceCents: 74_900 },
+    });
+    await expect((await as(second)).json()).resolves.toEqual({
+      settings: { mode: "MAXIMUM_PRICE", minimumDiscountPercent: null, maximumPriceCents: 10_000 },
+    });
+    expect(await ruleRow(1)).toMatchObject({ mode: "BOTH", maximum_price_cents: 74_900 });
   });
 
   it("A5: a field this API cannot store is refused by name, and nothing is written", async () => {
@@ -203,7 +233,7 @@ describe("the settings API", () => {
         fields: ["components", "dealRule", "location", "models", "radiusKm"],
       },
     });
-    expect(await revisionRows()).toEqual([]);
+    await expectNothingWritten();
     expect(response.headers.get("Cache-Control")).toBe("no-store");
     expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff");
     expect(response.headers.get("Access-Control-Allow-Origin")).toBe(appOrigin);
@@ -216,7 +246,7 @@ describe("the settings API", () => {
     await expect(response.json()).resolves.toMatchObject({
       error: { code: "SETTINGS_FIELD_UNSUPPORTED", fields: ["maximumPriceCent"] },
     });
-    expect(await revisionRows()).toEqual([]);
+    await expectNothingWritten();
   });
 
   it.each([
@@ -243,7 +273,7 @@ describe("the settings API", () => {
     await expect(response.json()).resolves.toMatchObject({
       error: { code: "UNSUPPORTED_MEDIA_TYPE" },
     });
-    expect(await revisionRows()).toEqual([]);
+    await expectNothingWritten();
   });
 
   it.each([
@@ -301,7 +331,7 @@ describe("the settings API", () => {
     expect(wide.length).toBeLessThan(MAX_SETTINGS_BODY_BYTES);
     expect(await put(JSON.stringify({ mode: wide }))).toHaveProperty("status", 413);
 
-    expect(await revisionRows()).toEqual([]);
+    await expectNothingWritten();
   });
 
   it.each([
@@ -317,7 +347,7 @@ describe("the settings API", () => {
 
     expect(response.status).toBe(400);
     await expect(response.json()).resolves.toMatchObject({ error: { code: "INVALID_JSON" } });
-    expect(await revisionRows()).toEqual([]);
+    await expectNothingWritten();
   });
 
   it.each([
@@ -361,7 +391,7 @@ describe("the settings API", () => {
 
     expect(response.status).toBe(400);
     await expect(response.json()).resolves.toMatchObject({ error: { code: "INVALID_SETTINGS" } });
-    expect(await revisionRows()).toEqual([]);
+    await expectNothingWritten();
   });
 
   it.each([
@@ -373,7 +403,7 @@ describe("the settings API", () => {
 
     expect(response.status).toBe(400);
     await expect(response.json()).resolves.toMatchObject({ error: { code: "INVALID_SETTINGS" } });
-    expect(await revisionRows()).toEqual([]);
+    await expectNothingWritten();
   });
 
   it.each([
@@ -427,20 +457,23 @@ describe("the settings API", () => {
     const after = Math.floor(Date.now() / 1000);
 
     expect(response.status).toBe(200);
-    const [row] = (await revisionRows()) as Array<{ created_at: number }>;
-    expect(row.created_at).toBeGreaterThanOrEqual(before);
-    expect(row.created_at).toBeLessThanOrEqual(after);
+    // The local identity is provisioned as a new user (the owner is claimed by TEST_OWNER_EMAIL).
+    const row = (await database.db
+      .prepare("SELECT alerts_reopened_at FROM users WHERE email = 'local-dev@localhost'")
+      .first()) as { alerts_reopened_at: number };
+    expect(row.alerts_reopened_at).toBeGreaterThanOrEqual(before);
+    expect(row.alerts_reopened_at).toBeLessThanOrEqual(after);
     // ...and that is a different clock from the one every other test injects.
-    expect(row.created_at).not.toBe(REQUEST_CLOCK);
+    expect(row.alerts_reopened_at).not.toBe(REQUEST_CLOCK);
   });
 
   it("A13: a storage failure is a 503, not a 400 and not an unhandled throw", async () => {
+    // THE CALLER RESOLVES; ONLY THE RULE'S OWN STATEMENT FAILS. A wholly broken binding is
+    // USER_STORAGE_FAILED (A13b), so this is the only way to reach SETTINGS_STORAGE_FAILED.
     const broken = {
-      prepare: () => {
-        throw new Error("D1_ERROR: database is unavailable");
-      },
-      batch: () => {
-        throw new Error("D1_ERROR: database is unavailable");
+      prepare: (sql: string) => {
+        if (sql.includes("SET mode")) throw new Error("D1_ERROR: database is unavailable");
+        return database.db.prepare(sql);
       },
     } as unknown as D1Database;
 
@@ -457,19 +490,32 @@ describe("the settings API", () => {
       environment({ DB: broken }),
       dependencies,
     );
-    const read = await handleRequest(
-      new Request(`${workerOrigin}/api/settings`, {
-        headers: { Authorization: authorization, Origin: appOrigin },
-      }),
-      environment({ DB: broken }),
-      dependencies,
-    );
+    expect(write.status).toBe(503);
+    await expect(write.json()).resolves.toMatchObject({ error: { code: "SETTINGS_STORAGE_FAILED" } });
+    expect(write.headers.get("Access-Control-Allow-Origin")).toBe(appOrigin);
+  });
 
-    for (const response of [write, read]) {
+  it("A13b: a binding that cannot even resolve the caller is USER_STORAGE_FAILED, on both methods", async () => {
+    const broken = {
+      prepare: () => {
+        throw new Error("D1_ERROR: database is unavailable");
+      },
+    } as unknown as D1Database;
+    for (const init of [{ method: "PUT", body: JSON.stringify(FIRST) }, {}]) {
+      const response = await handleRequest(
+        new Request(`${workerOrigin}/api/settings`, {
+          ...init,
+          headers: {
+            Authorization: authorization,
+            Origin: appOrigin,
+            "Content-Type": "application/json",
+          },
+        }),
+        environment({ DB: broken }),
+        dependencies,
+      );
       expect(response.status).toBe(503);
-      await expect(response.json()).resolves.toMatchObject({
-        error: { code: "SETTINGS_STORAGE_FAILED" },
-      });
+      await expect(response.json()).resolves.toMatchObject({ error: { code: "USER_STORAGE_FAILED" } });
       expect(response.headers.get("Access-Control-Allow-Origin")).toBe(appOrigin);
     }
   });
@@ -508,7 +554,7 @@ describe("the settings API", () => {
     expect(response.headers.get("Vary")).toBe("Origin");
     expect(response.headers.get("Cache-Control")).toBe("no-store");
     expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff");
-    expect(await revisionRows()).toEqual([]);
+    await expectNothingWritten();
   });
 
   /**
@@ -538,7 +584,7 @@ describe("the settings API", () => {
 
     expect(response.status).toBe(status);
     await expect(response.json()).resolves.toMatchObject({ error: { code } });
-    expect(await revisionRows()).toEqual([]);
+    await expectNothingWritten();
   });
 
   it("A16: an unsupported field is named even when the rest of the body is invalid too", async () => {
@@ -556,7 +602,7 @@ describe("the settings API", () => {
         message: "The request contains fields this API cannot store.",
       },
     });
-    expect(await revisionRows()).toEqual([]);
+    await expectNothingWritten();
   });
 
   it("A17: an oversized DECLARED length is refused before the body is read", async () => {

@@ -25,6 +25,7 @@ import { componentById, mockLocations } from "../../src/data/catalog";
 import { MAX_WATCH_TARGETS } from "../../src/utils/validation";
 import type { ComponentType } from "../../src/types";
 import { CATALOG_COMPONENT_ID, STORAGE_COMPONENT_ID } from "../normalize/catalogIndex";
+import type { User } from "../users/users";
 
 export { MAX_WATCH_TARGETS };
 
@@ -416,30 +417,69 @@ export const validateSelection = (
   };
 };
 
-const SELECT_MARKET = `SELECT location, latitude, longitude, radius_km
-  FROM watch_market WHERE id = 1`;
+/** ONE USER'S AREA (migrations/0009). All four columns are NULL together for a new user. */
+const SELECT_AREA = `SELECT location, latitude, longitude, radius_km
+  FROM users WHERE user_id = ?1`;
 
 /** `ORDER BY target_id` is what makes the inversion's first-row-wins rule deterministic. */
 const SELECT_TARGETS = `SELECT target_id, component_type, query
-  FROM watch_targets ORDER BY target_id`;
+  FROM user_watch_targets WHERE user_id = ?1 ORDER BY target_id`;
 
 /**
  * THE DELETE KEEPS THE KEPT ROWS AND THE INSERT WRITES ONLY THE DERIVED ONES. Deleting everything
  * outside the final set and then re-inserting all of it looks tidier and is WRONG: a kept row
  * survives the DELETE and then collides with its own re-INSERT on the PRIMARY KEY, landing in the
  * catch as WATCH_STORAGE_FAILED on every save that keeps anything.
+ *
+ * SCOPED TO THE CALLER BY `user_id = ?2`. Without it one user's save deletes every other user's
+ * searches -- their kept ids are not in this caller's list. W-iso is the guard.
  */
-const DELETE_SCOPED = `DELETE FROM watch_targets
-  WHERE target_id NOT IN (SELECT value FROM json_each(?1))`;
-const INSERT_TARGET = `INSERT INTO watch_targets (target_id, component_type, query)
-  VALUES (?1, ?2, ?3)`;
+const DELETE_SCOPED = `DELETE FROM user_watch_targets
+  WHERE user_id = ?2 AND target_id NOT IN (SELECT value FROM json_each(?1))`;
+const INSERT_TARGET = `INSERT INTO user_watch_targets (user_id, target_id, component_type, query)
+  VALUES (?1, ?2, ?3, ?4)`;
 /**
- * PINNED TO THE LITERAL 1 (the POINT_AT idiom), so `watch_market`'s singleton invariant holds in
- * the statement as well as in the `CHECK (id = 1)`.
+ * THE AREA, AND THE ALERT RE-OPENING, IN THE SAME STATEMENT. Every save stamps
+ * `alerts_reopened_at`: the drain no longer re-judges anything on a rule, search or area change, so
+ * this stamp is what lets the deals a save newly qualifies alert (worker/notify/enqueue.ts).
+ * ?1 location, ?2 latitude, ?3 longitude, ?4 radius_km, ?5 now, ?6 user_id.
  */
-const UPSERT_MARKET = `INSERT INTO watch_market (id, location, latitude, longitude, radius_km)
-       VALUES (1, ?1, ?2, ?3, ?4)
-  ON CONFLICT(id) DO UPDATE SET location = ?1, latitude = ?2, longitude = ?3, radius_km = ?4`;
+const UPDATE_AREA = `UPDATE users
+   SET location = ?1, latitude = ?2, longitude = ?3, radius_km = ?4, alerts_reopened_at = ?5
+ WHERE user_id = ?6`;
+
+/**
+ * THE SHARED SEARCH CAP, ENFORCED ATOMICALLY. The LAST statement of the save batch -- after the
+ * DELETE, the INSERTs and the area UPDATE, so it counts the state the save would leave -- inserts a
+ * 0 into `watch_cap_guard` when the DISTINCT (component_type, query, area) count over EVERY user's
+ * stored targets (active or not) exceeds the cap. The table's CHECK (ok = 1) refuses the 0 and D1
+ * rolls the whole save back. Two concurrent saves cannot both slip under it: a batch is one
+ * transaction, and each counts the other's committed rows.
+ *
+ * (latitude, longitude, radius_km) STANDS FOR THE MARKET KEY. The key is never built in SQL
+ * (verdicts.ts says why); every stored area is a catalog location whose coordinates the save
+ * validated against the slug, and watch.test.ts W-cap-key pins that distinct catalog coordinates are
+ * distinct market keys -- so the tuple and the key count the same thing.
+ * ?1 the cap.
+ */
+export const CAP_GUARD = `INSERT INTO watch_cap_guard (ok)
+SELECT 0
+ WHERE (SELECT COUNT(*) FROM (SELECT DISTINCT t.component_type, t.query,
+                                              u.latitude, u.longitude, u.radius_km
+                                FROM user_watch_targets t
+                                JOIN users u ON u.user_id = t.user_id)) > ?1`;
+
+/** The 409's numbers, read AFTER the rollback: what is in use now, and how much of it is yours. */
+const SELECT_BUDGET = `SELECT
+  (SELECT COUNT(*) FROM (SELECT DISTINCT t.component_type, t.query,
+                                         u.latitude, u.longitude, u.radius_km
+                           FROM user_watch_targets t
+                           JOIN users u ON u.user_id = t.user_id))              AS used,
+  (SELECT COUNT(*) FROM (SELECT DISTINCT component_type, query
+                           FROM user_watch_targets WHERE user_id = ?1))        AS yours`;
+
+/** D1 names the failed CHECK by its CONSTRAINT name. */
+const CAP_REFUSED = /watch_budget/;
 
 interface TargetRow {
   target_id: string;
@@ -447,15 +487,15 @@ interface TargetRow {
   query: string;
 }
 
-interface MarketRow {
-  location: string;
-  latitude: number;
-  longitude: number;
-  radius_km: number;
+interface AreaRow {
+  location: string | null;
+  latitude: number | null;
+  longitude: number | null;
+  radius_km: number | null;
 }
 
-const readStoredTargets = async (db: D1Database): Promise<StoredTarget[]> => {
-  const read = await db.prepare(SELECT_TARGETS).all<TargetRow>();
+const readStoredTargets = async (db: D1Database, userId: number): Promise<StoredTarget[]> => {
+  const read = await db.prepare(SELECT_TARGETS).bind(userId).all<TargetRow>();
   return read.results.map((row) => ({
     targetId: row.target_id,
     componentType: row.component_type,
@@ -463,24 +503,23 @@ const readStoredTargets = async (db: D1Database): Promise<StoredTarget[]> => {
   }));
 };
 
-const readState = async (db: D1Database): Promise<WatchBody> => {
-  const market = await db.prepare(SELECT_MARKET).all<MarketRow>();
-  const stored = await readStoredTargets(db);
+const readState = async (db: D1Database, userId: number): Promise<WatchBody> => {
+  const area = await db.prepare(SELECT_AREA).bind(userId).all<AreaRow>();
+  const stored = await readStoredTargets(db, userId);
   const inverted = invert(stored);
-  const row = market.results[0];
+  const row = area.results[0];
+  const located = row !== undefined && row.location !== null;
   return {
     selection: {
       components: inverted.components,
       models: inverted.models,
-      // `null` when the singleton row is absent -- a reachable state (someone can DELETE it) and
-      // an explicit one.
-      location:
-        row === undefined
-          ? null
-          : { slug: row.location, latitude: row.latitude, longitude: row.longitude },
+      // `null` for a user who has never saved an area -- an explicit state, not a default.
+      location: located
+        ? { slug: row.location!, latitude: row.latitude!, longitude: row.longitude! }
+        : null,
       // `null`, NEVER 0: no layer accepts a radius of 0, so a 0 here would load the form already
       // invalid with no user action.
-      radiusKm: row === undefined ? null : row.radius_km,
+      radiusKm: located ? row.radius_km : null,
     },
     // EVERY stored row verbatim, so the client knows each row's id and can decide what to keep.
     storedTargets: stored,
@@ -489,17 +528,22 @@ const readState = async (db: D1Database): Promise<WatchBody> => {
   };
 };
 
-export const handleGetWatch = async (db: D1Database): Promise<WatchResult> => {
+export const handleGetWatch = async (db: D1Database, user: User): Promise<WatchResult> => {
   // WITHOUT THIS READ THE FORM STARTS FROM `initialSettings` AND THE FIRST SAVE REPLACES LIVE
   // CONFIGURATION. The read is what makes the write safe.
   try {
-    return { ok: true, status: 200, body: await readState(db) };
+    return { ok: true, status: 200, body: await readState(db, user.userId) };
   } catch {
     return fail(503, "WATCH_TARGETS_STORAGE_FAILED");
   }
 };
 
-export const handlePutWatch = async (request: Request, db: D1Database): Promise<WatchResult> => {
+export const handlePutWatch = async (
+  request: Request,
+  db: D1Database,
+  user: User,
+  now: number,
+): Promise<WatchResult> => {
   const mediaType = (request.headers.get("Content-Type") ?? "").split(";")[0].trim().toLowerCase();
   if (mediaType !== "application/json") return fail(415, "UNSUPPORTED_MEDIA_TYPE");
 
@@ -533,7 +577,7 @@ export const handlePutWatch = async (request: Request, db: D1Database): Promise<
     return fail(400, "INVALID_JSON");
   }
 
-  return applyWatchSelection(parsed as Record<string, unknown>, db);
+  return applyWatchSelection(parsed as Record<string, unknown>, db, user, now);
 };
 
 /**
@@ -544,6 +588,8 @@ export const handlePutWatch = async (request: Request, db: D1Database): Promise<
 export const applyWatchSelection = async (
   body: Record<string, unknown>,
   db: D1Database,
+  user: User,
+  now: number,
 ): Promise<WatchResult> => {
   const selection = validateSelection(body);
   if ("bad" in selection) return fail(400, selection.bad.code, selection.bad.details);
@@ -555,7 +601,7 @@ export const applyWatchSelection = async (
 
   let stored: StoredTarget[];
   try {
-    stored = await readStoredTargets(db);
+    stored = await readStoredTargets(db, user.userId);
   } catch {
     // DISTINCT FROM THE WRITE CODE BELOW: this one means the READ failed, and its message says
     // "could not be read". Two different fixes behind one code sends an operator to the wrong one.
@@ -602,34 +648,53 @@ export const applyWatchSelection = async (
   }
 
   // ONE BATCH, so a failing statement rolls the DELETE back and a half-written watch list is
-  // unreachable. Bounds: <= 11 statements, <= 4 bound parameters each, against the MEASURED D1
-  // ceiling of 100 parameters.
+  // unreachable. Bounds: <= 12 statements, <= 6 bound parameters each, against the MEASURED D1
+  // ceiling of 100 parameters. The cap guard is LAST so it counts what the save would leave.
   const keptFinalIds = final.filter((row) => keptIds.has(row.targetId)).map((row) => row.targetId);
   const toInsert = final.filter((row) => !keptIds.has(row.targetId));
   try {
     await db.batch([
-      db.prepare(DELETE_SCOPED).bind(JSON.stringify(keptFinalIds)),
+      db.prepare(DELETE_SCOPED).bind(JSON.stringify(keptFinalIds), user.userId),
       ...toInsert.map((row) =>
-        db.prepare(INSERT_TARGET).bind(row.targetId, row.componentType, row.query),
+        db.prepare(INSERT_TARGET).bind(user.userId, row.targetId, row.componentType, row.query),
       ),
       db
-        .prepare(UPSERT_MARKET)
+        .prepare(UPDATE_AREA)
         .bind(
           selection.location.slug,
           selection.location.latitude,
           selection.location.longitude,
           selection.radiusKm,
+          now,
+          user.userId,
         ),
+      db.prepare(CAP_GUARD).bind(MAX_WATCH_TARGETS),
     ]);
-  } catch {
-    return fail(503, "WATCH_STORAGE_FAILED");
+  } catch (error) {
+    if (!CAP_REFUSED.test(String(error))) return fail(503, "WATCH_STORAGE_FAILED");
+    // A 409, NOT A 400: the request is valid and the caller's own list is within its cap; the
+    // SHARED budget is what is full. The numbers say how much of it this caller can free.
+    try {
+      const budget = await db
+        .prepare(SELECT_BUDGET)
+        .bind(user.userId)
+        .all<{ used: number; yours: number }>();
+      const row = budget.results[0];
+      return fail(409, "WATCH_BUDGET_FULL", {
+        used: row?.used ?? null,
+        maximum: MAX_WATCH_TARGETS,
+        yours: row?.yours ?? null,
+      });
+    } catch {
+      return fail(409, "WATCH_BUDGET_FULL", { used: null, maximum: MAX_WATCH_TARGETS, yours: null });
+    }
   }
 
   // RE-READ FROM D1, NEVER ECHOED: the response then reports what IS STORED. No `changed` flag --
   // there is no revision to protect here, so computing one would cost a read-before for a
   // cosmetic field.
   try {
-    return { ok: true, status: 200, body: await readState(db) };
+    return { ok: true, status: 200, body: await readState(db, user.userId) };
   } catch {
     return fail(503, "WATCH_TARGETS_STORAGE_FAILED");
   }
