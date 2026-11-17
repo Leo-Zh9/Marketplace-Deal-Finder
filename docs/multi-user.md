@@ -19,6 +19,10 @@ webhooks and the round-robin notify loop are PR3; until then alerts go to the ow
   `STOPPED` and the notify step all use that one definition. An unusable allowlist **throws**:
   `/api/watch-targets` answers 503 `AUTH_CONFIG_*`, a monitoring run records `DEGRADED`. It never
   reads as "nobody is active".
+- **An unclaimed or mis-claimed owner is loud too.** If user 1 has no email, or an email the
+  allowlist does not approve (a typo in the claim), `/api/watch-targets` answers
+  `503 OWNER_UNCLAIMED` -- the collector fails loudly -- and every monitoring run records
+  `DEGRADED`. Read as "nobody is active", it would have been a silent `STOPPED` outage.
 
 ### Local development: a second identity
 
@@ -82,9 +86,28 @@ npx wrangler d1 execute marketplace-deal-finder-db --local \
   everywhere, and equality inside its bounds (price <= $1M, comparables <= 100,000).
 - Preview labels are `decide(...)` with the user's rule on the live aggregate; a never-judged
   listing stays `PENDING`. Sort: deal, everything else, pending, NOT_DEAL last.
-- Every watch save and every real rule change stamps `users.alerts_reopened_at`. Enqueue admits a
-  candidate judged in the last day **or** whose user re-opened alerts in the last day, so a
-  loosened rule alerts the deals it newly qualifies. A SENT row is never re-enqueued.
+- **Re-opening alerts.** A save that changes what a user watches -- a different area, or a search
+  they did not have before -- and every real rule change stamp `users.alerts_reopened_at`. Enqueue
+  admits a candidate judged in the last day **or** whose user re-opened alerts in the last day, so a
+  loosened rule, a new search or a new area alerts the deals it newly qualifies. **Adding a search
+  therefore re-opens that user's whole backlog for a day**: every fresh listing in their area that
+  is a deal under their rule and was never alerted can alert, up to 20 enqueued per run. An
+  untouched Save stamps nothing (the dashboard sends the watch PUT on every Save), and neither does
+  removing a search. A SENT row is never re-enqueued.
+
+### Labels and alerts follow the live average
+
+The rule is applied to the market average **as it stands now**, not to the average a listing was
+judged against. Two consequences, both deliberate:
+
+- A listing once judged NOT_DEAL can become a deal later -- and alert, once -- when the average
+  moves up; a DEAL can relabel NOT_DEAL when it moves down. The stored `evaluation_tasks.verdict` is
+  the frozen evidence rule's and is not consulted.
+- **Other users' areas move the shared average.** Listings from a friend's area enter the same pool,
+  so your Preview labels and your alerts can change because of what they collect.
+
+Whatever the average does, a listing alerts **at most once per user** (`notify.test.ts` N-drift):
+the NOT EXISTS excludes every non-CANCELLED row, so a SENT row never comes back.
 
 ## Notifications
 
@@ -113,38 +136,104 @@ SELECT COUNT(*) FROM watch_targets;
 SELECT status, COUNT(*) FROM notifications GROUP BY 1;
 ```
 
-On the collector device: the guard state must hold no `refused:*` latch, because every target id
-changes at deploy (`jq '.alarm | keys' ~/.marketplace-collector-state.json`).
+On the collector device: `jq '.alarm | keys' ~/.marketplace-collector-state.json` must show **no
+`refused:*` latch**. Every wire target id changes at this deploy (`type-query@area`), so a latch
+keyed by an old id would be pruned, not honoured. **If one is present, do not deploy until it has
+cleared.** The same applies later: changing a user's area renames that user's wire ids, which drops
+the latches keyed by the old ones.
+
+0009 itself refuses an install whose saved market is not `EVIDENCE_POOL_KEY`: it fails with
+`CHECK constraint failed: watch_budget` and nothing is applied (the whole file rolls back). If you
+see that error, query 1 above did not return toronto / 43.6532 / -79.3832 / 25; stop and re-plan.
 
 ## Deploy order
 
 1. Deploy the PR1 collector on the device first (it reads `targets[i].market` and falls back to the
    top-level `market`; it is safe against the current Worker).
-2. Hold the monitor lock for an hour:
+2. **Pause the collector** for steps 3-6, so no listing is ingested between the migration (which
+   seeds `listing_markets` from `listings`) and the new Worker (which writes membership on every
+   sighting). A listing ingested by the OLD Worker after 0009 gets no membership row and is invisible
+   to Preview and alerts until its next sighting after the deploy. Do not edit anything in the
+   dashboard during steps 3-6 either.
+   ```sh
+   launchctl bootout gui/$UID/com.marketplace-deal-finder.collector
+   ```
+3. Hold the monitor lock for an hour:
    ```sql
    INSERT INTO monitor_lock (id, run_id, acquired_at, expires_at)
    VALUES (1, 'HOLD', unixepoch(), unixepoch() + 3600)
    ON CONFLICT(id) DO UPDATE SET run_id = 'HOLD', acquired_at = excluded.acquired_at,
                                  expires_at = excluded.expires_at;
    ```
-3. Apply 0009: `npm run db:migrate`.
-4. Claim user 1 (lowercase, exactly as Google returns it):
+4. Apply 0009: `npm run db:migrate`.
+5. Claim user 1 with the address **exactly as it appears in `APPROVED_EMAILS`**, lowercase:
    `UPDATE users SET email = '<owner email>' WHERE user_id = 1 AND email IS NULL;`
-5. Deploy the Worker.
-6. Release the lock: `UPDATE monitor_lock SET expires_at = 0, run_id = '' WHERE id = 1;`
+   Then verify before going on: `SELECT user_id, email FROM users;` must show `1` and that exact
+   address. A typo here makes the new Worker answer `OWNER_UNCLAIMED` to the collector and degrade
+   every run -- loud, but an outage.
+6. Deploy the Worker.
+7. Release the lock: `UPDATE monitor_lock SET expires_at = 0, run_id = '' WHERE id = 1;`
+8. Restart the collector:
+   ```sh
+   launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.marketplace-deal-finder.collector.plist
+   ```
 
-Steps 3 and 4 before step 5: the new Worker answers `OWNER_UNCLAIMED` until 4 is done.
+Steps 4 and 5 before step 6: the new Worker answers `OWNER_UNCLAIMED` until 5 is done.
 
 ## Rollback
 
-1. `wrangler rollback` to the previous Worker.
-2. If user 1's rule differs from the current `search_settings` revision, write it back as a new
-   revision (percent = `minimum_discount_bp / 100`) and point `search_settings` at it.
-3. Replace `watch_targets` with user 1's rows:
-   `DELETE FROM watch_targets; INSERT INTO watch_targets (target_id, component_type, query) SELECT target_id, component_type, query FROM user_watch_targets WHERE user_id = 1;`
-4. Set `monitoring_state` and `watch_market` from user 1:
-   `UPDATE monitoring_state SET enabled = (SELECT monitoring_enabled FROM users WHERE user_id = 1), changed_at = (SELECT monitoring_changed_at FROM users WHERE user_id = 1) WHERE id = 1;`
-   `UPDATE watch_market SET location = u.location, latitude = u.latitude, longitude = u.longitude, radius_km = u.radius_km FROM (SELECT * FROM users WHERE user_id = 1) u WHERE watch_market.id = 1;`
-5. Upsert user 1's non-CANCELLED `user_notifications` back into `notifications` (same columns,
-   `ON CONFLICT (source, listing_id) DO UPDATE` every column).
-6. `NOTIFICATIONS` stays on. The 0009 tables stay; nothing reads them.
+THE ORDER IS THE POINT. The old Worker reads `notifications`, which knows nothing that was sent
+after cutover; started before step 6 below, its first notify step would re-send every alert since
+the deploy. So hold the lock and pause the collector first, restore the data, and only then roll the
+Worker back.
+
+1. Pause the collector (`launchctl bootout gui/$UID/com.marketplace-deal-finder.collector`) and hold
+   the monitor lock (the statement in Deploy order step 3).
+2. Rule: if user 1's rule differs from the current `search_settings` revision, write it back as a
+   new revision and point at it. `/ 100.0`, never `/ 100`: integer division turns 4.35% into 4%.
+   ```sql
+   INSERT INTO search_revisions (revision, mode, minimum_discount_percent, maximum_price_cents, created_at)
+   SELECT (SELECT MAX(revision) FROM search_revisions) + 1, mode,
+          CASE WHEN minimum_discount_bp IS NULL THEN NULL ELSE minimum_discount_bp / 100.0 END,
+          maximum_price_cents, unixepoch()
+     FROM users WHERE user_id = 1 AND mode IS NOT NULL;
+   UPDATE search_settings SET current_revision = (SELECT MAX(revision) FROM search_revisions) WHERE id = 1;
+   ```
+3. Watch list:
+   ```sql
+   DELETE FROM watch_targets;
+   INSERT INTO watch_targets (target_id, component_type, query)
+   SELECT target_id, component_type, query FROM user_watch_targets WHERE user_id = 1;
+   ```
+4. Start/Stop and market:
+   ```sql
+   UPDATE monitoring_state
+      SET enabled    = (SELECT monitoring_enabled    FROM users WHERE user_id = 1),
+          changed_at = (SELECT monitoring_changed_at FROM users WHERE user_id = 1)
+    WHERE id = 1;
+   UPDATE watch_market
+      SET location  = (SELECT location  FROM users WHERE user_id = 1),
+          latitude  = (SELECT latitude  FROM users WHERE user_id = 1),
+          longitude = (SELECT longitude FROM users WHERE user_id = 1),
+          radius_km = (SELECT radius_km FROM users WHERE user_id = 1)
+    WHERE id = 1 AND (SELECT location FROM users WHERE user_id = 1) IS NOT NULL;
+   ```
+5. Notifications: user 1's non-CANCELLED rows back into `notifications`, every column:
+   ```sql
+   INSERT INTO notifications (source, listing_id, model_key, status, created_at, updated_at,
+                              attempts, next_attempt_at, lease_token, lease_expires_at,
+                              last_attempt_at, sent_price_cents, sent_at, last_error)
+   SELECT source, listing_id, model_key, status, created_at, updated_at, attempts, next_attempt_at,
+          lease_token, lease_expires_at, last_attempt_at, sent_price_cents, sent_at, last_error
+     FROM user_notifications WHERE user_id = 1 AND status <> 'CANCELLED'
+   ON CONFLICT (source, listing_id) DO UPDATE SET
+     model_key = excluded.model_key, status = excluded.status, created_at = excluded.created_at,
+     updated_at = excluded.updated_at, attempts = excluded.attempts,
+     next_attempt_at = excluded.next_attempt_at, lease_token = excluded.lease_token,
+     lease_expires_at = excluded.lease_expires_at, last_attempt_at = excluded.last_attempt_at,
+     sent_price_cents = excluded.sent_price_cents, sent_at = excluded.sent_at,
+     last_error = excluded.last_error;
+   ```
+6. `wrangler rollback` to the previous Worker.
+7. Release the lock (`UPDATE monitor_lock SET expires_at = 0, run_id = '' WHERE id = 1;`) and restart
+   the collector. `NOTIFICATIONS` stays on. The 0009 tables stay; nothing reads them.
