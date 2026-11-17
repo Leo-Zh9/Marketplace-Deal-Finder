@@ -15,6 +15,7 @@
 
 import { build } from "vite";
 import { Miniflare, convertV4MiniflareOptions } from "miniflare";
+import { TEST_ALLOWLIST } from "./users";
 import { applyMigrations } from "./d1";
 
 /** Relative to the vite root, which is the project root vitest runs from. */
@@ -52,6 +53,9 @@ export const createScheduledTestWorker = async (): Promise<ScheduledTestWorker> 
       compatibilityDate: "2026-09-11",
       compatibilityFlags: ["nodejs_compat"],
       d1Databases: { DB: "test" },
+      // The deployed Worker's allowlist secret: ACTIVE users are decided by it (migrations/0009),
+      // and without it every monitoring run is DEGRADED rather than OK.
+      bindings: { APP_ENV: "production", APPROVED_EMAILS: TEST_ALLOWLIST },
       // BOTH bindings, and the second is required rather than cosmetic: without it the
       // monitoring cron reaches `create` on an undefined binding and `scheduled()` rejects.
       workflows: {

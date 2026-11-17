@@ -1,5 +1,12 @@
 # Phase 3E-b — the run lock, the monitoring Cron, the Monitoring Workflow and run telemetry
 
+> **Multi-user (migrations/0009, `docs/multi-user.md`).** Start/Stop is per user
+> (`users.monitoring_enabled`); a run records `STOPPED` only when **no user is active** (allowlisted
+> and Started), and an unusable `APPROVED_EMAILS` records `DEGRADED`. `monitoring_state` is kept for
+> rollback and read by nothing. To pause everyone from the terminal:
+> `UPDATE users SET monitoring_enabled = 0, monitoring_changed_at = unixepoch();`. The
+> `monitor_lock` HOLD below is unchanged.
+
 3E-a shipped the daily cleanup Cron and the `search_settings` / `search_revisions` pair. 3E-b
 is the other half: the `*/30 * * * *` Cron, `monitor_lock`, the Monitoring Workflow and the
 `monitor_runs` log.

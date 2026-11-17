@@ -1,7 +1,7 @@
 /**
  * WHAT THE USER IS WATCHING, DERIVED THE SAME WAY THE DASHBOARD DERIVES IT.
  *
- * The stored `watch_targets` rows go through the server's own `invert` (worker/api/watch.ts) --
+ * The user's stored `user_watch_targets` rows go through the server's own `invert` (worker/api/watch.ts) --
  * the function `GET /api/watch` uses to rebuild the form -- and come out as the `{all, pairs}`
  * pair `GET /api/verdicts` filters on. So "selected" means exactly what the dashboard means:
  *
@@ -26,8 +26,9 @@ export interface NotifySelection {
   pairs: string[];
 }
 
+/** ONE USER'S searches (migrations/0009), ordered as `GET /api/watch` orders them. ?1 user_id. */
 export const SELECT_WATCH_TARGETS = `SELECT target_id, component_type, query
-  FROM watch_targets ORDER BY target_id`;
+  FROM user_watch_targets WHERE user_id = ?1 ORDER BY target_id`;
 
 export const selectionFromTargets = (rows: readonly StoredTarget[]): NotifySelection => {
   const inverted = invert(rows);
@@ -45,9 +46,10 @@ export const selectionFromTargets = (rows: readonly StoredTarget[]): NotifySelec
   return { all, pairs };
 };
 
-export const readSelection = async (db: D1Database): Promise<NotifySelection> => {
+export const readSelection = async (db: D1Database, userId: number): Promise<NotifySelection> => {
   const read = await db
     .prepare(SELECT_WATCH_TARGETS)
+    .bind(userId)
     .all<{ target_id: string; component_type: string; query: string }>();
   return selectionFromTargets(
     read.results.map((row) => ({

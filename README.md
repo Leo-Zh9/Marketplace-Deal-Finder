@@ -202,6 +202,7 @@ one included — as deals.
 | `docs/phase-5a-settings-api.md` | the settings API contract |
 | `docs/collector-ingest.md` | the collector, the ingest route and its credential |
 | `docs/phase-4-notifications.md` | Discord deal alerts: the state machine, the failure table, the enable procedure |
+| `docs/multi-user.md` | up to three users: areas, the evidence pool, the shared search budget, per-user rules, deploy and rollback |
 
 ---
 

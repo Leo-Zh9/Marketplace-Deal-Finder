@@ -19,13 +19,13 @@
  * deliberate exception -- it MUST be fresh per execution, and §"the lease token" below is why.
  */
 
-import { loadMonitoringState } from "../api/monitoring";
 import { evaluateBatch } from "../evaluation/evaluateBatch";
 import { EVALUATION_BATCH_SIZE, type EvaluationSettings } from "../evaluation/types";
-import { resolveNotifyConfig, type NotifyEnvironment } from "../notify/config";
+import type { NotifyEnvironment } from "../notify/config";
 import type { NotifyFetch } from "../notify/deliver";
-import { runNotify, zeroCounts, type NotifyCounts } from "../notify/runNotify";
+import { runNotify, type NotifyCounts } from "../notify/runNotify";
 import { loadCurrentSettings } from "../search/settings";
+import { loadActiveUsers, readAllowlist, type Allowlist } from "../users/users";
 import type { D1Usage } from "../storage/types";
 import { COLLECTION_STEPS, type CollectionStep } from "./collection";
 import {
@@ -86,8 +86,9 @@ export type MonitorStatus =
  */
 const STATUS_RANK: Record<MonitorStatus, number> = {
   SKIPPED_LOCKED: 0,
-  // The operator's Stop (migrations/0008). Decided in the same step as NO_SETTINGS and checked
-  // before it, so a stopped install with no settings reads STOPPED -- the thing to undo first.
+  // NO USER IS ACTIVE (migrations/0009: every user Stopped, or none allowlisted). Decided in the
+  // same step as NO_SETTINGS and checked before it, so a stopped install with no settings reads
+  // STOPPED -- the thing to undo first.
   STOPPED: 1,
   NO_SETTINGS: 2,
   LOCK_LOST: 3,
@@ -336,7 +337,7 @@ export const runMonitor = async (
   params: MonitorParams,
   runId: string,
   options: MonitorOptions = {},
-  notifyEnvironment: NotifyEnvironment = {},
+  notifyEnvironment: NotifyEnvironment & { APPROVED_EMAILS?: string } = {},
 ): Promise<MonitorRun> => {
   // POSITIONAL, not a payload field and not an option: `runId` is `event.instanceId`, which is
   // stable across replays and step retries and is not forgeable from a hand-written payload.
@@ -529,9 +530,8 @@ export const runMonitor = async (
     return finalize();
   }
 
-  // 2. THE SETTINGS. `search_settings` is EMPTY until someone runs the documented bootstrap,
-  //    so `null` is the state of production right now and a run that throws on it is a silent
-  //    failure every 30 minutes.
+  // 2. THE SETTINGS. `search_settings` is the frozen DISCOUNT evidence rule (migrations/0009 seeds
+  //    one), and a run that throws on its absence is a silent failure every 30 minutes.
   //
   //    IT DOES NOT DEFAULT, and that is the load-bearing half. A drain under a fabricated
   //    revision 0, followed by an operator bootstrapping their own revision 0, leaves every
@@ -539,25 +539,48 @@ export const runMonitor = async (
   //    tiers, carrying a verdict computed from settings nobody chose, unrecoverable without a
   //    manual revision bump.
   //
-  //    THE STOP FLAG IS READ IN THE SAME STEP, so it costs no step and is memoized with the
+  //    WHO IS ACTIVE IS READ IN THE SAME STEP, so it costs no step and is memoized with the
   //    settings it gates. `stopped` is OPTIONAL on purpose: a step result memoized by a Worker
   //    older than this field has none, and that reads as running -- the state it was in. Its row
   //    read goes through `spend()` like every other statement, so the run's telemetry stays exact.
-  //    STOPPED IS CHECKED FIRST: the operator's Stop is the thing to undo before a missing rule.
-  const loaded: Awaited<ReturnType<typeof loadCurrentSettings>> & { stopped?: boolean } =
+  //    STOPPED (no user active) IS CHECKED FIRST: a Stop is the thing to undo before a missing rule.
+  //
+  //    THE ALLOWLIST IS PARSED BEFORE THE STEP, and an unusable one DEGRADES the run rather than
+  //    reading as "nobody is active": that would record STOPPED, and STOPPED is not a warning.
+  let allowlist: Allowlist;
+  try {
+    allowlist = readAllowlist(notifyEnvironment);
+  } catch (error) {
+    recordError(`load-settings: ${String(error)}`);
+    escalate("DEGRADED");
+    return finalize();
+  }
+  const loaded: Awaited<ReturnType<typeof loadCurrentSettings>> & {
+    stopped?: boolean;
+    ownerClaimed?: boolean;
+  } =
     await runStep("load-settings", async () => {
       const current = await loadCurrentSettings(db);
-      const state = await loadMonitoringState(db);
+      const active = await loadActiveUsers(db, allowlist);
       return {
         settings: current.settings,
-        stopped: state.monitoring.state === "stopped",
+        stopped: active.users.length === 0,
+        ownerClaimed: active.ownerClaimed,
         usage: {
-          rowsRead: current.usage.rowsRead + state.usage.rowsRead,
-          rowsWritten: current.usage.rowsWritten + state.usage.rowsWritten,
+          rowsRead: current.usage.rowsRead + active.usage.rowsRead,
+          rowsWritten: current.usage.rowsWritten + active.usage.rowsWritten,
         },
       };
     });
   spend(loaded.usage);
+  // AN UNCLAIMED OR MIS-CLAIMED OWNER DEGRADES THE RUN. Read as "nobody is active" it would record
+  // STOPPED -- which does not warn -- while the operator's install collects nothing. Missing on a
+  // result memoized by an older Worker, which reads as claimed: the state it was recorded in.
+  if (loaded.ownerClaimed === false) {
+    recordError("load-settings: OWNER_UNCLAIMED: user 1 has no email the allowlist approves");
+    escalate("DEGRADED");
+    return finalize();
+  }
   if (loaded.stopped === true) {
     escalate("STOPPED");
     return finalize();
@@ -721,12 +744,12 @@ export const runMonitor = async (
   //    its fetch and `params.now` is frozen, so the step's one retry cannot claim or sweep a row
   //    the first execution left SENDING. In the inert states the body makes no D1 query at all.
   //
-  //    A STOP PRESSED WHILE THIS RUN WAS DRAINING SENDS NOTHING. `load-settings` read the flag
-  //    minutes ago; alerting after the operator pressed Stop is the one thing Stop promises not to
-  //    do. So the body re-reads it -- inside the step, so it is memoized with the result -- but only
-  //    when notifications are ON: an inert step still makes no D1 query, which keeps R16's pin. The
-  //    read is spent like every other statement. Stopped returns zero counts; PENDING rows stay
-  //    PENDING for the first run after Start.
+  //    A STOP PRESSED WHILE THIS RUN WAS DRAINING SENDS NOTHING. `load-settings` read the flags
+  //    minutes ago; alerting after a user pressed Stop is the one thing Stop promises not to do. So
+  //    runNotify re-reads the user it sends for -- inside the step, so it is memoized with the
+  //    result -- and only when notifications are ON: an inert step still makes no D1 query, which
+  //    keeps R16's pin. A user who is not active gets zero counts; PENDING rows stay PENDING for the
+  //    first run after Start.
   //
   //    A step result memoized by a Worker older than this shape is a bare NotifyCounts with no
   //    `counts` key; it is read as the counts it is, with no usage.
@@ -736,18 +759,13 @@ export const runMonitor = async (
         "notify",
         async () => {
           const usage: D1Usage = { rowsRead: 0, rowsWritten: 0 };
-          if (resolveNotifyConfig(notifyEnvironment).state === "on") {
-            const state = await loadMonitoringState(db);
-            usage.rowsRead += state.usage.rowsRead;
-            usage.rowsWritten += state.usage.rowsWritten;
-            if (state.monitoring.state === "stopped") return { counts: zeroCounts("on"), usage };
-          }
           const counts = await runNotify(db, {
             environment: notifyEnvironment,
             now: params.now,
             fetch: options.notifyFetch ?? globalFetch,
             leaseTokenPrefix: `${runId}:notify`,
             timeoutMs: options.notifyTimeoutMs,
+            usage,
           });
           return { counts, usage };
         },

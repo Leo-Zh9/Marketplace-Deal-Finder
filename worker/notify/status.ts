@@ -23,14 +23,24 @@ import { resolveNotifyConfig, type NotifyEnvironment, type NotifyState } from ".
 
 export const SENT_WINDOW_SECONDS = 86_400;
 
+/**
+ * THE CALLER'S OWN ROWS (migrations/0009), every subquery scoped by `user_id = ?2`: one user's
+ * page never counts another user's alerts, and `webhook-rejected` is the caller's own webhook's
+ * latest answer.
+ */
 export const SELECT_NOTIFY_STATUS = `SELECT
-  (SELECT COUNT(*) FROM notifications WHERE status IN ('PENDING', 'SENDING'))   AS pending,
-  (SELECT COUNT(*) FROM notifications WHERE status = 'SENT' AND sent_at >= ?1)  AS sent_24h,
-  (SELECT COUNT(*) FROM notifications WHERE status = 'DELIVERY_UNKNOWN')        AS delivery_unknown,
-  (SELECT COUNT(*) FROM notifications WHERE status = 'FAILED')                  AS failed,
-  (SELECT MAX(sent_at) FROM notifications WHERE status = 'SENT')                AS last_sent_at,
-  (SELECT COALESCE(last_error, '') LIKE 'webhook-rejected%' FROM notifications
-    WHERE last_attempt_at IS NOT NULL
+  (SELECT COUNT(*) FROM user_notifications
+    WHERE user_id = ?2 AND status IN ('PENDING', 'SENDING'))                    AS pending,
+  (SELECT COUNT(*) FROM user_notifications
+    WHERE user_id = ?2 AND status = 'SENT' AND sent_at >= ?1)                   AS sent_24h,
+  (SELECT COUNT(*) FROM user_notifications
+    WHERE user_id = ?2 AND status = 'DELIVERY_UNKNOWN')                         AS delivery_unknown,
+  (SELECT COUNT(*) FROM user_notifications
+    WHERE user_id = ?2 AND status = 'FAILED')                                   AS failed,
+  (SELECT MAX(sent_at) FROM user_notifications
+    WHERE user_id = ?2 AND status = 'SENT')                                     AS last_sent_at,
+  (SELECT COALESCE(last_error, '') LIKE 'webhook-rejected%' FROM user_notifications
+    WHERE user_id = ?2 AND last_attempt_at IS NOT NULL
     ORDER BY last_attempt_at DESC, COALESCE(last_error, '') LIKE 'webhook-rejected%' DESC
     LIMIT 1)                                                                    AS rejected`;
 
@@ -59,14 +69,15 @@ export const readNotificationsStatus = async (
   db: D1Database | undefined,
   environment: NotifyEnvironment,
   now: number,
+  userId: number | null,
 ): Promise<NotificationsStatus> => {
   const config = resolveNotifyConfig(environment);
   if (config.state !== "on") return { state: config.state };
-  if (db === undefined) return { state: "on" };
+  if (db === undefined || userId === null) return { state: "on" };
 
   let row: StatusRow | undefined;
   try {
-    const read = await db.prepare(SELECT_NOTIFY_STATUS).bind(now - SENT_WINDOW_SECONDS).all<StatusRow>();
+    const read = await db.prepare(SELECT_NOTIFY_STATUS).bind(now - SENT_WINDOW_SECONDS, userId).all<StatusRow>();
     row = read.results[0];
   } catch {
     console.warn("status: the notifications table could not be read");

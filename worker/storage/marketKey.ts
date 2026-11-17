@@ -59,3 +59,17 @@ export const marketKey = (market: Market): string => {
 
   return `${fixed(latitude)},${fixed(longitude)}|${Math.round(radiusKm)}km`;
 };
+
+/**
+ * THE ONE EVIDENCE POOL (migrations/0009). recordSightings binds THIS, never the sighting's own
+ * market, into the content hash, the observation, the aggregate and `listings.market_key` -- so
+ * every user's area feeds one set of price averages, and a listing seen from two overlapping areas
+ * is one listing with one contribution instead of a contribution that MOVES between two markets on
+ * every run. WHICH areas saw it is `listing_markets`, keyed by `marketKey(envelope.market)`.
+ *
+ * IT IS THE INSTALL'S MARKET KEY AT THE TIME 0009 SHIPPED (downtown Toronto, 25 km), and it must stay
+ * byte-identical to it: then every stored hash, observation, aggregate and listing row is already in
+ * the pool, and nothing is rewritten. The operator pre-flight verifies the saved key equals this.
+ * It is a NAME, not a location: no search runs at it.
+ */
+export const EVIDENCE_POOL_KEY = "43.6532,-79.3832|25km";

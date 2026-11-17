@@ -11,7 +11,12 @@ import { ModelSelector } from "./components/ModelSelector";
 import { ApiRequestError, type AuthenticatedIdentity } from "./auth/authTypes";
 import { componentById, mockLocations } from "./data/catalog";
 import { requestErrorMessage } from "./services/apiClient";
-import { marketplaceClient, settingsToDealRule } from "./services/marketplaceClient";
+import { budgetFullMessage } from "./utils/budget";
+import {
+  marketplaceClient,
+  settingsToDealRule,
+  type WatchWire,
+} from "./services/marketplaceClient";
 import {
   preservableTargets,
   queryFor,
@@ -136,6 +141,8 @@ const newerReading =
 function App({ identity, onSignOut, getToken }: AppProps) {
   const [settings, setSettings] = useState<SearchSettings>(initialSettings);
   const [storedTargets, setStoredTargets] = useState<StoredTarget[]>([]);
+  /** The SHARED budget as the Worker last reported it; null until a read carries one. */
+  const [sharedBudget, setSharedBudget] = useState<WatchWire["budget"] | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [radiusMode, setRadiusMode] = useState<"2" | "5" | "10" | "25" | "custom">("25");
   const [errors, setErrors] = useState<ValidationErrors>({});
@@ -209,6 +216,7 @@ function App({ identity, onSignOut, getToken }: AppProps) {
             : (String(radiusKm) as typeof radiusMode),
         );
         setStoredTargets(watch.storedTargets);
+        setSharedBudget(watch.budget ?? null);
         setLoaded(true);
       } catch (error: unknown) {
         if (cancelled) return;
@@ -520,16 +528,15 @@ function App({ identity, onSignOut, getToken }: AppProps) {
        * its own `LIMIT 50`, so a page of a component the user is not watching can no longer arrive
        * and be filtered to nothing in the browser.
        *
-       * THE MARKET IS THE SAVED ONE, NOT THE FORM'S. The read filters on the market key of the
-       * SAVED `watch_market` row, so rows collected in an old market no longer reach the page after
-       * a saved location change -- nothing deletes them from `listings`, so before that filter they
-       * stayed here indefinitely, DEALs first. The form's UNSAVED `location` and `radiusKm` are
-       * still REQUIRED to press this button (validate() refuses without them) and still reach
-       * nothing here: listings exist only for a market the collector has run in, and it runs in the
-       * saved one, so an unsaved market has nothing stored to show. That is disclosed on screen
-       * rather than applied. The DEAL RULE is the same: a verdict is committed by `evaluateBatch`
-       * against the STORED revision, so an UNSAVED rule edit previews against the saved rule. The
-       * action-help line under the buttons says both.
+       * THE AREA IS THE SAVED ONE, NOT THE FORM'S. The read filters on the user's SAVED area
+       * (migrations/0009: `users.location`/`radius_km`, matched through `listing_markets`), so
+       * listings seen only in an old area no longer reach the page after a saved location change.
+       * The form's UNSAVED `location` and `radiusKm` are still REQUIRED to press this button
+       * (validate() refuses without them) and still reach nothing here: a listing is a member of
+       * an area only once the collector has searched it. That is disclosed on screen rather than
+       * applied. The DEAL RULE is the same: the page applies the user's STORED rule, so an UNSAVED
+       * rule edit previews against the saved rule. The action-help line under the buttons says
+       * both.
        */
       const result = await marketplaceClient.preview(settings, getToken);
       setListings(result.listings);
@@ -583,6 +590,7 @@ function App({ identity, onSignOut, getToken }: AppProps) {
       // that was preserved for a type the form deselected comes back as a SELECTED TYPE, because
       // that row is still being collected -- showing it unticked would be the lie.
       setStoredTargets(written.storedTargets);
+      setSharedBudget(written.budget ?? null);
       setSettings((current) => ({
         ...current,
         components: written.selection.components,
@@ -605,6 +613,13 @@ function App({ identity, onSignOut, getToken }: AppProps) {
       await marketplaceClient.saveDealRule(settings.dealRule, getToken);
       setSavedAt(new Date().toISOString());
     } catch (error: unknown) {
+      // THE SHARED BUDGET (migrations/0009): every user's searches share 9 Facebook requests, and
+      // the Worker refused this save atomically -- nothing was written. Say how much is in use and
+      // how much of it is this user's, which is the part they can free.
+      if (error instanceof ApiRequestError && error.code === "WATCH_BUDGET_FULL") {
+        setRequestError(budgetFullMessage(error.details));
+        return;
+      }
       /*
        * "NOTHING WAS CHANGED" WAS A FALSE CLAIM ABOUT THE OPERATOR'S DATA, and the D-3 reordering
        * cannot fix it: this fallback is reached only when the throw is NOT an `ApiRequestError`,
@@ -721,6 +736,17 @@ function App({ identity, onSignOut, getToken }: AppProps) {
             <p className="budget-line" data-testid="budget">
               {targetCount} of {MAX_WATCH_TARGETS} searches used
             </p>
+            {/*
+             * THE CAP THE 409 ENFORCES IS SHARED (migrations/0009), so the line above -- this form's
+             * own list -- is not the whole story: another user's searches spend the same nine.
+             * As stored at the last load or save, which is what the Worker will count.
+             */}
+            {sharedBudget && (
+              <p className="muted-copy" data-testid="shared-budget">
+                {sharedBudget.used} of {sharedBudget.maximum} shared searches used ({sharedBudget.yours}{" "}
+                yours)
+              </p>
+            )}
             {errors.targets && (
               <p className="field-error" role="alert">
                 {errors.targets}
@@ -852,7 +878,7 @@ function App({ identity, onSignOut, getToken }: AppProps) {
                * read zero.
                */}
               <p className="muted-copy" data-testid="radius-warning">
-                Changing the location or radius starts your price benchmarks over.
+                Price benchmarks are shared across everyone's areas, so changing yours keeps them.
               </p>
             </div>
 
@@ -891,7 +917,7 @@ function App({ identity, onSignOut, getToken }: AppProps) {
             </p>
             {/*
               * ON SCREEN, because the surprise is reachable in one click: Preview reads listings
-              * collected in the SAVED market and judged against the SAVED deal rule, so editing the
+              * seen in the SAVED area and judged against the SAVED deal rule, so editing the
               * location, radius or rule and previewing without saving shows the saved ones.
               */}
             <p className="action-help" data-testid="preview-scope">

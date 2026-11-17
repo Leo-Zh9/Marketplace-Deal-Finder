@@ -85,12 +85,30 @@ if [ "${1:-}" = "--serve" ]; then
   for _ in $(seq 1 40); do $CURL -sf -o /dev/null "$BASE/api/status" --max-time 2 && break; sleep 1; done
 fi
 
-# MONITORING STARTS RUNNING ON EVERY RUN OF THIS GATE. A previous run killed inside the Start/Stop
-# section would leave the local row stopped, and then every collector run below would log
-# `kind:stopped`, exit 0 and collect nothing -- 20-odd assertions going red for a reason none of
-# them names. An UPSERT, so it also works on a database whose seed row was deleted.
-sql "INSERT INTO monitoring_state (id, enabled, changed_at) VALUES (1, 1, 0)
-     ON CONFLICT(id) DO UPDATE SET enabled = 1;" >/dev/null
+# THE OWNER IS CLAIMED, exactly as the runbook claims it after migrating (migrations/0009): user 1
+# is the default loopback identity, local-dev@localhost. Without the claim every browser route
+# answers 503 OWNER_UNCLAIMED.
+#
+# MONITORING STARTS RUNNING FOR THE OWNER ON EVERY RUN OF THIS GATE, AND STOPPED FOR EVERYONE ELSE.
+# A previous run killed inside the Start/Stop section would leave the owner stopped, and then every
+# collector run below would log `kind:stopped`, exit 0 and collect nothing -- 20-odd assertions
+# going red for a reason none of them names. The two-identity section's users are stopped and
+# their searches dropped, so a previous run's alice and bob cannot widen the collector's list.
+sql "UPDATE users SET email = 'local-dev@localhost' WHERE user_id = 1 AND email IS NULL;
+     UPDATE users SET monitoring_enabled = 1 WHERE user_id = 1;
+     UPDATE users SET monitoring_enabled = 0 WHERE user_id <> 1;
+     DELETE FROM user_watch_targets WHERE user_id <> 1;" >/dev/null
+
+# THE FROZEN EVIDENCE RULE (migrations/0009): a DISCOUNT revision the drain evaluates under. No API
+# writes it any more, so this gate writes it the way 0009 does. evidence_rule <percent>
+evidence_rule() {
+  sql "DELETE FROM search_settings; DELETE FROM search_revisions;
+       INSERT INTO search_revisions (revision, mode, minimum_discount_percent, maximum_price_cents, created_at)
+       VALUES (0, 'DISCOUNT', $1, NULL, 0);
+       INSERT INTO search_settings (id, current_revision) VALUES (1, 0);" >/dev/null
+}
+# The owner's own rule, cleared: what a fresh user has.
+no_rule() { sql "UPDATE users SET mode = NULL, minimum_discount_bp = NULL, maximum_price_cents = NULL WHERE user_id = 1;" >/dev/null; }
 
 echo "== auth and CORS =="
 is "loopback dev identity is accepted"        200 "$(code -H "Origin: $ORIGIN" "$BASE/api/status")"
@@ -133,19 +151,23 @@ is "  ...and on /api/monitoring/stop"         204 "$(pf /api/monitoring/stop POS
 is "  ...while GET is refused there"          403 "$(pf /api/monitoring/stop GET)"
 
 echo "== settings write path =="
-sql "DELETE FROM search_settings; DELETE FROM search_revisions;" >/dev/null
+# THE CALLER'S RULE, ON THEIR users ROW (migrations/0009). The evidence rule is frozen: no PUT here
+# may touch search_revisions or search_settings.
+evidence_rule 0
+no_rule
 is "GET with no settings is 200"              200 "$(code -H "Origin: $ORIGIN" "$BASE/api/settings")"
 is "  ...and the body says null"              '{"settings":null}' "$(body)"
 
 put() { code -X PUT -H "Origin: $ORIGIN" -H "Content-Type: application/json" -d "$1" "$BASE/api/settings"; }
 is "a valid PUT is accepted"                  200 "$(put '{"mode":"MAXIMUM_PRICE","minimumDiscountPercent":null,"maximumPriceCents":74900}')"
 has "  ...and reports changed"                '"changed":true' "$(body)"
-is "  ...and the row reached D1"              74900 "$(val 'SELECT maximum_price_cents FROM search_revisions WHERE revision=0')"
+is "  ...and the row reached D1"              74900 "$(val 'SELECT maximum_price_cents FROM users WHERE user_id = 1')"
 is "an identical PUT is idempotent"           200 "$(put '{"mode":"MAXIMUM_PRICE","minimumDiscountPercent":null,"maximumPriceCents":74900}')"
 has "  ...and reports NO change"              '"changed":false' "$(body)"
-is "  ...and wrote no second revision"        1 "$(val 'SELECT COUNT(*) FROM search_revisions')"
-is "a changed PUT bumps the revision"         200 "$(put '{"mode":"MAXIMUM_PRICE","minimumDiscountPercent":null,"maximumPriceCents":61250}')"
-has "  ...to revision 1"                      '"searchRevision":1' "$(body)"
+is "  ...and the evidence rule is untouched"  1 "$(val 'SELECT COUNT(*) FROM search_revisions')"
+is "a changed PUT is stored"                  200 "$(put '{"mode":"MAXIMUM_PRICE","minimumDiscountPercent":null,"maximumPriceCents":61250}')"
+has "  ...and reported back"                  '"maximumPriceCents":61250' "$(body)"
+is "  ...still without a new revision"        0 "$(val 'SELECT MAX(revision) FROM search_revisions')"
 
 echo "== settings rejections =="
 is "an unstorable field is refused"           400 "$(put '{"mode":"MAXIMUM_PRICE","maximumPriceCents":74900,"radiusKm":25}')"
@@ -160,13 +182,14 @@ sql "DELETE FROM monitor_runs" >/dev/null; sql "DELETE FROM monitor_lock" >/dev/
 fire '*/30 * * * *'
 until_val 'SELECT COUNT(*) FROM monitor_runs' 1
 is "a configured run reports OK"              OK "$(val 'SELECT status FROM monitor_runs ORDER BY run_seq DESC LIMIT 1')"
-is "  ...at the revision the API wrote"       1 "$(val 'SELECT search_revision FROM monitor_runs ORDER BY run_seq DESC LIMIT 1')"
+is "  ...at the evidence rule's revision"     0 "$(val 'SELECT search_revision FROM monitor_runs ORDER BY run_seq DESC LIMIT 1')"
 # The control. Without it, "OK" could be a default rather than a reading of the settings.
 sql "DELETE FROM search_settings" >/dev/null; sql "DELETE FROM monitor_lock" >/dev/null
 sql "DELETE FROM monitor_runs" >/dev/null
 fire '*/30 * * * *'
 until_val 'SELECT COUNT(*) FROM monitor_runs' 1
 is "an unconfigured run reports NO_SETTINGS"  NO_SETTINGS "$(val 'SELECT status FROM monitor_runs ORDER BY run_seq DESC LIMIT 1')"
+evidence_rule 0
 
 echo "== the cron guard routes each schedule to its own workflow =="
 # The guard exists because both crons reach one handler. If it broke, the daily cleanup
@@ -190,7 +213,7 @@ echo "== the collector ingest path =="
 # DEAL -- the exact verdict PR #6 exists to prevent. Anywhere between those two points, a
 # monitoring run would put that DEAL inside the gate. Moving this section earlier reintroduces it.
 # Truncating at both ends is what keeps a re-run from draining the previous run's leftovers.
-ingest_tables() { sql "DELETE FROM listings; DELETE FROM price_observations; DELETE FROM model_stats; DELETE FROM evaluation_tasks;" >/dev/null; }
+ingest_tables() { sql "DELETE FROM listings; DELETE FROM price_observations; DELETE FROM model_stats; DELETE FROM evaluation_tasks; DELETE FROM listing_markets;" >/dev/null; }
 ingest_tables
 
 # THE WATCH LIST IS RESET HERE, AND THE RESET IS LOAD-BEARING. THE FIX FOR A RED GATE BELOW IS TO
@@ -219,9 +242,9 @@ ingest_tables
 # So: point the market at the values the merged assertions already use, and keep exactly ONE
 # target. market_key stays 43.5123,-79.8765|18km and all 24 existing collector assertions survive
 # byte-for-byte.
-sql "UPDATE watch_market SET location='toronto', latitude=43.5123, longitude=-79.8765, radius_km=18 WHERE id=1;
-     DELETE FROM watch_targets;
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('e2e-gpu', 'gpu', 'graphics card');" >/dev/null
+sql "UPDATE users SET location='toronto', latitude=43.5123, longitude=-79.8765, radius_km=18 WHERE user_id=1;
+     DELETE FROM user_watch_targets WHERE user_id = 1;
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'e2e-gpu', 'gpu', 'graphics card');" >/dev/null
 
 ING="$BASE/api/listings"
 MINI='{"source":"facebook-marketplace","componentType":"gpu","market":{"latitude":43.5123,"longitude":-79.8765,"radiusKm":18},"listings":[]}'
@@ -246,8 +269,11 @@ is "  ...with a WRONG token too"               401 "$(wt -H 'X-Collector-Token: 
 is "a valid token from the ALLOWED origin"     403 "$(wt -H "X-Collector-Token: $COLLECTOR_TOKEN" -H "Origin: $ORIGIN")"
 is "the watch-list preflight is refused"       403 "$(pf /api/watch-targets GET)"
 is "a valid token with no Origin reads it"     200 "$(wt -H "X-Collector-Token: $COLLECTOR_TOKEN")"
-has "  ...carrying the seeded target"          '"targetId":"e2e-gpu"' "$(body)"
+# THE WIRE ID IS ONE PER FACEBOOK REQUEST (migrations/0009): type, query slug, area -- whatever
+# the owner's own row is called.
+has "  ...carrying the seeded target"          '"targetId":"gpu-graphics-card@toronto-18"' "$(body)"
 has "  ...and the market alongside it"         '"radiusKm":18' "$(body)"
+has "  ...and on the target itself"            '"query":"graphics card","market":{"location":"toronto"' "$(body)"
 
 echo "== the health report the collector writes =="
 # E-9. THE SAME CREDENTIAL ON THE SAME TERMS AS THE TWO ROUTES ABOVE: no browser channel, no
@@ -315,7 +341,7 @@ collect
 is "the collector run exits 0"                 0 "$COLLECTOR_EXIT"
 has "  ...emitting a run line"                 '"kind":"run"' "$(cat /tmp/e2e-collector.out)"
 has "  ...for the ONE server-side target"      '"targets":1,"complete":true,"exitCode":0,"exitCodes":{"0":1}' "$(cat /tmp/e2e-collector.out)"
-has "  ...naming that target"                  '"target":"e2e-gpu"' "$(cat /tmp/e2e-collector.out)"
+has "  ...naming that target"                  '"target":"gpu-graphics-card@toronto-18"' "$(cat /tmp/e2e-collector.out)"
 # NOT cosmetic: a launchd env file with COLLECTOR_DRY_RUN set reports complete:true, exitCode:0
 # forever while collecting nothing, and this is the one field that distinguishes that state.
 has "  ...and NOT a dry run"                   '"dryRun":false' "$(cat /tmp/e2e-collector.out)"
@@ -474,14 +500,15 @@ echo "== multi-target: a partial failure drops nothing =="
 # shapes a URL that is never fetched. The exit codes, the stored-listing counts, the wall-time
 # bound and `delayMs` are all unchanged, and the block is not resized.
 #
-# FULLY OFFLINE, NO SECOND FIXTURE. `a-bad` carries component_type='gpuu': storable (0005 puts no
-# CHECK on that column, deliberately) and refused LOUDLY by the ingest route as 400
-# INVALID_LISTINGS -> exit 6. It sorts FIRST, so the two good targets run AFTER a failure.
+# FULLY OFFLINE, NO SECOND FIXTURE. `a-bad` carries component_type='agpu': storable (no CHECK on
+# that column, deliberately) and refused LOUDLY by the ingest route as 400 INVALID_LISTINGS ->
+# exit 6. Its wire id `agpu-...` sorts FIRST (ids are `type-query@area` since migrations/0009), so
+# the two good targets run AFTER a failure.
 ingest_tables
-sql "DELETE FROM watch_targets;
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('a-bad', 'gpuu', 'graphics card');
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('b-gpu', 'gpu', 'rtx');
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('c-gpu', 'gpu', 'radeon');" >/dev/null
+sql "DELETE FROM user_watch_targets WHERE user_id = 1;
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'a-bad', 'agpu', 'graphics card');
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'b-gpu', 'gpu', 'rtx');
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'c-gpu', 'gpu', 'radeon');" >/dev/null
 # THIS BLOCK RUNS AT A REAL, NON-ZERO DELAY, AND THE WALL-TIME ASSERTION BELOW IS WHY.
 #
 # MEASURED HOLE THIS CLOSES: every unit test injects `sleep` and asserts it was CALLED with the
@@ -513,7 +540,7 @@ has "  ...pinning every per-target outcome"    '"targets":3,"complete":false,"ex
 # The half the counters cannot say: the two good targets' listings STILL REACHED D1 although the
 # failing target ran FIRST.
 is "  ...and the good targets still wrote"     4 "$(val "SELECT COUNT(*) FROM listings WHERE component_type='gpu'")"
-is "  ...and the bad target wrote nothing"     0 "$(val "SELECT COUNT(*) FROM listings WHERE component_type='gpuu'")"
+is "  ...and the bad target wrote nothing"     0 "$(val "SELECT COUNT(*) FROM listings WHERE component_type='agpu'")"
 has "  ...at the delay it was given"           "\"delayMs\":$MT_DELAY_MS" "$(cat /tmp/e2e-collector.out)"
 # THE MECHANISM, not the reported value: three targets means TWO real sleeps.
 atleast "  ...and REALLY slept between them (${MT_ELAPSED}ms)" "$MT_FLOOR_MS" "$MT_ELAPSED"
@@ -537,7 +564,7 @@ atleast "  ...and REALLY slept between them (${MT_ELAPSED}ms)" "$MT_FLOOR_MS" "$
 # is the `a` of the reported pair. `COLLECTOR_LIMIT=4` is set, so the 6 also pins that the ids are
 # the PARSED set and not the posted slice.
 has "  ...and no feed alarm fires below the floor" '"alarms":[]' "$(cat /tmp/e2e-collector.out)"
-has "  ...while the overlap IS measured at 6 of 6" '"overlap":{"a":"a-bad","b":"b-gpu","shared":6,"of":6}' "$(cat /tmp/e2e-collector.out)"
+has "  ...while the overlap IS measured at 6 of 6" '"overlap":{"a":"agpu-graphics-card@toronto-18","b":"gpu-radeon@toronto-18","shared":6,"of":6}' "$(cat /tmp/e2e-collector.out)"
 has "  ...and the run was not cut"             '"canary":false' "$(cat /tmp/e2e-collector.out)"
 
 echo "== the guard: three empty runs latch, the fourth is a probe =="
@@ -557,10 +584,10 @@ echo "== the guard: three empty runs latch, the fourth is a probe =="
 # G-8, G-10, G-17, G-18, G-11, G-12) and that is stated rather than papered over; E-4 above tests
 # the floor, not the trip.
 ingest_tables
-sql "DELETE FROM watch_targets;
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('x-one', 'gpu', 'graphics card');
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('y-two', 'gpu', 'rtx');
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('z-three', 'gpu', 'radeon');" >/dev/null
+sql "DELETE FROM user_watch_targets WHERE user_id = 1;
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'x-one', 'gpu', 'graphics card');
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'y-two', 'gpu', 'rtx');
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'z-three', 'gpu', 'radeon');" >/dev/null
 rm -f "$COLLECTOR_STATE"
 
 empty_run() {
@@ -586,7 +613,7 @@ is "the second empty run exits 3"              3 "$COLLECTOR_EXIT"
 has "  ...and STILL no alarm at two runs"      '"alarms":[]' "$(cat /tmp/e2e-collector.out)"
 empty_run
 is "the third empty run exits 3"               3 "$COLLECTOR_EXIT"
-has "  ...and the third run latches all three" '"alarms":["source-empty:x-one","source-empty:y-two","source-empty:z-three"]' "$(cat /tmp/e2e-collector.out)"
+has "  ...and the third run latches all three" '"alarms":["source-empty:gpu-graphics-card@toronto-18","source-empty:gpu-radeon@toronto-18","source-empty:gpu-rtx@toronto-18"]' "$(cat /tmp/e2e-collector.out)"
 # THE LATCH DOES NOT CUT THE RUN THAT PRODUCED IT: the three requests were already made by the
 # time the third consecutive failure existed. The cut starts on the next run.
 has "  ...without cutting that same run"       '"canary":false' "$(cat /tmp/e2e-collector.out)"
@@ -600,21 +627,25 @@ is "the fourth run is a probe and exits 3"     3 "$COLLECTOR_EXIT"
 is "  ...running TWO targets, not three"       2 "$(grep -c '"kind":"target"' /tmp/e2e-collector.out)"
 has "  ...reporting the cut and the full count" '"targets":3,"complete":false,"exitCode":3,"exitCodes":{"3":2}' "$(cat /tmp/e2e-collector.out)"
 has "  ...as a canary run"                     '"canary":true' "$(cat /tmp/e2e-collector.out)"
-has "  ...with the causes still latched"       '"source-empty:x-one"' "$(cat /tmp/e2e-collector.out)"
+has "  ...with the causes still latched"       '"source-empty:gpu-graphics-card@toronto-18"' "$(cat /tmp/e2e-collector.out)"
 # THE PAGE SAYS SO TOO, which is the whole point: the exit code is 3 either way, so the reduction
 # is only visible here and on the dashboard.
 is "  ...and /api/status reports the cut"      200 "$(code -H "Origin: $ORIGIN" "$BASE/api/status")"
 has "  ...as degraded"                         '"status":"degraded"' "$(body)"
 has "  ...naming the canary"                   '"canary"' "$(body)"
-has "  ...and the cause with its target"       '"source-empty:x-one"' "$(body)"
+has "  ...and the cause with its target"       '"source-empty:gpu-graphics-card@toronto-18"' "$(body)"
 has "  ...over the count the SERVER returned"  '"targets":3' "$(body)"
 
 # E-5. THE PRUNE, AND IT IS LOAD-BEARING RATHER THAN TIDY. `watch_targets` has no `enabled`
 # column, so DELETING a row is the only way to pause a search -- and a latched cause whose
 # targets are all gone would otherwise yield an EMPTY PROBE SET: a run that makes zero requests,
 # stores nothing and exits 0. The mutation (pruning `consecutive` only) produces exactly that.
-sql "DELETE FROM watch_targets;
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('e2e-gpu', 'gpu', 'graphics card');" >/dev/null
+#
+# THE NEW TARGET IS A DIFFERENT SEARCH. Since migrations/0009 the wire id is `type-query@area`, so
+# re-adding gpu / 'graphics card' would be the SAME Facebook request as x-one and rightly keep its
+# latch; 'video card' is a genuinely new search, whose arrival strands all three causes.
+sql "DELETE FROM user_watch_targets WHERE user_id = 1;
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'e2e-gpu', 'gpu', 'video card');" >/dev/null
 collect
 is "replacing the watch list exits 0"          0 "$COLLECTOR_EXIT"
 is "  ...running the ONE new target"           1 "$(grep -c '"kind":"target"' /tmp/e2e-collector.out)"
@@ -628,17 +659,17 @@ has "  ...and the stranded causes pruned"      '"alarms":[]' "$(cat /tmp/e2e-col
 # wrong for 45 minutes and then BLAMED THE LAPTOP (`stale`) for a bad watch list.
 HEALTH_BEFORE=$(val 'SELECT reported_at FROM collector_health WHERE id = 1')
 STATE_BEFORE=$(cksum "$COLLECTOR_STATE" | awk '{print $1}')
-sql "DELETE FROM watch_targets;
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('c01','gpu','graphics card');
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('c02','gpu','graphics card');
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('c03','gpu','graphics card');
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('c04','gpu','graphics card');
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('c05','gpu','graphics card');
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('c06','gpu','graphics card');
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('c07','gpu','graphics card');
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('c08','gpu','graphics card');
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('c09','gpu','graphics card');
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('c10','gpu','graphics card');" >/dev/null
+sql "DELETE FROM user_watch_targets WHERE user_id = 1;
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'c01','gpu','graphics card 01');
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'c02','gpu','graphics card 02');
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'c03','gpu','graphics card 03');
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'c04','gpu','graphics card 04');
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'c05','gpu','graphics card 05');
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'c06','gpu','graphics card 06');
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'c07','gpu','graphics card 07');
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'c08','gpu','graphics card 08');
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'c09','gpu','graphics card 09');
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'c10','gpu','graphics card 10');" >/dev/null
 collect
 is "an over-the-cap list exits 2"              2 "$COLLECTOR_EXIT"
 is "  ...having run NOTHING"                   0 "$(grep -c '"kind":"target"' /tmp/e2e-collector.out)"
@@ -660,9 +691,9 @@ echo "== two rows with the SAME query are one search, not a feed =="
 # construction. Without the guard the pair reports 6 of 6 and -- at a denominator above the floor
 # -- would latch every run and never clear: a permanent 78 % cut blamed on a generic feed when the
 # real fault is two watch rows that should be one.
-sql "DELETE FROM watch_targets;
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('dup-gpu', 'gpu', 'rtx');
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('dup-cpu', 'cpu', 'rtx');" >/dev/null
+sql "DELETE FROM user_watch_targets WHERE user_id = 1;
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'dup-gpu', 'gpu', 'rtx');
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'dup-cpu', 'cpu', 'rtx');" >/dev/null
 ingest_tables
 rm -f "$COLLECTOR_STATE"
 collect
@@ -675,9 +706,9 @@ has "  ...so nothing latches"                  '"alarms":[]' "$(cat /tmp/e2e-col
 # and its `searchKey` is `JSON.stringify([componentType, query])` -- so `('gpu','rtx')` and
 # `('cpu','rtx ')` are two distinct storable rows. Facebook trims and is case-insensitive, so
 # they are ONE search; a byte comparison read them as a pair at 1.000 forever.
-sql "DELETE FROM watch_targets;
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('dup-gpu', 'gpu', 'RTX');
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('dup-cpu', 'cpu', 'rtx ');" >/dev/null
+sql "DELETE FROM user_watch_targets WHERE user_id = 1;
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'dup-gpu', 'gpu', 'RTX');
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'dup-cpu', 'cpu', 'rtx ');" >/dev/null
 ingest_tables
 rm -f "$COLLECTOR_STATE"
 collect
@@ -701,10 +732,10 @@ has "  ...so nothing latches there either"     '"alarms":[]' "$(cat /tmp/e2e-col
 # here green. Only the same-query rule drops a pair whose pages did not parse.
 sed 's/GroupCommerceProductItem/RenamedCommerceItem/g' \
   collector/testing/fixtures/facebookSearchPage.html > /tmp/e2e-unparsed.html
-sql "INSERT INTO watch_targets (target_id, component_type, query) VALUES ('e2e-three', 'gpu', 'radeon');" >/dev/null
+sql "INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'e2e-three', 'gpu', 'radeon');" >/dev/null
 cat > "$COLLECTOR_STATE" <<'STATE'
-{"version":1,"consecutive":{"dup-gpu":{"sourceEmpty":0,"transient":0}},
- "alarm":{"feed-overlap:dup-cpu+dup-gpu":{"runs":9,"cleanProbes":0}},"probe":0,"canaryRuns":3}
+{"version":1,"consecutive":{"gpu-rtx@toronto-18":{"sourceEmpty":0,"transient":0}},
+ "alarm":{"feed-overlap:cpu-rtx@toronto-18+gpu-rtx@toronto-18":{"runs":9,"cleanProbes":0}},"probe":0,"canaryRuns":3}
 STATE
 run_collector COLLECTOR_TARGET_DELAY_MS=0 COLLECTOR_HTML_FILE=/tmp/e2e-unparsed.html
 rm -f /tmp/e2e-unparsed.html
@@ -749,23 +780,23 @@ echo "== exit 4 is not a clean probe: a latch survives a page that changed shape
 # 0/6/18/6 evidence. That is the one non-SUCCESS, non-EMPTY classification this gate can reach.
 sed 's/GroupCommerceProductItem/RenamedCommerceItem/g' \
   collector/testing/fixtures/facebookSearchPage.html > /tmp/e2e-renamed.html
-sql "DELETE FROM watch_targets;
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('e2e-gpu', 'gpu', 'graphics card');
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('e2e-two', 'gpu', 'rtx');
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('e2e-three', 'gpu', 'radeon');" >/dev/null
+sql "DELETE FROM user_watch_targets WHERE user_id = 1;
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'e2e-gpu', 'gpu', 'graphics card');
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'e2e-two', 'gpu', 'rtx');
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'e2e-three', 'gpu', 'radeon');" >/dev/null
 ingest_tables
 # ONE CLEAN PROBE SHORT OF CLEARING, so a single wrongly-credited run would drop the cause.
 cat > "$COLLECTOR_STATE" <<'STATE'
-{"version":1,"consecutive":{"e2e-gpu":{"sourceEmpty":0,"transient":0}},
- "alarm":{"refused:e2e-gpu":{"runs":9,"cleanProbes":1}},"probe":0,"canaryRuns":2}
+{"version":1,"consecutive":{"gpu-graphics-card@toronto-18":{"sourceEmpty":0,"transient":0}},
+ "alarm":{"refused:gpu-graphics-card@toronto-18":{"runs":9,"cleanProbes":1}},"probe":0,"canaryRuns":2}
 STATE
 run_collector COLLECTOR_TARGET_DELAY_MS=0 COLLECTOR_HTML_FILE=/tmp/e2e-renamed.html
 is "a renamed-anchor page exits 4"             4 "$COLLECTOR_EXIT"
 has "  ...reporting PROVIDER_FAILURE"          '"state":"PROVIDER_FAILURE"' "$(cat /tmp/e2e-collector.out)"
 has "  ...as parser-blind"                     '"reason":"parser-blind"' "$(cat /tmp/e2e-collector.out)"
-has "  ...and the refusal latch SURVIVES it"   '"alarms":["refused:e2e-gpu"]' "$(cat /tmp/e2e-collector.out)"
+has "  ...and the refusal latch SURVIVES it"   '"alarms":["refused:gpu-graphics-card@toronto-18"]' "$(cat /tmp/e2e-collector.out)"
 run_collector COLLECTOR_TARGET_DELAY_MS=0 COLLECTOR_HTML_FILE=/tmp/e2e-renamed.html
-has "  ...and survives a second one"           '"alarms":["refused:e2e-gpu"]' "$(cat /tmp/e2e-collector.out)"
+has "  ...and survives a second one"           '"alarms":["refused:gpu-graphics-card@toronto-18"]' "$(cat /tmp/e2e-collector.out)"
 # ...AND THE VOLUME CUT IS STILL IN FORCE, which is the whole point: two of three targets, not
 # three of three back into a refusal.
 has "  ...with the cut still engaged"          '"canary":true' "$(cat /tmp/e2e-collector.out)"
@@ -780,14 +811,14 @@ echo "== the expiry run that CLEARS its last cause is not labelled degraded =="
 # ONE CLEAN PROBE SHORT OF CLEARING, at the volume bound. So this run is FULL (the expiry fired),
 # every target exits 0, the last cause clears -- and the run line must carry NO alarm. Reporting
 # `canary-expired` unconditionally put `degraded` on the operator's first fully recovered run.
-sql "DELETE FROM watch_targets;
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('e2e-gpu', 'gpu', 'graphics card');
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('e2e-two', 'gpu', 'rtx');
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('e2e-three', 'gpu', 'radeon');" >/dev/null
+sql "DELETE FROM user_watch_targets WHERE user_id = 1;
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'e2e-gpu', 'gpu', 'graphics card');
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'e2e-two', 'gpu', 'rtx');
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'e2e-three', 'gpu', 'radeon');" >/dev/null
 ingest_tables
 cat > "$COLLECTOR_STATE" <<'STATE'
-{"version":1,"consecutive":{"e2e-gpu":{"sourceEmpty":3,"transient":0}},
- "alarm":{"source-empty:e2e-gpu":{"runs":52,"cleanProbes":1}},"probe":0,"canaryRuns":48}
+{"version":1,"consecutive":{"gpu-graphics-card@toronto-18":{"sourceEmpty":3,"transient":0}},
+ "alarm":{"source-empty:gpu-graphics-card@toronto-18":{"runs":52,"cleanProbes":1}},"probe":0,"canaryRuns":48}
 STATE
 collect
 is "the expiry run exits 0"                    0 "$COLLECTOR_EXIT"
@@ -818,8 +849,8 @@ echo "== the dry-run trap, measured end to end =="
 # report a run that collected nothing"). Its failure shape is the same lie in the STALE disguise:
 # the row stops being updated, the page says `stale` 45 minutes later, and "stale" reads as a
 # broken cron or a sleeping Mac rather than saying WHY.
-sql "DELETE FROM watch_targets;
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('e2e-gpu', 'gpu', 'graphics card');" >/dev/null
+sql "DELETE FROM user_watch_targets WHERE user_id = 1;
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'e2e-gpu', 'gpu', 'graphics card');" >/dev/null
 ingest_tables
 DRY_BEFORE=$(val 'SELECT reported_at FROM collector_health WHERE id = 1')
 run_collector COLLECTOR_TARGET_DELAY_MS=0 COLLECTOR_DRY_RUN=1
@@ -845,8 +876,8 @@ rm -f "$COLLECTOR_STATE"
 # take the fallback and both emit 60000.
 # THE FIRST ROW'S VARIABLE MUST BE LEFT UNSET. Do not "fix" it to COLLECTOR_TARGET_DELAY_MS=60000.
 # Both run at N = 1, where no sleep happens, so they cost one process each and no wall time.
-sql "DELETE FROM watch_targets;
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('e2e-gpu', 'gpu', 'graphics card');" >/dev/null
+sql "DELETE FROM user_watch_targets WHERE user_id = 1;
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'e2e-gpu', 'gpu', 'graphics card');" >/dev/null
 run_collector
 is "an UNSET delay still exits 0"              0 "$COLLECTOR_EXIT"
 has "  ...and falls back to 60000"             '"delayMs":60000' "$(cat /tmp/e2e-collector.out)"
@@ -861,6 +892,9 @@ echo "== the browser read path: does the page get the verdicts? =="
 # DEAL. Whether a verdict is CORRECT is evaluateBatch's suite; whether it REACHES THE PAGE is
 # this block.
 vd() { $CURL -s -o /tmp/e2e.body -w '%{http_code}' "$@" "$BASE/api/verdicts" --max-time 15; }
+# THE LABEL IS THE OWNER'S RULE APPLIED TO THE LIVE ROW (migrations/0009), not the stored verdict:
+# MAXIMUM_PRICE at CA$5,000 makes the CA$3,000 listing a deal once it has been judged at all.
+sql "UPDATE users SET mode='MAXIMUM_PRICE', minimum_discount_bp=NULL, maximum_price_cents=500000 WHERE user_id=1;" >/dev/null
 sql "UPDATE evaluation_tasks SET status='COMPLETE', verdict='DEAL' WHERE listing_id='915010494744438';
      UPDATE evaluation_tasks SET status='PENDING', verdict=NULL WHERE listing_id='1807946430653887';" >/dev/null
 # THE NAIVE ROW IS STILL WRONG, AND THE DIFFERENTIAL BELOW IS WHAT REPLACES IT.
@@ -974,10 +1008,10 @@ json.dump({'components': sel['components'], 'models': sel['models'], 'location':
 "; }
 # TWO BROAD ROWS FOR ONE TYPE, so preservation has something to keep AND something to drop. Both
 # are free-text queries the form cannot author, which is the only kind preservation protects.
-sql "DELETE FROM watch_targets;
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('keep-me','gpu','radeon deals');
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('drop-me','gpu','rtx');
-     UPDATE watch_market SET location='waterloo', latitude=43.4643, longitude=-80.5204, radius_km=10 WHERE id=1;" >/dev/null
+sql "DELETE FROM user_watch_targets WHERE user_id = 1;
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'keep-me','gpu','radeon deals');
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'drop-me','gpu','rtx');
+     UPDATE users SET location='waterloo', latitude=43.4643, longitude=-80.5204, radius_km=10 WHERE user_id=1;" >/dev/null
 
 # THE QUERY IS `radeon`, NOT `graphics card`, AND THAT CHOICE IS THE WHOLE TEST. MEASURED: with the
 # body carrying `graphics card` -- which is also gpu's catalog `searchTerm` -- dropping the query
@@ -986,14 +1020,14 @@ sql "DELETE FROM watch_targets;
 # nine rows are, so the echo becomes observable.
 is "a valid PUT is accepted"                  200 "$(wput '{"components":["gpu"],"models":{"gpu":{"mode":"all","values":[],"query":"radeon"}},"location":{"slug":"toronto","latitude":43.6532,"longitude":-79.3832},"radiusKm":25,"preservedTargetIds":["keep-me"]}')"
 is "  ...and the derived row reached D1"      'gpu-radeon|gpu|radeon' \
-   "$(val "SELECT target_id || '|' || component_type || '|' || query FROM watch_targets WHERE target_id='gpu-radeon'")"
+   "$(val "SELECT target_id || '|' || component_type || '|' || query FROM user_watch_targets WHERE target_id='gpu-radeon'")"
 is "  ...and the market with it"              'toronto|43.6532,-79.3832|25' \
-   "$(val "SELECT location || '|' || latitude || ',' || longitude || '|' || radius_km FROM watch_market")"
+   "$(val "SELECT location || '|' || latitude || ',' || longitude || '|' || radius_km FROM users WHERE user_id = 1")"
 # PRESERVATION OVER HTTP: the echoed row is untouched and the unechoed one is gone.
 is "  ...the kept row is untouched"           'keep-me|gpu|radeon deals' \
-   "$(val "SELECT target_id || '|' || component_type || '|' || query FROM watch_targets WHERE target_id='keep-me'")"
-is "  ...the unkept row is removed"           0 "$(val "SELECT COUNT(*) FROM watch_targets WHERE target_id='drop-me'")"
-is "  ...leaving exactly two rows"            2 "$(val 'SELECT COUNT(*) FROM watch_targets')"
+   "$(val "SELECT target_id || '|' || component_type || '|' || query FROM user_watch_targets WHERE target_id='keep-me'")"
+is "  ...the unkept row is removed"           0 "$(val "SELECT COUNT(*) FROM user_watch_targets WHERE target_id='drop-me'")"
+is "  ...leaving exactly two rows"            2 "$(val 'SELECT COUNT(*) FROM user_watch_targets')"
 is "the GET reads the same selection back"    200 "$(code -H "Origin: $ORIGIN" "$BASE/api/watch")"
 has "  ...echoing the stored query"           '"query":"radeon"' "$(body)"
 has "  ...naming the kept row"                '"targetId":"keep-me"' "$(body)"
@@ -1001,13 +1035,13 @@ has "  ...and the radius"                     '"radiusKm":25' "$(body)"
 # THE SINGLETON SURVIVES a second market: a plain INSERT would be a second row and CHECK (id = 1)
 # would make it a 503 instead.
 is "a second PUT with another market"         200 "$(wput '{"components":["gpu"],"models":{"gpu":{"mode":"all","values":[],"query":"radeon"}},"location":{"slug":"waterloo","latitude":43.4643,"longitude":-80.5204},"radiusKm":10,"preservedTargetIds":["keep-me"]}')"
-is "  ...leaves ONE market row"               1 "$(val 'SELECT COUNT(*) FROM watch_market')"
-is "  ...pointing at the new market"          waterloo "$(val 'SELECT location FROM watch_market')"
+is "  ...replaces the caller's area"           10 "$(val 'SELECT radius_km FROM users WHERE user_id = 1')"
+is "  ...pointing at the new market"          waterloo "$(val 'SELECT location FROM users WHERE user_id = 1')"
 # ALL NINE TYPES SURVIVE THE ROUTE, and `case_fans` is the one whose spellings differ: the catalog
 # id on the wire, the worker id in the column. Binding the catalog spelling makes that target a
 # 400 INVALID_LISTINGS on every collector run.
 is "a case_fans PUT is accepted"              200 "$(wput '{"components":["case_fans"],"models":{"case_fans":{"mode":"all","values":[],"query":"case fan"}},"location":{"slug":"toronto","latitude":43.6532,"longitude":-79.3832},"radiusKm":25,"preservedTargetIds":["keep-me"]}')"
-is "  ...storing the WORKER spelling"         case_fan "$(val "SELECT component_type FROM watch_targets WHERE target_id='case_fans-case-fan'")"
+is "  ...storing the WORKER spelling"         case_fan "$(val "SELECT component_type FROM user_watch_targets WHERE target_id='case_fans-case-fan'")"
 is "  ...and reading back the CATALOG one"    200 "$(code -H "Origin: $ORIGIN" "$BASE/api/watch")"
 has "  ...as case_fans"                       '"case_fans"' "$(body)"
 # THE GET'S OWN OUTPUT RE-PUTs: the read and the write agree on one vocabulary.
@@ -1020,17 +1054,17 @@ is "  ...and the GET's own output re-PUTs"     200 "$(wputf /tmp/e2e.watchbody)"
 # width this gate can see. The id is re-derived from the query, which is harmless -- MEASURED,
 # nothing in the repository parses `target_id`.
 is "  ...with the free-text query intact"     'gpu-radeon-deals|gpu|radeon deals' \
-   "$(val "SELECT target_id || '|' || component_type || '|' || query FROM watch_targets WHERE component_type='gpu'")"
-is "  ...and no re-derived row beside it"     0 "$(val "SELECT COUNT(*) FROM watch_targets WHERE query='graphics card'")"
+   "$(val "SELECT target_id || '|' || component_type || '|' || query FROM user_watch_targets WHERE component_type='gpu'")"
+is "  ...and no re-derived row beside it"     0 "$(val "SELECT COUNT(*) FROM user_watch_targets WHERE query='graphics card'")"
 # THE CAP REFUSES AND WRITES NOTHING. MAX_TARGETS_PER_RUN refuses rather than truncating, so a
 # saved list of ten collects NOTHING on every run.
-WATCH_BEFORE_CAP=$(val 'SELECT COUNT(*) FROM watch_targets')
+WATCH_BEFORE_CAP=$(val 'SELECT COUNT(*) FROM user_watch_targets')
 # THE TEN NAMES ARE REAL CATALOG MODELS. An invented name is a DIFFERENT 400 -- INVALID_WATCH
 # naming the value -- so the status row would pass while the cap went untested; the `has` below is
 # what caught exactly that on this row's first run.
 is "a body deriving ten targets is refused"   400 "$(wput '{"components":["gpu"],"models":{"gpu":{"mode":"selected","values":["GeForce RTX 5090","GeForce RTX 5080","GeForce RTX 5070 Ti","GeForce RTX 5070","GeForce RTX 5060 Ti 16GB","GeForce RTX 5060 Ti 8GB","GeForce RTX 5060","Radeon RX 9070 XT","Radeon RX 9070","Radeon RX 9060 XT 16GB"]}},"location":{"slug":"toronto","latitude":43.6532,"longitude":-79.3832},"radiusKm":25,"preservedTargetIds":[]}')"
 has "  ...naming the cap"                     '"code":"WATCH_TARGETS_EXCEEDED"' "$(body)"
-is "  ...and writing nothing"                 "$WATCH_BEFORE_CAP" "$(val 'SELECT COUNT(*) FROM watch_targets')"
+is "  ...and writing nothing"                 "$WATCH_BEFORE_CAP" "$(val 'SELECT COUNT(*) FROM user_watch_targets')"
 # BAD BODIES ARE LOUD, AND preservedTargetIds IS REQUIRED: defaulting it to [] would make any save
 # from a client that does not know the field a silent delete of every kept search.
 is "an absent preservedTargetIds is refused"  400 "$(wput '{"components":["gpu"],"models":{"gpu":{"mode":"all","values":[],"query":"graphics card"}},"location":{"slug":"toronto","latitude":43.6532,"longitude":-79.3832},"radiusKm":25}')"
@@ -1046,10 +1080,10 @@ has "  ...naming the key"                     '"fields":["models.gpu.targetId"]'
 # the model row AND the kept search surrendered to make room for it -- because the type's mode was
 # decided by whichever of its rows sorted first by `target_id`, and `gpu-broad` sorts before
 # `gpu-geforce-rtx-5090`. Every other row in this gate stops after one save.
-sql "DELETE FROM watch_targets;
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('gpu-broad','gpu','radeon');" >/dev/null
+sql "DELETE FROM user_watch_targets WHERE user_id = 1;
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'gpu-broad','gpu','radeon');" >/dev/null
 is "narrowing gpu to one model is accepted"    200 "$(wput '{"components":["gpu"],"models":{"gpu":{"mode":"selected","values":["GeForce RTX 5090"]}},"location":{"slug":"toronto","latitude":43.6532,"longitude":-79.3832},"radiusKm":25,"preservedTargetIds":["gpu-broad"]}')"
-is "  ...keeping the broad row beside it"      2 "$(val 'SELECT COUNT(*) FROM watch_targets')"
+is "  ...keeping the broad row beside it"      2 "$(val 'SELECT COUNT(*) FROM user_watch_targets')"
 is "the GET shows the narrowing"               200 "$(code -H "Origin: $ORIGIN" "$BASE/api/watch")"
 # IT MUST NOT SNAP BACK TO mode:"all". That reversion is what made the new row invisible in the form
 # and the budget read one lower than D1.
@@ -1057,9 +1091,9 @@ has "  ...as mode selected"                    '"mode":"selected","values":["GeF
 has "  ...with the broad row kept, not lost"   '"targetId":"gpu-broad"' "$(body)"
 watchbody
 is "  ...and an untouched SECOND save is 200"  200 "$(wputf /tmp/e2e.watchbody)"
-is "  ...with the model search still stored"   1 "$(val "SELECT COUNT(*) FROM watch_targets WHERE query='GeForce RTX 5090'")"
-is "  ...and the broad query still beside it"  1 "$(val "SELECT COUNT(*) FROM watch_targets WHERE query='radeon'")"
-is "  ...and nothing else written or lost"     2 "$(val 'SELECT COUNT(*) FROM watch_targets')"
+is "  ...with the model search still stored"   1 "$(val "SELECT COUNT(*) FROM user_watch_targets WHERE query='GeForce RTX 5090'")"
+is "  ...and the broad query still beside it"  1 "$(val "SELECT COUNT(*) FROM user_watch_targets WHERE query='radeon'")"
+is "  ...and nothing else written or lost"     2 "$(val 'SELECT COUNT(*) FROM user_watch_targets')"
 
 # THE CREDENTIAL BOUNDARY, as the three-row differential with a live control. The naive
 # "a collector token is refused" row is VACUOUS here: the gate runs on 127.0.0.1 with
@@ -1080,18 +1114,19 @@ echo "== the cross-component link: does the collector run what the FORM wrote? =
 # it over HTTP with NO COLLECTOR_* target variables and runs that target. Before this slice the
 # watch list was only reachable through a hand-written `wrangler d1 execute`.
 ingest_tables
-sql "DELETE FROM watch_targets;" >/dev/null
+sql "DELETE FROM user_watch_targets WHERE user_id = 1;" >/dev/null
 is "the form writes a single target"          200 "$(wput '{"components":["gpu"],"models":{"gpu":{"mode":"all","values":[],"query":"graphics card"}},"location":{"slug":"toronto","latitude":43.6532,"longitude":-79.3832},"radiusKm":25,"preservedTargetIds":[]}')"
-is "  ...and it is the only one"              1 "$(val 'SELECT COUNT(*) FROM watch_targets')"
+is "  ...and it is the only one"              1 "$(val 'SELECT COUNT(*) FROM user_watch_targets')"
 collect
 is "the collector run exits 0"                0 "$COLLECTOR_EXIT"
-has "  ...naming the target the FORM wrote"   '"target":"gpu-graphics-card"' "$(cat /tmp/e2e-collector.out)"
+has "  ...naming the target the FORM wrote"   '"target":"gpu-graphics-card@toronto-25"' "$(cat /tmp/e2e-collector.out)"
 has "  ...for exactly that one target"        '"targets":1,"complete":true,"exitCode":0' "$(cat /tmp/e2e-collector.out)"
 is "  ...and its listings reached D1"         4 "$(val "SELECT COUNT(*) FROM listings WHERE component_type='gpu'")"
 # THE MARKET THE FORM WROTE IS THE MARKET THE LISTINGS LANDED IN -- market_key is built from the
 # coordinates, and a form that wrote a market the collector did not use would be invisible here
 # without this row.
-is "  ...in the market the form wrote"        '43.6532,-79.3832|25km' "$(val 'SELECT DISTINCT market_key FROM listings')"
+is "  ...seen in the area the form wrote"     '43.6532,-79.3832|25km' "$(val 'SELECT DISTINCT market_key FROM listing_markets')"
+is "  ...and pooled under the evidence key"   '43.6532,-79.3832|25km' "$(val 'SELECT DISTINCT market_key FROM listings')"
 # THE KEY THE COLLECTOR WROTE IS THE KEY THE PAGE READS. /api/verdicts filters on the market key it
 # builds from the SAVED watch_market row; a drift between the two spellings would serve nothing.
 code -H "Origin: $ORIGIN" "$BASE/api/verdicts" >/dev/null
@@ -1103,12 +1138,13 @@ echo "== Start/Stop: the dashboard pauses the collector and the monitor =="
 # one -- which is exactly what makes Start's 409 reachable, and what makes the STOPPED run below
 # prove that Stop is checked BEFORE the missing rule.
 mon() { code -X POST -H "Origin: $ORIGIN" "$BASE/api/monitoring/$1"; }
+no_rule
 is "Start with no deal rule is refused"       409 "$(mon start)"
 has "  ...as MONITORING_NOT_READY"             '"code":"MONITORING_NOT_READY"' "$(body)"
-is "  ...and the row is untouched"            1 "$(val 'SELECT enabled FROM monitoring_state WHERE id = 1')"
+is "  ...and the row is untouched"            1 "$(val 'SELECT monitoring_enabled FROM users WHERE user_id = 1')"
 is "Stop is accepted"                         200 "$(mon stop)"
 has "  ...answering stopped"                  '"state":"stopped"' "$(body)"
-is "  ...and the row reached D1"              0 "$(val 'SELECT enabled FROM monitoring_state WHERE id = 1')"
+is "  ...and the row reached D1"              0 "$(val 'SELECT monitoring_enabled FROM users WHERE user_id = 1')"
 is "the collector's watch list still answers" 200 "$(wt -H "X-Collector-Token: $COLLECTOR_TOKEN")"
 has "  ...with no targets, and saying why"    '"targets":[],"monitoring":"stopped"' "$(body)"
 # THE HEALTH ROW IS SET TO A SENTINEL FIRST: a stopped run must not post health, and "reported_at is
@@ -1130,7 +1166,6 @@ is "a monitoring run records STOPPED"         STOPPED "$(val 'SELECT status FROM
 # DISCOUNT, NOT MAXIMUM_PRICE: see the CA$0 note at the top of the collector section. Both tables
 # are cleared first, as the settings section does -- the NO_SETTINGS control deleted only the
 # pointer, and a first save over old revisions collides on revision 0.
-sql "DELETE FROM search_settings; DELETE FROM search_revisions;" >/dev/null
 is "a DISCOUNT rule is saved"                 200 "$(put '{"mode":"DISCOUNT","minimumDiscountPercent":20,"maximumPriceCents":null}')"
 is "Start is accepted now"                    200 "$(mon start)"
 has "  ...answering running"                  '"state":"running"' "$(body)"
@@ -1164,7 +1199,7 @@ fire_monitor() {
   $CURL -s -o /dev/null "$BASE/cdn-cgi/handler/scheduled?cron=%2A%2F30%20%2A%20%2A%20%2A%20%2A&time=$(now_ms)" --max-time 20
   until_val 'SELECT COUNT(*) FROM monitor_runs' "$((before + 1))" 60 || echo "  (monitor run did not finish)"
 }
-notif() { val "SELECT status FROM notifications WHERE listing_id='$1'"; }
+notif() { val "SELECT status FROM user_notifications WHERE listing_id='$1'"; }
 # A model-keyed DEAL straight into D1, judged at the CURRENT revision and seen just now. Used for
 # the rows after the first; the first one is produced by the real ingest route and the real drain.
 seed_deal() { # seed_deal <id> [model_key-sql]
@@ -1178,7 +1213,9 @@ seed_deal() { # seed_deal <id> [model_key-sql]
                                      evaluated_at, lease_expires_at, lease_token)
        VALUES ('facebook-marketplace', '$1', 'COMPLETE', 1,
                (SELECT current_revision FROM search_settings WHERE id = 1), 'DEAL',
-               CAST(strftime('%s','now') AS INTEGER), 0, '');" >/dev/null
+               CAST(strftime('%s','now') AS INTEGER), 0, '');
+       INSERT INTO listing_markets (market_key, source, listing_id, last_seen_at)
+       VALUES ('43.6532,-79.3832|25km', 'facebook-marketplace', '$1', 0);" >/dev/null
 }
 last_post() { python3 -c "
 import json,sys
@@ -1198,13 +1235,15 @@ else
   for _ in $(seq 1 20); do $CURL -sf -o /dev/null "http://127.0.0.1:$STUB_PORT/health" --max-time 1 && break; sleep 0.25; done
 
   ingest_tables
-  sql "DELETE FROM notifications; DELETE FROM monitor_runs; DELETE FROM monitor_lock;
-       DELETE FROM watch_targets;
-       INSERT INTO watch_targets (target_id, component_type, query) VALUES ('e2e-gpu', 'gpu', 'graphics card');
-       UPDATE watch_market SET location='toronto', latitude=43.6532, longitude=-79.3832, radius_km=25 WHERE id=1;" >/dev/null
+  sql "DELETE FROM user_notifications; DELETE FROM monitor_runs; DELETE FROM monitor_lock;
+       DELETE FROM user_watch_targets WHERE user_id = 1;
+       INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'e2e-gpu', 'gpu', 'graphics card');
+       UPDATE users SET location='toronto', latitude=43.6532, longitude=-79.3832, radius_km=25 WHERE user_id=1;" >/dev/null
   # Both settings tables are cleared, as the settings section does: the NO_SETTINGS control above
   # deleted only the pointer, and a first save with old revisions left behind collides on revision 0.
-  sql "DELETE FROM search_settings; DELETE FROM search_revisions;" >/dev/null
+  # The drain judges under a DISCOUNT 20% evidence rule; the owner's own rule is the same 20%.
+  evidence_rule 20
+  no_rule
   is "a DISCOUNT 20% rule is saved"             200 "$(put '{"mode":"DISCOUNT","minimumDiscountPercent":20,"maximumPriceCents":null}')"
 
   # SIX LISTINGS OF ONE MODEL THROUGH THE REAL INGEST ROUTE: five at CA$600 and one at CA$300.
@@ -1228,7 +1267,7 @@ print(json.dumps({'source':'facebook-marketplace','componentType':'gpu',
   is "  the drain judged exactly one DEAL"      7000000000000006 "$(val "SELECT group_concat(listing_id) FROM evaluation_tasks WHERE verdict='DEAL'")"
   is "  ...and five NOT_DEAL"                   5 "$(val "SELECT COUNT(*) FROM evaluation_tasks WHERE verdict='NOT_DEAL'")"
   is "  ...and the stub received NO request"    0 "$(posts)"
-  is "  ...and no notification row exists"      0 "$(val 'SELECT COUNT(*) FROM notifications')"
+  is "  ...and no notification row exists"      0 "$(val 'SELECT COUNT(*) FROM user_notifications')"
   is "  /api/status answers 200"                200 "$(code -H "Origin: $ORIGIN" "$BASE/api/status")"
   has "  ...reading unconfigured"               '"notifications":{"state":"unconfigured"}' "$(body)"
 
@@ -1253,7 +1292,7 @@ print(json.dumps({'source':'facebook-marketplace','componentType':'gpu',
   has "  ...and the link built from the id"     'https://www.facebook.com/marketplace/item/7000000000000006' "$NT_POST"
   is "  ...never the stored url"                0 "$(printf '%s' "$NT_POST" | grep -c 'evil.example')"
   has "  ...at the judged price"                'for CA$300.00' "$NT_POST"
-  is "  ...and the row is SENT at that price"   'SENT|30000' "$(val "SELECT status || '|' || sent_price_cents FROM notifications WHERE listing_id='7000000000000006'")"
+  is "  ...and the row is SENT at that price"   'SENT|30000' "$(val "SELECT status || '|' || sent_price_cents FROM user_notifications WHERE listing_id='7000000000000006'")"
   is "  /api/status counts it"                  200 "$(code -H "Origin: $ORIGIN" "$BASE/api/status")"
   has "  ...as one sent in 24h"                 '"sent24h":1' "$(body)"
 
@@ -1263,7 +1302,7 @@ print(json.dumps({'source':'facebook-marketplace','componentType':'gpu',
   seed_deal 7100000000000001 NULL
   fire_monitor
   is "  a null-model DEAL sends nothing"        1 "$(posts)"
-  is "  ...and is never enqueued"               0 "$(val "SELECT COUNT(*) FROM notifications WHERE listing_id='7100000000000001'")"
+  is "  ...and is never enqueued"               0 "$(val "SELECT COUNT(*) FROM user_notifications WHERE listing_id='7100000000000001'")"
 
   seed_deal 7200000000000001
   answer '["500"]'
@@ -1277,7 +1316,7 @@ print(json.dumps({'source':'facebook-marketplace','componentType':'gpu',
   answer '["429:1"]'
   fire_monitor
   is "  a 429 is posted once"                   3 "$(posts)"
-  is "  ...and stays PENDING with a wait"       'PENDING|1' "$(val "SELECT status || '|' || (next_attempt_at IS NOT NULL) FROM notifications WHERE listing_id='7300000000000001'")"
+  is "  ...and stays PENDING with a wait"       'PENDING|1' "$(val "SELECT status || '|' || (next_attempt_at IS NOT NULL) FROM user_notifications WHERE listing_id='7300000000000001'")"
   sleep 2
   fire_monitor
   is "  ...and is SENT once the wait is over"   SENT "$(notif 7300000000000001)"
@@ -1292,15 +1331,104 @@ print(json.dumps({'source':'facebook-marketplace','componentType':'gpu',
   has "  ...as webhook-rejected"                '"state":"webhook-rejected"' "$(body)"
   fire_monitor
   is "  the next fire probes EXACTLY once"      6 "$(posts)"
-  is "  ...counting no attempt"                 0 "$(val "SELECT MAX(attempts) FROM notifications WHERE listing_id LIKE '74%'")"
+  is "  ...counting no attempt"                 0 "$(val "SELECT MAX(attempts) FROM user_notifications WHERE listing_id LIKE '74%'")"
   fire_monitor
   is "  a healthy webhook sends both"           8 "$(posts)"
   is "  ...and status reads on again"           200 "$(code -H "Origin: $ORIGIN" "$BASE/api/status")"
   has "  ...state on"                           '"state":"on"' "$(body)"
 
   kill "$STUB_PID" 2>/dev/null; STUB_PID=
-  sql "DELETE FROM notifications; DELETE FROM search_settings;" >/dev/null
+  sql "DELETE FROM user_notifications;" >/dev/null
+  evidence_rule 0
 fi
+
+echo "== two identities: overlapping areas, their own rules, one shared budget, no crossing =="
+# migrations/0009. `X-Local-User: <name>` is read ONLY in the local + loopback branch and names
+# `<name>@localhost`; with the owner (local-dev, user 1) that makes three users, MAX_USERS.
+# The owner's searches are cleared for this section so the shared budget below counts only these
+# two users; the restore at the end puts the owner's seed back.
+as() { local who=$1; shift; $CURL -s -o /tmp/e2e.body -w '%{http_code}' -H "Origin: $ORIGIN" -H "X-Local-User: $who" "$@" --max-time 15; }
+aput() { as "$1" -X PUT -H "Content-Type: application/json" -d "$3" "$BASE$2"; }
+uid() { val "SELECT user_id FROM users WHERE email = '$1@localhost'"; }
+gpu_in() { printf '{"components":["gpu"],"models":{"gpu":{"mode":"all","values":[],"query":"%s"}},"location":{"slug":"toronto","latitude":43.6532,"longitude":-79.3832},"radiusKm":%s,"preservedTargetIds":[]}' "$1" "$2"; }
+ingest_tables
+sql "DELETE FROM user_watch_targets; DELETE FROM user_notifications; DELETE FROM monitor_runs; DELETE FROM monitor_lock;" >/dev/null
+evidence_rule 0
+
+is "alice is provisioned on her first request" 200 "$(as alice "$BASE/api/watch")"
+is "  ...and bob on his"                       200 "$(as bob "$BASE/api/watch")"
+is "  ...two rows of their own"                2 "$(val "SELECT COUNT(*) FROM users WHERE email IN ('alice@localhost','bob@localhost')")"
+is "a malformed X-Local-User is refused"       401 "$(as 'Bad Name' "$BASE/api/watch")"
+
+# OVERLAPPING AREAS: the same centre, 25 km and 10 km -- bob's area sits inside alice's.
+is "alice saves gpu in Toronto at 25 km"       200 "$(aput alice /api/watch "$(gpu_in 'graphics card' 25)")"
+is "bob saves gpu in Toronto at 10 km"         200 "$(aput bob /api/watch "$(gpu_in 'graphics card' 10)")"
+is "alice's rule is at most CA\$5,000"         200 "$(aput alice /api/settings '{"mode":"MAXIMUM_PRICE","maximumPriceCents":500000}')"
+is "bob's rule is at most CA\$1,000"           200 "$(aput bob /api/settings '{"mode":"MAXIMUM_PRICE","maximumPriceCents":100000}')"
+
+# ISOLATION: no route takes a user id, so each reads and writes only their own row.
+is "alice reads her own watch list"            200 "$(as alice "$BASE/api/watch")"
+has "  ...at her radius"                       '"radiusKm":25' "$(body)"
+is "bob reads his"                             200 "$(as bob "$BASE/api/watch")"
+has "  ...at his"                              '"radiusKm":10' "$(body)"
+is "bob's save left alice's searches alone"    1 "$(val "SELECT COUNT(*) FROM user_watch_targets WHERE user_id = $(uid alice)")"
+is "alice reads her own rule"                  200 "$(as alice "$BASE/api/settings")"
+has "  ...CA\$5,000"                           '"maximumPriceCents":500000' "$(body)"
+is "bob reads his"                             200 "$(as bob "$BASE/api/settings")"
+has "  ...CA\$1,000"                           '"maximumPriceCents":100000' "$(body)"
+is "alice starts"                              200 "$(as alice -X POST "$BASE/api/monitoring/start")"
+is "bob stops"                                 200 "$(as bob -X POST "$BASE/api/monitoring/stop")"
+is "  ...and alice is still running"           1 "$(val "SELECT monitoring_enabled FROM users WHERE user_id = $(uid alice)")"
+as alice "$BASE/api/status" >/dev/null
+has "  ...as her status says"                  '"monitoring":{"state":"running"' "$(body)"
+as bob "$BASE/api/status" >/dev/null
+has "  ...while bob's says stopped"            '"monitoring":{"state":"stopped"' "$(body)"
+wt -H "X-Collector-Token: $COLLECTOR_TOKEN" >/dev/null
+has "the collector gets alice's search alone"  '"targets":[{"targetId":"gpu-graphics-card@toronto-25"' "$(body)"
+is "bob starts too"                            200 "$(as bob -X POST "$BASE/api/monitoring/start")"
+wt -H "X-Collector-Token: $COLLECTOR_TOKEN" >/dev/null
+has "  ...and the collector gets both areas"   '"targetId":"gpu-graphics-card@toronto-10"' "$(body)"
+has "  ...each target carrying its own market" '"market":null,"targets":[' "$(body)"
+
+# ONE LISTING SEEN FROM BOTH AREAS: one row, one contribution, two memberships.
+shared_post() { python3 -c "
+import json,sys
+print(json.dumps({'source':'facebook-marketplace','componentType':'gpu',
+  'market':{'latitude':43.6532,'longitude':-79.3832,'radiusKm':int(sys.argv[1])},
+  'listings':[{'listingId':'8800000000000001','title':'ASUS GeForce RTX 5080 16GB','priceText':'CA\$3,000',
+               'locationText':'Toronto, ON','url':'https://www.facebook.com/marketplace/item/8800000000000001'}]}))" "$1"; }
+for r in 25 10; do
+  is "the shared listing is ingested from ${r} km" 200 "$($CURL -s -o /tmp/e2e.body -w '%{http_code}' -X POST -H 'Content-Type: application/json' -H "X-Collector-Token: $COLLECTOR_TOKEN" -d "$(shared_post $r)" "$ING" --max-time 15)"
+done
+is "  ...stored as ONE listing"                1 "$(val "SELECT COUNT(*) FROM listings WHERE listing_id = '8800000000000001'")"
+is "  ...seen in BOTH areas"                   2 "$(val "SELECT COUNT(*) FROM listing_markets WHERE listing_id = '8800000000000001'")"
+is "  ...pooled under the one evidence key"    '43.6532,-79.3832|25km' "$(val "SELECT market_key FROM listings WHERE listing_id = '8800000000000001'")"
+fire '*/30 * * * *'
+until_val "SELECT COUNT(*) FROM evaluation_tasks WHERE listing_id = '8800000000000001' AND verdict IS NOT NULL" 1 60
+status_of() { python3 -c "
+import json
+rows=[r for r in json.load(open('/tmp/e2e.body'))['listings'] if r['listingId']=='8800000000000001']
+print(rows[0]['evaluation']['status'] if rows else 'absent')"; }
+is "alice sees it"                             200 "$(as alice "$BASE/api/verdicts")"
+is "  ...as a DEAL under her rule"             DEAL "$(status_of)"
+is "bob sees the same listing"                 200 "$(as bob "$BASE/api/verdicts")"
+is "  ...as NOT_DEAL under his"                NOT_DEAL "$(status_of)"
+
+# THE SHARED BUDGET. alice holds 7 psu models + gpu (8 distinct); bob's one gpu search at 10 km is
+# the 9th. Adding a cpu search makes bob's list the 10th distinct search -> 409, nothing written.
+PSU7='["Corsair AX1600i","Corsair HX1500i","Corsair RM1200x Shift","Corsair RM1000x Shift","Corsair RM850x Shift","Corsair RM850x","Seasonic Prime TX-1300"]'
+is "alice fills eight searches"                200 "$(aput alice /api/watch '{"components":["psu","gpu"],"models":{"psu":{"mode":"selected","values":'"$PSU7"'},"gpu":{"mode":"all","values":[],"query":"graphics card"}},"location":{"slug":"toronto","latitude":43.6532,"longitude":-79.3832},"radiusKm":25,"preservedTargetIds":[]}')"
+is "the 10th distinct search is refused"       409 "$(aput bob /api/watch '{"components":["gpu","cpu"],"models":{"gpu":{"mode":"all","values":[],"query":"graphics card"},"cpu":{"mode":"all","values":[],"query":"cpu"}},"location":{"slug":"toronto","latitude":43.6532,"longitude":-79.3832},"radiusKm":10,"preservedTargetIds":[]}')"
+has "  ...as WATCH_BUDGET_FULL"                '"code":"WATCH_BUDGET_FULL"' "$(body)"
+has "  ...with the shared count and his share" '"used":9,"maximum":9,"yours":1' "$(body)"
+is "  ...and bob's list is untouched"          1 "$(val "SELECT COUNT(*) FROM user_watch_targets WHERE user_id = $(uid bob)")"
+is "a search alice already runs is shared"     200 "$(aput bob /api/watch '{"components":["gpu","cpu"],"models":{"gpu":{"mode":"all","values":[],"query":"graphics card"},"cpu":{"mode":"all","values":[],"query":"cpu"}},"location":{"slug":"toronto","latitude":43.6532,"longitude":-79.3832},"radiusKm":25,"preservedTargetIds":[]}')"
+is "alice reads the shared budget"            200 "$(as alice "$BASE/api/watch")"
+has "  ...nine in use, eight of them hers"     '"budget":{"used":9,"maximum":9,"yours":8}' "$(body)"
+is "  ...so the budget reads nine"             9 "$(val "SELECT COUNT(*) FROM (SELECT DISTINCT t.component_type, t.query, u.latitude, u.longitude, u.radius_km FROM user_watch_targets t JOIN users u ON u.user_id = t.user_id)")"
+
+# Leave the two identities stopped and empty, so a later run of this gate starts as the top expects.
+sql "UPDATE users SET monitoring_enabled = 0 WHERE user_id <> 1; DELETE FROM user_watch_targets WHERE user_id <> 1;" >/dev/null
 
 ingest_tables
 
@@ -1313,10 +1441,10 @@ ingest_tables
 # seed here means every run starts from the state a FRESH `wrangler d1 migrations apply` produces,
 # which is the only state the reset exists to survive. With this line present, deleting the reset
 # turns the collector section red.
-sql "DELETE FROM watch_targets;
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('cpu-toronto', 'cpu', 'cpu');
-     INSERT INTO watch_targets (target_id, component_type, query) VALUES ('gpu-toronto', 'gpu', 'graphics card');
-     UPDATE watch_market SET location='toronto', latitude=43.6532, longitude=-79.3832, radius_km=25 WHERE id=1;" >/dev/null
+sql "DELETE FROM user_watch_targets WHERE user_id = 1;
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'cpu-toronto', 'cpu', 'cpu');
+     INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'gpu-toronto', 'gpu', 'graphics card');
+     UPDATE users SET location='toronto', latitude=43.6532, longitude=-79.3832, radius_km=25 WHERE user_id=1;" >/dev/null
 # AND THE RESTORE IS ASSERTED, NOT ASSUMED -- which is the same defect one level in. `sql()`
 # discards stderr, this script has no `set -e`, and an unchecked restore that silently failed
 # would leave the gate green while the reset at the top of the collector section quietly stopped
@@ -1327,13 +1455,13 @@ sql "DELETE FROM watch_targets;
 # cover a restore that writes the right values into the wrong DATABASE, or one that also mutates
 # a table nothing here reads. "Impossible" was the word here before and it was one notch too
 # wide, which is the same defect these rows exist to catch.
-is "the shipped seed is restored"              2 "$(val 'SELECT COUNT(*) FROM watch_targets')"
+is "the shipped seed is restored"              2 "$(val 'SELECT COUNT(*) FROM user_watch_targets')"
 # THE COORDINATES ARE IN THIS ASSERTION BECAUSE THEY ARE WHAT market_key IS BUILT FROM. Measured:
 # a PARTIAL restore that dropped only the latitude/longitude clause left both rows green with the
 # coordinates still at this file's own values -- an assertion one notch wider than its
 # measurement, on exactly the two columns the reset exists to control.
 is "  ...and the market with it"               'toronto|43.6532,-79.3832|25' \
-   "$(val "SELECT location || '|' || latitude || ',' || longitude || '|' || radius_km FROM watch_market")"
+   "$(val "SELECT location || '|' || latitude || ',' || longitude || '|' || radius_km FROM users WHERE user_id = 1")"
 
 printf '\n  %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

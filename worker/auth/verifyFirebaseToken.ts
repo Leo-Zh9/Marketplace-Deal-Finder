@@ -106,6 +106,15 @@ export const validateFirebaseClaims = (
   return { ok: true, subject: sub, expiresAt: exp };
 };
 
+/**
+ * A SECOND LOCAL IDENTITY, for exercising two users on one machine (migrations/0009). The header
+ * names it; the address is `<name>@localhost`. The pattern is tight because the name becomes an
+ * email that `users.email`'s CHECK and the `@localhost` allowlist rule both read.
+ */
+export const LOCAL_USER_HEADER = "X-Local-User";
+export const LOCAL_USER_PATTERN = /^[a-z0-9-]{1,20}$/;
+export const LOCAL_DEFAULT_EMAIL = "local-dev@localhost";
+
 let defaults: AuthDependencies | null = null;
 
 /** Lazy so an injecting test never builds a store; a singleton so the cache survives an isolate. */
@@ -142,15 +151,22 @@ export const authenticateRequest = async (
   //    APP_ENV is the only factor an attacker cannot influence: in workerd
   //    request.url is itself built from the incoming Host/:authority, so the
   //    loopback check is defence in depth, not an independent second factor.
+  //
+  //    `X-Local-User` IS READ HERE AND NOWHERE ELSE. Outside this branch -- APP_ENV=production, or
+  //    a non-loopback host -- the header is never looked at, so it cannot select an identity in
+  //    production. A-local-2 is the guard. A malformed value is refused rather than ignored, so a
+  //    typo cannot silently act as the default user.
   if (
     environment.APP_ENV === "local" &&
     isLoopbackHostname(new URL(request.url).hostname)
   ) {
+    const name = request.headers.get(LOCAL_USER_HEADER);
+    if (name !== null && !LOCAL_USER_PATTERN.test(name)) return invalidToken;
     return {
       ok: true,
       identity: {
-        email: "local-dev@localhost",
-        subject: "local-development",
+        email: name === null ? LOCAL_DEFAULT_EMAIL : `${name}@localhost`,
+        subject: name === null ? "local-development" : `local-development:${name}`,
         expiresAt: now + 86_400,
         authenticationMethod: "local-development",
       },

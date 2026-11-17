@@ -33,13 +33,14 @@ import { handleStartMonitoring, handleStopMonitoring } from "../api/monitoring";
 import { zeroCounts } from "../notify/runNotify";
 import { loadCurrentSettings } from "../search/settings";
 import { createTestDatabase, truncateAll, type TestDatabase } from "../testing/d1";
+import { owner, setArea, setMonitoring, TEST_ALLOWLIST } from "../testing/users";
 import { COLLECTION_STEPS, type CollectionOutcome, type CollectionStep } from "./collection";
 import { acquireMonitorLock, MONITOR_LOCK_SECONDS } from "./monitorLock";
 import { MAX_STEPS, runCleanup } from "./runCleanup";
 import {
   discoverSources,
   drainLeaseToken,
-  runMonitor,
+  runMonitor as realRunMonitor,
   BATCHES_PER_DRAIN_STEP,
   DRAIN_STEPS,
   MONITOR_STEP_CONFIG,
@@ -47,6 +48,19 @@ import {
   type MonitorParams,
   type MonitorStepper,
 } from "./runMonitor";
+
+/**
+ * EVERY RUN SEES THE ALLOWLIST A DEPLOYED WORKER SEES (migrations/0009): ACTIVE users are decided by
+ * it, and an unusable one DEGRADES the run (R-allow). Tests that pass an environment override it.
+ */
+const runMonitor = (...args: Parameters<typeof realRunMonitor>) => {
+  const [db, step, params, runId, options, environment] = args;
+  return realRunMonitor(db, step, params, runId, options, {
+    APP_ENV: "production",
+    APPROVED_EMAILS: TEST_ALLOWLIST,
+    ...environment,
+  });
+};
 
 /**
  * R17 needs `decide` to throw for exactly one candidate. The wrapper delegates to the real
@@ -155,6 +169,18 @@ const bootstrapSettings = async (input: {
          ON CONFLICT(id) DO UPDATE SET current_revision = ?1`,
       )
       .bind(REVISION),
+    // THE OWNER'S OWN RULE, the same rule (migrations/0009): notify enqueues under it and Start
+    // requires it. The evidence rule above is what the drain evaluates under.
+    db
+      .prepare(
+        `UPDATE users SET mode = ?1, minimum_discount_bp = ?2, maximum_price_cents = ?3
+          WHERE user_id = 1`,
+      )
+      .bind(
+        input.mode,
+        input.percent === null ? null : Math.round(input.percent * 100),
+        input.mode === "DISCOUNT" ? null : input.maxCents,
+      ),
   ]);
 };
 
@@ -192,6 +218,14 @@ const seed = async (source: string, count: number, priceCents: number = PRICE_CE
         `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?2)
          INSERT INTO evaluation_tasks (source, listing_id, status, created_at)
          SELECT ?1, ?1 || '-' || i, 'PENDING', ?3 FROM n`,
+      )
+      .bind(source, count, T),
+    // Seen in the owner's area (migrations/0009 membership), so the notify step can alert on them.
+    db
+      .prepare(
+        `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?2)
+         INSERT INTO listing_markets (market_key, source, listing_id, last_seen_at)
+         SELECT '43.6532,-79.3832|25km', ?1, ?1 || '-' || i, ?3 FROM n`,
       )
       .bind(source, count, T),
   ]);
@@ -1373,14 +1407,10 @@ describe("runMonitor -- the notify step", () => {
   const watchEverything = async () => {
     await db
       .prepare(
-        "INSERT INTO watch_targets (target_id, component_type, query) VALUES ('gpu-all', 'gpu', 'graphics card')",
+        "INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'gpu-all', 'gpu', 'graphics card')",
       )
       .run();
-    await db
-      .prepare(
-        "INSERT INTO watch_market (id, location, latitude, longitude, radius_km) VALUES (1, 'toronto', 43.6532, -79.3832, 25)",
-      )
-      .run();
+    await setArea(db, { location: "toronto", latitude: 43.6532, longitude: -79.3832, radiusKm: 25 });
   };
 
   /**
@@ -1453,8 +1483,8 @@ describe("runMonitor -- the notify step", () => {
 });
 
 /**
- * THE DASHBOARD'S STOP (migrations/0008). A stopped run is read inside `load-settings` and
- * finalizes like NO_SETTINGS: no discovery, no drain, no notify, one STOPPED row, the lock
+ * THE DASHBOARD'S STOP, PER USER (migrations/0009). With NO user active, the run is read inside
+ * `load-settings` as STOPPED and finalizes like NO_SETTINGS: no discovery, no drain, no notify, one STOPPED row, the lock
  * released, and no console.warn -- it is the operator's choice, not a fault.
  */
 describe("runMonitor -- the Stop flag", () => {
@@ -1466,21 +1496,17 @@ describe("runMonitor -- the Stop flag", () => {
 
   const snapshot = async () => ({
     tasks: (await db.prepare("SELECT * FROM evaluation_tasks ORDER BY source, listing_id").all()).results,
-    notifications: (await db.prepare("SELECT * FROM notifications ORDER BY source, listing_id").all()).results,
+    notifications: (await db.prepare("SELECT * FROM user_notifications ORDER BY source, listing_id").all()).results,
   });
 
   // The saved market as well, for the same reason as the notify-step describe's helper.
   const watchEverything = async () => {
     await db
       .prepare(
-        "INSERT INTO watch_targets (target_id, component_type, query) VALUES ('gpu-all', 'gpu', 'graphics card')",
+        "INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (1, 'gpu-all', 'gpu', 'graphics card')",
       )
       .run();
-    await db
-      .prepare(
-        "INSERT INTO watch_market (id, location, latitude, longitude, radius_km) VALUES (1, 'toronto', 43.6532, -79.3832, 25)",
-      )
-      .run();
+    await setArea(db, { location: "toronto", latitude: 43.6532, longitude: -79.3832, radiusKm: 25 });
   };
 
   /**
@@ -1494,7 +1520,7 @@ describe("runMonitor -- the Stop flag", () => {
     await maximumPriceSettings();
     await watchEverything();
     await seed("alpha", 2);
-    await handleStopMonitoring(db, T);
+    await handleStopMonitoring(db, await owner(db), T);
     const posts: string[] = [];
     const notifyFetch = async (url: string) => {
       posts.push(url);
@@ -1522,7 +1548,7 @@ describe("runMonitor -- the Stop flag", () => {
     expect(warn).not.toHaveBeenCalled();
     warn.mockRestore();
 
-    await handleStartMonitoring(db, T);
+    await handleStartMonitoring(db, await owner(db), T);
     const started = await runMonitor(db, recording().stepper, { now: T }, "run-started", { notifyFetch }, ON);
 
     expect({ status: started.status, claimedCount: started.claimedCount }).toEqual({
@@ -1541,11 +1567,11 @@ describe("runMonitor -- the Stop flag", () => {
    */
   it("R-s2: stopped with no settings is STOPPED; running with no settings is NO_SETTINGS", async () => {
     await seed("alpha", 3);
-    await handleStopMonitoring(db, T);
+    await handleStopMonitoring(db, await owner(db), T);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 
     const stopped = await runMonitor(db, recording().stepper, { now: T }, "run-stopped-unset");
-    await db.prepare("UPDATE monitoring_state SET enabled = 1 WHERE id = 1").run();
+    await setMonitoring(db, true);
     const running = await runMonitor(db, recording().stepper, { now: T }, "run-running-unset");
 
     expect([stopped.status, running.status]).toEqual(["STOPPED", "NO_SETTINGS"]);
@@ -1574,7 +1600,7 @@ describe("runMonitor -- the Stop flag", () => {
     };
     const recorder = recording({
       before: async (name) => {
-        if (name === "notify") await handleStopMonitoring(db, T);
+        if (name === "notify") await handleStopMonitoring(db, await owner(db), T);
       },
     });
 
@@ -1587,7 +1613,7 @@ describe("runMonitor -- the Stop flag", () => {
     expect(posts).toEqual([]);
     expect((await snapshot()).notifications).toEqual([]);
 
-    await handleStartMonitoring(db, T);
+    await handleStartMonitoring(db, await owner(db), T);
     await runMonitor(db, recording().stepper, { now: T }, "run-after-start", { notifyFetch }, ON);
     expect(posts).toHaveLength(2);
   });
@@ -1607,7 +1633,7 @@ describe("runMonitor -- the Stop flag", () => {
       db,
       recording({
         before: async (name) => {
-          if (name === "notify") await handleStopMonitoring(db, T);
+          if (name === "notify") await handleStopMonitoring(db, await owner(db), T);
         },
       }).stepper,
       { now: T },
@@ -1621,6 +1647,82 @@ describe("runMonitor -- the Stop flag", () => {
   });
 
   /**
+   * R-allow. AN UNUSABLE ALLOWLIST DEGRADES THE RUN -- never "nobody is active", which would record
+   * STOPPED, the one status that does not warn. It still finalizes and releases, and drains nothing.
+   */
+  it("R-allow: a missing or malformed APPROVED_EMAILS is DEGRADED, not STOPPED", async () => {
+    await maximumPriceSettings();
+    await seed("alpha", 2);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    for (const [index, environment] of [
+      { APP_ENV: "production", APPROVED_EMAILS: undefined },
+      { APP_ENV: "production", APPROVED_EMAILS: "[oops" },
+    ].entries()) {
+      const run = await runMonitor(db, recording().stepper, { now: T }, `run-allow-${index}`, {}, environment);
+      expect(run.status).toBe("DEGRADED");
+      expect(run.errors[0]).toMatch(/APPROVED_EMAILS allowlist is unusable/);
+    }
+    expect(await taskStatuses()).toEqual([{ status: "PENDING", n: 2 }]);
+    expect(await lockRow()).toEqual({ run_id: "", acquired_at: T, expires_at: 0 });
+    warn.mockRestore();
+  });
+
+  /**
+   * R-owner. AN UNCLAIMED OR MIS-CLAIMED OWNER DEGRADES THE RUN -- never STOPPED, which does not
+   * warn. It finalizes, releases, drains nothing and names why. Kills: dropping the check.
+   */
+  it("R-owner: user 1 with no approved email is DEGRADED, not STOPPED", async () => {
+    await maximumPriceSettings();
+    await seed("alpha", 2);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await db.prepare("UPDATE users SET email = NULL WHERE user_id = 1").run();
+    const unclaimed = await runMonitor(db, recording().stepper, { now: T }, "run-unclaimed");
+    await db.prepare("UPDATE users SET email = 'typo@example.com' WHERE user_id = 1").run();
+    const typo = await runMonitor(db, recording().stepper, { now: T }, "run-typo");
+    for (const run of [unclaimed, typo]) {
+      expect(run.status).toBe("DEGRADED");
+      expect(run.errors[0]).toMatch(/OWNER_UNCLAIMED/);
+    }
+    expect(await taskStatuses()).toEqual([{ status: "PENDING", n: 2 }]);
+    expect(await lockRow()).toEqual({ run_id: "", acquired_at: T, expires_at: 0 });
+    warn.mockRestore();
+  });
+
+  /**
+   * R-other. STOPPED ONLY WHEN NOBODY IS ACTIVE. The owner Stopped, a second allowlisted user still
+   * Started: the run drains (OK), and the PR2 notify step -- the owner's -- sends nothing.
+   */
+  it("R-other: one active user keeps the run going; the stopped owner is sent nothing", async () => {
+    await maximumPriceSettings();
+    await watchEverything();
+    await seed("alpha", 2);
+    await handleStopMonitoring(db, await owner(db), T);
+    await db
+      .prepare(
+        `INSERT INTO users (user_id, email, monitoring_enabled, monitoring_changed_at, created_at)
+         VALUES (2, 'second@example.com', 1, 0, 0)`,
+      )
+      .run();
+    const posts: string[] = [];
+    const run = await runMonitor(
+      db,
+      recording().stepper,
+      { now: T },
+      "run-other",
+      {
+        notifyFetch: async (url) => {
+          posts.push(url);
+          return new Response('{"id":"1"}', { status: 200 });
+        },
+      },
+      ON,
+    );
+    expect({ status: run.status, claimedCount: run.claimedCount }).toEqual({ status: "OK", claimedCount: 2 });
+    expect(run.notify).toMatchObject({ state: "on", enqueued: 0, sent: 0 });
+    expect(posts).toEqual([]);
+  });
+
+  /**
    * R-s3. A `load-settings` result memoized BEFORE this field existed -- an instance replayed across
    * the deploy -- has no `stopped`, and it reads as running, the state it was recorded in. The row
    * says stopped here, so a reader that treated the missing field as stopped (or re-read the row)
@@ -1629,7 +1731,7 @@ describe("runMonitor -- the Stop flag", () => {
   it("R-s3: a memoized load-settings result without the field reads as running", async () => {
     await maximumPriceSettings();
     await seed("alpha", 2);
-    await handleStopMonitoring(db, T);
+    await handleStopMonitoring(db, await owner(db), T);
     const inner = recording();
     const replayed: MonitorStepper = {
       do: (name, config, callback) =>

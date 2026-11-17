@@ -7,9 +7,9 @@ import { evaluateBatch } from "../evaluation/evaluateBatch";
 import { MINIMUM_REFERENCE_COUNT } from "../evaluation/types";
 import { enqueueCandidates } from "../notify/enqueue";
 import { recordSightings } from "../storage/recordSightings";
+import { addMember, owner, setArea, setRule } from "../testing/users";
 import {
   handleGetVerdicts,
-  SELECT_MARKET,
   SELECT_VERDICTS,
   SELECT_VERDICTS_FILTERED,
   VERDICT_PAGE_SIZE,
@@ -44,25 +44,25 @@ afterAll(async () => {
 });
 
 /**
- * THE SAVED MARKET IS SEEDED, because the read filters on it and `truncateAll` deletes the row
- * (worker/testing/d1.ts). These are `MARKET`'s own coordinates, so every fixture below is in the
- * saved market unless it says otherwise.
+ * THE CALLER'S AREA IS SEEDED, because the read filters on it and `truncateAll` leaves user 1 with
+ * none (worker/testing/d1.ts). These are `MARKET`'s own coordinates, so every fixture below is in
+ * the caller's area unless it says otherwise. The DEFAULT RULE is DISCOUNT 10%: a label is `decide`
+ * under the caller's rule (verdicts.ts labelFor), never the stored verdict.
  */
 const saveMarket = (latitude: number, longitude: number, radiusKm: number) =>
-  database.db
-    .prepare(
-      `INSERT INTO watch_market (id, location, latitude, longitude, radius_km)
-       VALUES (1, 'toronto', ?1, ?2, ?3)
-       ON CONFLICT(id) DO UPDATE SET latitude = ?1, longitude = ?2, radius_km = ?3`,
-    )
-    .bind(latitude, longitude, radiusKm)
-    .run();
+  setArea(database.db, { latitude, longitude, radiusKm });
 
 beforeEach(async () => {
   await truncateAll(database.db);
   await saveMarket(43.5123, -79.8765, 18);
+  await setRule(database.db, { mode: "DISCOUNT", bp: 1000 });
 });
 
+/**
+ * A listing row, and its MEMBERSHIP in the area its `market_key` names -- so a fixture "in another
+ * market" is a listing seen only in another AREA (migrations/0009), which is what the old
+ * `l.market_key` filter meant.
+ */
 const listing = async (over: Record<string, unknown> = {}) => {
   const row = {
     source: SOURCE,
@@ -94,6 +94,7 @@ const listing = async (over: Record<string, unknown> = {}) => {
       row.validity, row.content_hash, row.first_seen_at, row.last_seen_at,
     )
     .run();
+  await addMember(database.db, row.market_key, row.listing_id, row.source);
 };
 
 const task = async (listingId: string, status: string, verdict: string | null) =>
@@ -139,7 +140,7 @@ const query = (all: string[], pairs?: string[]) => {
 };
 
 const read = async (params: URLSearchParams = unfiltered()) => {
-  const result = await handleGetVerdicts(database.db, params);
+  const result = await handleGetVerdicts(database.db, params, await owner(database.db));
   if (!result.ok) throw new Error(`expected ok, got ${result.code}`);
   return result.body;
 };
@@ -187,18 +188,22 @@ describe("GET /api/verdicts", () => {
   });
 
   it("V-3: orders DEAL, NEEDS_REVIEW, PENDING, NOT_DEAL and newest first inside a rank", async () => {
+    // THE CALLER'S RULE DECIDES THE LABEL AND THE BUCKET (verdicts.ts labelFor / ORDER_AND_BOUND);
+    // the stored verdict decides only PENDING (NULL). MAXIMUM_PRICE at 400,000 needs no evidence,
+    // so each label below follows from price and validity alone.
     // EVERY ID IS CHOSEN SO THAT ALPHABETICAL ORDER CONTRADICTS RECENCY INSIDE ITS RANK.
     // MEASURED: with ids that happened to agree, dropping `last_seen_at DESC` from the
     // ORDER BY survived this test.
-    await listing({ listing_id: "z-not-deal", last_seen_at: 1_900_000_000 });
-    await task("z-not-deal", "COMPLETE", "NOT_DEAL");
+    await setRule(database.db, { mode: "MAXIMUM_PRICE", max: 400_000 });
+    await listing({ listing_id: "z-not-deal", price_cents: 500_000, last_seen_at: 1_900_000_000 });
+    await task("z-not-deal", "COMPLETE", "DEAL");
     await listing({ listing_id: "b-deal-new", last_seen_at: 1_800_000_100 });
-    await task("b-deal-new", "COMPLETE", "DEAL");
+    await task("b-deal-new", "COMPLETE", "NOT_DEAL");
     await listing({ listing_id: "a-deal-old", last_seen_at: 1_800_000_050 });
     await task("a-deal-old", "COMPLETE", "DEAL");
-    await listing({ listing_id: "a-review-old", last_seen_at: 1_800_000_200 });
+    await listing({ listing_id: "a-review-old", validity: "NEEDS_REVIEW", last_seen_at: 1_800_000_200 });
     await task("a-review-old", "NEEDS_REVIEW", "NEEDS_REVIEW");
-    await listing({ listing_id: "b-corrupt-new", last_seen_at: 1_800_000_300 });
+    await listing({ listing_id: "b-corrupt-new", price_cents: null, last_seen_at: 1_800_000_300 });
     await task("b-corrupt-new", "COMPLETE", "Deal");
     await listing({ listing_id: "a-unjudged-old", last_seen_at: 1_800_000_400 });
     await task("a-unjudged-old", "PENDING", null);
@@ -212,6 +217,36 @@ describe("GET /api/verdicts", () => {
     expect(body.listings.map((row) => row.evaluation.status)).toEqual([
       "DEAL", "DEAL", "NEEDS_REVIEW", "NEEDS_REVIEW", "PENDING", "PENDING", "NOT_DEAL",
     ]);
+  });
+
+  /**
+   * V-3r: THE SAME ROWS UNDER ANOTHER RULE. The stored verdicts are unchanged; only the caller's
+   * rule moves, and the labels and the order move with it. A user with NO rule sees every row
+   * PENDING -- nothing has been judged against a rule they have not chosen.
+   */
+  it("V-3r: labels follow the caller's rule, not the stored verdict", async () => {
+    await listing({ listing_id: "cheap", price_cents: 100_000, last_seen_at: 1_800_000_000 });
+    await task("cheap", "COMPLETE", "NOT_DEAL");
+    await listing({ listing_id: "dear", price_cents: 300_000, last_seen_at: 1_800_000_100 });
+    await task("dear", "COMPLETE", "DEAL");
+
+    await setRule(database.db, { mode: "MAXIMUM_PRICE", max: 200_000 });
+    let body = await read();
+    expect(body.listings.map((row) => [row.listingId, row.evaluation.status])).toEqual([
+      ["cheap", "DEAL"],
+      ["dear", "NOT_DEAL"],
+    ]);
+
+    await setRule(database.db, { mode: "MAXIMUM_PRICE", max: 350_000 });
+    body = await read();
+    expect(body.listings.map((row) => [row.listingId, row.evaluation.status])).toEqual([
+      ["dear", "DEAL"],
+      ["cheap", "DEAL"],
+    ]);
+
+    await setRule(database.db, null);
+    body = await read();
+    expect(body.listings.map((row) => row.evaluation.status)).toEqual(["PENDING", "PENDING"]);
   });
 
   /**
@@ -494,7 +529,7 @@ describe("GET /api/verdicts", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     await listing({ listing_id: "bad-a", component_type: "gpuu" });
     await listing({ listing_id: "bad-b", last_seen_at: "not-a-time" });
-    const result = await handleGetVerdicts(database.db, unfiltered());
+    const result = await handleGetVerdicts(database.db, unfiltered(), await owner(database.db));
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error("unreachable");
     expect(result.status).toBe(503);
@@ -602,7 +637,7 @@ describe("GET /api/verdicts -- the server-side selection filter", () => {
 
     const pairsOnly = new URLSearchParams();
     pairsOnly.set("pairs", JSON.stringify(["gpu/GeForce RTX 5080"]));
-    const result = await handleGetVerdicts(database.db, pairsOnly);
+    const result = await handleGetVerdicts(database.db, pairsOnly, await owner(database.db));
     expect(result).toMatchObject({
       ok: false,
       status: 400,
@@ -624,7 +659,7 @@ describe("GET /api/verdicts -- the server-side selection filter", () => {
     const bad = new URLSearchParams();
     bad.set("all", "[]");
     bad.set("pairs", JSON.stringify(["gpu/"]));
-    expect(await handleGetVerdicts(database.db, bad)).toMatchObject({
+    expect(await handleGetVerdicts(database.db, bad, await owner(database.db))).toMatchObject({
       ok: false,
       status: 400,
       code: "INVALID_VERDICTS_QUERY",
@@ -651,7 +686,7 @@ describe("GET /api/verdicts -- the server-side selection filter", () => {
     ["an unknown type in a pair", [], ["gpuu/GeForce RTX 5080"], "gpuu/GeForce RTX 5080"],
   ])("V-f5: %s is a 400 INVALID_VERDICTS_QUERY", async (_label, all, pairs, detail) => {
     await listing({ listing_id: "present" });
-    const result = await handleGetVerdicts(database.db, query(all, pairs));
+    const result = await handleGetVerdicts(database.db, query(all, pairs), await owner(database.db));
     expect(result).toMatchObject({
       ok: false,
       status: 400,
@@ -664,7 +699,7 @@ describe("GET /api/verdicts -- the server-side selection filter", () => {
     for (const raw of ["gpu", '{"gpu":1}', "[1]", "[[]]"]) {
       const params = new URLSearchParams();
       params.set("all", raw);
-      expect(await handleGetVerdicts(database.db, params), raw).toMatchObject({
+      expect(await handleGetVerdicts(database.db, params, await owner(database.db)), raw).toMatchObject({
         ok: false,
         status: 400,
         code: "INVALID_VERDICTS_QUERY",
@@ -706,7 +741,7 @@ describe("GET /api/verdicts -- the server-side selection filter", () => {
 
     const baseline = await database.db
       .prepare(SELECT_VERDICTS)
-      .bind(VERDICT_PAGE_SIZE + 1, MARKET)
+      .bind(VERDICT_PAGE_SIZE + 1, MARKET, 1)
       .all();
     const unfiltered = baseline.meta.rows_read;
 
@@ -722,7 +757,7 @@ describe("GET /api/verdicts -- the server-side selection filter", () => {
     for (const [all, pairs] of table) {
       const read = await database.db
         .prepare(SELECT_VERDICTS_FILTERED)
-        .bind(VERDICT_PAGE_SIZE + 1, JSON.stringify(all), JSON.stringify(pairs), MARKET)
+        .bind(VERDICT_PAGE_SIZE + 1, JSON.stringify(all), JSON.stringify(pairs), MARKET, 1)
         .all();
       const delta = read.meta.rows_read - unfiltered;
       measured.push(`|all|=${all.length} |pairs|=${pairs.length} delta=${delta}`);
@@ -750,9 +785,9 @@ describe("GET /api/verdicts -- the server-side selection filter", () => {
 });
 
 /**
- * THE SAVED MARKET. Nothing deletes from `listings`, so before this term a SAVED location change
+ * THE CALLER'S AREA. Nothing deletes from `listings`, so before this term a SAVED location change
  * left every old-market row on the page indefinitely, DEALs first. The key is built in JS from the
- * `watch_market` row by the same `marketKey()` the collector's writes go through.
+ * user's area by the same `marketKey()` the collector's membership writes go through.
  */
 describe("GET /api/verdicts -- the saved market", () => {
   /**
@@ -781,16 +816,10 @@ describe("GET /api/verdicts -- the saved market", () => {
    */
   it("V-m2: a listing written through recordSightings for the saved market is read back", async () => {
     await saveMarket(43.5, -79.8, 18);
-    const stored = (
-      await database.db.prepare(SELECT_MARKET).all<{
-        latitude: number;
-        longitude: number;
-        radius_km: number;
-      }>()
-    ).results[0];
+    const stored = (await owner(database.db)).area!;
     await recordSightings(database.db, {
       source: SOURCE,
-      market: { latitude: stored.latitude, longitude: stored.longitude, radiusKm: stored.radius_km },
+      market: { latitude: stored.latitude, longitude: stored.longitude, radiusKm: stored.radiusKm },
       sightings: [
         {
           validity: "VALID",
@@ -820,7 +849,7 @@ describe("GET /api/verdicts -- the saved market", () => {
    */
   it("V-m3: with no market row, listings present, the page is empty and the main read is skipped", async () => {
     await listing({ listing_id: "present" });
-    await database.db.prepare("DELETE FROM watch_market").run();
+    await setArea(database.db, null);
 
     for (const params of [unfiltered(), query(["gpu"])]) {
       const prepared: string[] = [];
@@ -830,13 +859,13 @@ describe("GET /api/verdicts -- the saved market", () => {
           return database.db.prepare(sql);
         },
       } as unknown as D1Database;
-      const result = await handleGetVerdicts(spy, params);
+      const result = await handleGetVerdicts(spy, params, await owner(database.db));
       expect(result, params.toString()).toEqual({
         ok: true,
         status: 200,
         body: { listings: [], truncated: false },
       });
-      expect(prepared, params.toString()).toEqual([SELECT_MARKET]);
+      expect(prepared, params.toString()).toEqual([]);
     }
   });
 
@@ -847,18 +876,8 @@ describe("GET /api/verdicts -- the saved market", () => {
    */
   it("V-nh: the page read writes nothing, on a seed the notify step would enqueue", async () => {
     const now = 1_800_000_600;
-    await database.db
-      .prepare(
-        `INSERT INTO search_revisions (revision, mode, minimum_discount_percent, maximum_price_cents, created_at)
-         VALUES (3, 'DISCOUNT', 20, NULL, 1)`,
-      )
-      .run();
-    await database.db
-      .prepare("INSERT INTO search_settings (id, current_revision) VALUES (1, 3)")
-      .run();
-    await database.db
-      .prepare("INSERT INTO watch_targets (target_id, component_type, query) VALUES ('g', 'gpu', 'graphics card')")
-      .run();
+    // A MAXIMUM_PRICE rule needs no evidence, so the seed is a deal under the caller's rule.
+    await setRule(database.db, { mode: "MAXIMUM_PRICE", max: 1_000_000 });
     await listing({ listing_id: "eligible", last_seen_at: now - 60 });
     await database.db
       .prepare(
@@ -877,17 +896,17 @@ describe("GET /api/verdicts -- the saved market", () => {
       },
     } as unknown as D1Database;
     for (const params of [unfiltered(), query(["gpu"])]) {
-      const body = await handleGetVerdicts(spy, params);
+      const body = await handleGetVerdicts(spy, params, await owner(database.db));
       expect(body.ok, params.toString()).toBe(true);
     }
     expect(prepared.length).toBeGreaterThan(0);
     for (const sql of prepared) expect(sql.trimStart().startsWith("SELECT"), sql).toBe(true);
     const count = async () =>
-      (await database.db.prepare("SELECT COUNT(*) AS n FROM notifications").first<{ n: number }>())?.n;
+      (await database.db.prepare("SELECT COUNT(*) AS n FROM user_notifications").first<{ n: number }>())?.n;
     expect(await count()).toBe(0);
 
     // THE CONTROL: the same seed IS enqueue-eligible.
-    expect(await enqueueCandidates(database.db, now, { all: ["gpu"], pairs: [] }, MARKET)).toBe(1);
+    expect(await enqueueCandidates(database.db, now, { all: ["gpu"], pairs: [] }, MARKET, 1)).toBe(1);
     expect(await count()).toBe(1);
   });
 });

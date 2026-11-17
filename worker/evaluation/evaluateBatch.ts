@@ -125,12 +125,12 @@ RETURNING listing_id`;
  * verdict see" are the same SQL text and cannot disagree. candidateReadSql documents what they
  * compute and why.
  */
-const STATS_JOIN_KEYS = `s.market_key  = COALESCE(p.market_key,  l.market_key)
+export const STATS_JOIN_KEYS = `s.market_key  = COALESCE(p.market_key,  l.market_key)
         AND s.model_key   = COALESCE(p.model_key,   l.model_key)
         AND s.variant_key = COALESCE(p.variant_key, l.variant_key)`;
-const REFERENCE_COUNT_SQL = `CASE WHEN p.listing_id IS NULL THEN s.count
+export const REFERENCE_COUNT_SQL = `CASE WHEN p.listing_id IS NULL THEN s.count
             ELSE s.count - 1 END`;
-const REFERENCE_TOTAL_SQL = `CASE WHEN p.listing_id IS NULL THEN s.total_price_cents
+export const REFERENCE_TOTAL_SQL = `CASE WHEN p.listing_id IS NULL THEN s.total_price_cents
             ELSE s.total_price_cents - p.price_cents END`;
 
 /**
@@ -219,9 +219,10 @@ RETURNING listing_id`;
  * The COALESCE on the join keys is DEFENSIVE, not a live case: recordSightings writes UPSERT_OBS
  * and UPSERT_LISTING in one batch from the same values. It exists so the observation wins when
  * it exists (it names the row the price actually went into) and the listing's own keys name the
- * right aggregate when it does not. Caveat: if a market MOVE ever did produce divergence,
- * COALESCE would pick the aggregate of the market the candidate has left. Nothing today can
- * produce it; a future multi-market write path must re-check this.
+ * right aggregate when it does not. The multi-user write path (migrations/0009) re-checked it:
+ * recordSightings binds the ONE constant EVIDENCE_POOL_KEY into both rows whatever area a sighting
+ * came from, so overlapping areas cannot produce the divergence; WHICH area saw a listing lives in
+ * `listing_markets`, never in these keys.
  */
 export const candidateReadSql = (idCount: number): string => {
   const placeholders = Array.from({ length: idCount }, (_, index) => `?${index + 2}`).join(", ");

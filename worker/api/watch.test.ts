@@ -30,6 +30,9 @@ import {
 import { allSelection, derivedTargetCount } from "../../src/utils/validation";
 import type { ComponentType, ModelSelection } from "../../src/types";
 import { createTestDatabase, truncateAll, type TestDatabase } from "../testing/d1";
+import { addTarget, addUser, owner } from "../testing/users";
+import { marketKey } from "../storage/marketKey";
+import { mockLocations } from "../../src/data/catalog";
 import {
   claim,
   fingerprint,
@@ -75,17 +78,23 @@ const LIVE: [string, string, string][] = [
 const TORONTO = { slug: "toronto", latitude: 43.6532, longitude: -79.3832 };
 const WATERLOO = { slug: "waterloo", latitude: 43.4643, longitude: -80.5204 };
 
+/** The request clock every save stamps into `users.alerts_reopened_at`. */
+const NOW = 1_800_000_000;
+
+/** User 1's AREA (migrations/0009), the multi-user home of the retired watch_market row. */
 const insertMarket = (slug = "toronto", latitude = 43.6532, longitude = -79.3832, radius = 25) =>
   database.db
     .prepare(
-      "INSERT INTO watch_market (id, location, latitude, longitude, radius_km) VALUES (1,?1,?2,?3,?4)",
+      "UPDATE users SET location = ?1, latitude = ?2, longitude = ?3, radius_km = ?4 WHERE user_id = 1",
     )
     .bind(slug, latitude, longitude, radius);
 
-const insertTarget = (targetId: string, componentType: string, query: string) =>
+const insertTarget = (targetId: string, componentType: string, query: string, userId = 1) =>
   database.db
-    .prepare("INSERT INTO watch_targets (target_id, component_type, query) VALUES (?1,?2,?3)")
-    .bind(targetId, componentType, query);
+    .prepare(
+      "INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (?4,?1,?2,?3)",
+    )
+    .bind(targetId, componentType, query, userId);
 
 const seedLive = async () => {
   await truncateAll(database.db);
@@ -95,10 +104,13 @@ const seedLive = async () => {
   ]);
 };
 
-const rows = async () =>
+const rows = async (userId = 1) =>
   (
     await database.db
-      .prepare("SELECT target_id, component_type, query FROM watch_targets ORDER BY target_id")
+      .prepare(
+        "SELECT target_id, component_type, query FROM user_watch_targets WHERE user_id = ?1 ORDER BY target_id",
+      )
+      .bind(userId)
       .all<{ target_id: string; component_type: string; query: string }>()
   ).results;
 
@@ -113,10 +125,11 @@ const putRequest = (body: unknown) =>
   });
 
 /** THE WHOLE HANDLER, body read included, exactly as `worker/index.ts` calls it. */
-const put = (body: unknown, db: D1Database = database.db) => handlePutWatch(putRequest(body), db);
+const put = async (body: unknown, db: D1Database = database.db, userId = 1) =>
+  handlePutWatch(putRequest(body), db, await owner(database.db, userId), NOW);
 
-const get = async (db: D1Database = database.db): Promise<WatchBody> => {
-  const result = await handleGetWatch(db);
+const get = async (db: D1Database = database.db, userId = 1): Promise<WatchBody> => {
+  const result = await handleGetWatch(db, await owner(database.db, userId));
   if (!result.ok) throw new Error(`expected ok, got ${result.code}`);
   return result.body;
 };
@@ -799,9 +812,10 @@ describe("the watch list the BROWSER reads and writes", () => {
     const poisoned = {
       prepare: (sql: string) => {
         const statement = database.db.prepare(sql);
-        if (!sql.includes("INSERT INTO watch_market")) return statement;
+        if (!sql.includes("SET location = ?1")) return statement;
         return {
-          bind: (...args: unknown[]) => statement.bind(args[0], args[1], args[2], 99),
+          bind: (...args: unknown[]) =>
+            statement.bind(args[0], args[1], args[2], 99, args[4], args[5], args[6]),
         };
       },
       batch: (statements: unknown[]) =>
@@ -814,8 +828,8 @@ describe("the watch list the BROWSER reads and writes", () => {
     expect(await rows()).toEqual(before);
   });
 
-  /** W-one: a plain INSERT instead of the `id = 1` upsert would be a second market row. */
-  it("W-one: two PUTs with different markets leave exactly one watch_market row", async () => {
+  /** W-one: the area lives on the caller's row; a second save replaces it and stamps the re-open. */
+  it("W-one: two PUTs with different areas leave the caller's row on the second", async () => {
     await truncateAll(database.db);
     const body = (location: typeof TORONTO, radiusKm: number) => ({
       components: ["gpu"],
@@ -829,9 +843,9 @@ describe("the watch list the BROWSER reads and writes", () => {
     expect(await put(body(WATERLOO, 10))).toMatchObject({ ok: true });
 
     const market = await database.db
-      .prepare("SELECT COUNT(*) AS n, location, radius_km FROM watch_market")
-      .all<{ n: number; location: string; radius_km: number }>();
-    expect(market.results[0]).toEqual({ n: 1, location: "waterloo", radius_km: 10 });
+      .prepare("SELECT location, radius_km, alerts_reopened_at FROM users WHERE user_id = 1")
+      .all<{ location: string; radius_km: number; alerts_reopened_at: number }>();
+    expect(market.results[0]).toEqual({ location: "waterloo", radius_km: 10, alerts_reopened_at: NOW });
   });
 
   /**
@@ -915,7 +929,7 @@ describe("the watch list the BROWSER reads and writes", () => {
       },
     } as unknown as D1Database;
 
-    await expect(handleGetWatch(throwing)).resolves.toEqual({
+    await expect(handleGetWatch(throwing, await owner(database.db))).resolves.toEqual({
       ok: false,
       status: 503,
       code: "WATCH_TARGETS_STORAGE_FAILED",
@@ -950,8 +964,13 @@ describe("the watch list the BROWSER reads and writes", () => {
    */
   it("W-body: a wrong media type is 415, an oversized body is 413, and malformed JSON is 400", async () => {
     await seedLive();
-    const request = (init: RequestInit) =>
-      handlePutWatch(new Request("https://worker.example.test/api/watch", { method: "PUT", ...init }), database.db);
+    const request = async (init: RequestInit) =>
+      handlePutWatch(
+        new Request("https://worker.example.test/api/watch", { method: "PUT", ...init }),
+        database.db,
+        await owner(database.db),
+        NOW,
+      );
 
     expect(await request({ headers: { "Content-Type": "text/plain" }, body: "{}" })).toMatchObject({
       ok: false,
@@ -1049,5 +1068,212 @@ describe("the watch list the BROWSER reads and writes", () => {
 
     expect(await claim(database.db)).toBe(0);
     expect(await fingerprint(database.db)).toEqual(before);
+  });
+});
+
+/**
+ * MULTI-USER (migrations/0009): each user's searches are their own, and the 9-search budget is
+ * SHARED -- one Facebook request per distinct (component type, query, area).
+ */
+describe("PUT /api/watch -- per user, and the shared budget", () => {
+  const SECOND = 2;
+  const gpuOnly = (query: string, location = TORONTO, radiusKm = 25, preserved: string[] = []) => ({
+    components: ["gpu"],
+    models: { gpu: { mode: "all", values: [], query } },
+    location,
+    radiusKm,
+    preservedTargetIds: preserved,
+  });
+  /** `n` distinct psu queries plus one gpu query, all in one area. */
+  const many = (n: number, location = TORONTO) => ({
+    components: ["psu", "gpu"],
+    models: {
+      psu: { mode: "selected", values: componentById.psu.models.slice(0, n - 1) },
+      gpu: { mode: "all", values: [], query: "graphics card" },
+    },
+    location,
+    radiusKm: 25,
+    preservedTargetIds: [] as string[],
+  });
+
+  beforeEach(async () => {
+    await truncateAll(database.db);
+    await addUser(database.db, SECOND, "second@example.com");
+  });
+
+  /**
+   * W-iso: A USER CANNOT WRITE ANOTHER USER'S SEARCHES OR AREA. The second user's save keeps none
+   * of user 1's ids, so an unscoped DELETE_SCOPED would delete all of user 1's rows; an unscoped
+   * UPDATE_AREA would move user 1's area. GET reads only the caller's own.
+   */
+  it("W-iso: one user's save neither deletes, moves nor reveals another's searches", async () => {
+    expect(await put(gpuOnly("graphics card"), database.db, 1)).toMatchObject({ ok: true });
+    expect(await put(gpuOnly("rtx", WATERLOO, 10), database.db, SECOND)).toMatchObject({ ok: true });
+
+    expect(await rows(1)).toEqual([
+      { target_id: "gpu-graphics-card", component_type: "gpu", query: "graphics card" },
+    ]);
+    expect(await rows(SECOND)).toEqual([{ target_id: "gpu-rtx", component_type: "gpu", query: "rtx" }]);
+    const mine = await get(database.db, 1);
+    expect(mine.storedTargets.map((row) => row.query)).toEqual(["graphics card"]);
+    expect(mine.selection.location).toEqual(TORONTO);
+    expect(mine.selection.radiusKm).toBe(25);
+    const theirs = await get(database.db, SECOND);
+    expect(theirs.storedTargets.map((row) => row.query)).toEqual(["rtx"]);
+    expect(theirs.selection.location).toEqual(WATERLOO);
+  });
+
+  /**
+   * W-reopen: A SAVE THAT CHANGES WHAT IS WATCHED STAMPS THE CALLER'S `alerts_reopened_at`; ONE THAT
+   * CHANGES NOTHING DOES NOT. The dashboard sends this PUT on every Save, so an unconditional stamp
+   * re-opened the user's whole alert backlog on an untouched Save. Kills: the CASE replaced by a
+   * plain `= ?5` (the untouched save stamps), and `reopensAlerts` ignoring added searches or the area.
+   */
+  it("W-reopen: only an area change or a new search stamps alerts_reopened_at, and only the caller's", async () => {
+    const stamp = async (userId: number) =>
+      (
+        await database.db
+          .prepare("SELECT alerts_reopened_at AS at FROM users WHERE user_id = ?1")
+          .bind(userId)
+          .first<{ at: number | null }>()
+      )?.at;
+    const clear = () => database.db.prepare("UPDATE users SET alerts_reopened_at = NULL").run();
+
+    await put(gpuOnly("graphics card"), database.db, SECOND);
+    expect(await stamp(SECOND)).toBe(NOW);
+    expect(await stamp(1)).toBeNull();
+
+    await clear();
+    expect(await put(gpuOnly("graphics card"), database.db, SECOND)).toMatchObject({ ok: true });
+    expect(await stamp(SECOND)).toBeNull();
+
+    // The untouched GET->PUT round trip of a legacy-id list, the form's own Save: no stamp either,
+    // although every save re-derives the rows' ids.
+    await seedLive();
+    await addUser(database.db, SECOND, "second@example.com");
+    const live = await get();
+    expect(await put(saveBodyFrom(live))).toMatchObject({ ok: true });
+    expect(await stamp(1)).toBeNull();
+
+    // A new search stamps; so does an area change; dropping a kept search does not.
+    const added = await get();
+    expect(
+      await put(
+        saveBodyFrom(added, {
+          components: [...added.selection.components, "cpu_cooler"],
+          models: {
+            ...Object.fromEntries(added.selection.components.map((c) => [c, added.selection.models[c]])),
+            cpu_cooler: { mode: "all", values: [], query: "cpu cooler" },
+          },
+          preservedTargetIds: added.keptSearches.slice(1).map((row) => row.targetId),
+        }),
+      ),
+    ).toMatchObject({ ok: true });
+    expect(await stamp(1)).toBe(NOW);
+
+    await clear();
+    const moved = await get();
+    expect(await put(saveBodyFrom(moved, { location: WATERLOO, radiusKm: 10 }))).toMatchObject({ ok: true });
+    expect(await stamp(1)).toBe(NOW);
+
+    // The radius alone is a different area (another market key).
+    await clear();
+    const wider = await get();
+    expect(await put(saveBodyFrom(wider, { location: WATERLOO, radiusKm: 25 }))).toMatchObject({ ok: true });
+    expect(await stamp(1)).toBe(NOW);
+    await put(saveBodyFrom(await get(), { location: WATERLOO, radiusKm: 10 }));
+
+    await clear();
+    const fewer = await get();
+    expect(
+      await put(
+        saveBodyFrom(fewer, {
+          location: WATERLOO,
+          radiusKm: 10,
+          preservedTargetIds: fewer.keptSearches.slice(1).map((r) => r.targetId),
+        }),
+      ),
+    ).toMatchObject({ ok: true });
+    expect(await stamp(1)).toBeNull();
+  });
+
+  /** W-budget: GET reports the SHARED budget and the caller's share, as the 409 does. */
+  it("W-budget: GET /api/watch carries the shared use and the caller's share", async () => {
+    await put(many(3), database.db, 1);
+    await put(gpuOnly("graphics card"), database.db, SECOND);
+    await put(gpuOnly("rtx", WATERLOO, 25), database.db, SECOND);
+    expect((await get(database.db, 1)).budget).toEqual({ used: 4, maximum: MAX_WATCH_TARGETS, yours: 3 });
+    expect((await get(database.db, SECOND)).budget).toEqual({ used: 4, maximum: MAX_WATCH_TARGETS, yours: 1 });
+  });
+
+  /**
+   * W-cap: THE TENTH DISTINCT SEARCH IS A 409, ATOMICALLY. User 1 holds 9 distinct searches; the
+   * second user's identical gpu search in the SAME area is shared (still 9) and saves, while a new
+   * query is the tenth and is refused with the numbers -- and the refused save wrote NOTHING, its
+   * DELETE and area change included. Mutations: removing CAP_GUARD from the batch, or moving it
+   * before the INSERTs.
+   */
+  it("W-cap: shared searches count once, and the 10th distinct one is 409 WATCH_BUDGET_FULL", async () => {
+    expect(await put(many(9), database.db, 1)).toMatchObject({ ok: true });
+    expect(await rows(1)).toHaveLength(9);
+
+    expect(await put(gpuOnly("graphics card"), database.db, SECOND)).toMatchObject({ ok: true });
+
+    const refused = await put(gpuOnly("rtx", TORONTO, 25), database.db, SECOND);
+    expect(refused).toEqual({
+      ok: false,
+      status: 409,
+      code: "WATCH_BUDGET_FULL",
+      details: { used: 9, maximum: MAX_WATCH_TARGETS, yours: 1 },
+    });
+    // Rolled back: the second user still holds their shared search, in their old area.
+    expect(await rows(SECOND)).toEqual([
+      { target_id: "gpu-graphics-card", component_type: "gpu", query: "graphics card" },
+    ]);
+    expect(await database.db.prepare("SELECT COUNT(*) AS n FROM watch_cap_guard").first()).toEqual({ n: 0 });
+  });
+
+  /**
+   * W-cap-area: AN AREA CHANGE CAN TURN A SHARED SEARCH INTO A DISTINCT ONE -- and legitimately 409.
+   * The same query from Waterloo is a different Facebook request from the same query in Toronto.
+   */
+  it("W-cap-area: moving a shared search to another area is the 10th distinct search", async () => {
+    await put(many(9), database.db, 1);
+    expect(await put(gpuOnly("graphics card"), database.db, SECOND)).toMatchObject({ ok: true });
+    expect(await put(gpuOnly("graphics card", WATERLOO, 25, []), database.db, SECOND)).toMatchObject({
+      ok: false,
+      status: 409,
+      code: "WATCH_BUDGET_FULL",
+    });
+    expect((await get(database.db, SECOND)).selection.location).toEqual(TORONTO);
+  });
+
+  /**
+   * W-cap-key: THE GUARD COUNTS (latitude, longitude, radius) WHERE THE UNION COUNTS THE MARKET KEY.
+   * They agree only if distinct catalog coordinates are distinct keys -- pinned here over every
+   * catalog location and every legal radius.
+   */
+  it("W-cap-key: distinct catalog coordinates are distinct market keys", () => {
+    const tuples = new Set<string>();
+    const keys = new Set<string>();
+    for (const location of mockLocations) {
+      for (let radius = 1; radius <= 25; radius += 1) {
+        tuples.add(JSON.stringify([location.latitude, location.longitude, radius]));
+        keys.add(marketKey({ latitude: location.latitude, longitude: location.longitude, radiusKm: radius }));
+      }
+    }
+    expect(keys.size).toBe(tuples.size);
+  });
+
+  /** W-own-cap: each user's own 9-target cap is unchanged -- a 400, not the shared 409. */
+  it("W-own-cap: a user's own list over 9 is still the 400 it was", async () => {
+    await addTarget(database.db, "kept-a", "psu", "kept psu a", SECOND);
+    const body = { ...many(9), preservedTargetIds: ["kept-a"] };
+    expect(await put(body, database.db, SECOND)).toMatchObject({
+      ok: false,
+      status: 400,
+      code: "WATCH_TARGETS_EXCEEDED",
+    });
+    expect(await rows(SECOND)).toHaveLength(1);
   });
 });

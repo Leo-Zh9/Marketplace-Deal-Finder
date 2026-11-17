@@ -1,18 +1,18 @@
 /**
  * RE-CHECK ONE CLAIMED ROW AGAINST THE ENQUEUE PREDICATE, AND READ WHAT THE MESSAGE NEEDS.
  *
- * Same `CANDIDATE_PREDICATE` as enqueue.ts, for this one listing. Any failure -- the price
- * changed so the task was re-queued, the task is no longer a DEAL, the revision moved, the
- * listing went stale, the user stopped watching it, the model was lost, the saved market moved
- * away from the one it was collected in -- CANCELS the row. There
+ * Same `CANDIDATE_PREDICATE` as enqueue.ts, for this one listing and the CLAIMED ROW'S USER. Any
+ * failure -- the price changed so the task was re-queued, the listing is no longer a deal under the
+ * user's rule against today's aggregate, the listing went stale, the user stopped watching it, the
+ * model was lost, the user's area moved away from every area it was seen in -- CANCELS the row. There
  * is no fetch for a cancelled row.
  *
  * NEVER HOLD. A held row would need its own wake-up rule; a cancelled row already has one:
- * enqueue re-arms CANCELLED the next time the listing is again COMPLETE + DEAL + current
- * revision + fresh + selected, and it then sends at the price the drain just judged.
+ * enqueue re-arms CANCELLED the next time the listing again passes CANDIDATE_PREDICATE for that
+ * user (judged, a deal under their rule, fresh, selected, in their area) inside the window.
  *
  * The same read carries the message's inputs, so the alert is built from the state that passed
- * the check -- current price, the current revision's rule, the current aggregate -- and not from
+ * the check -- current price, the user's current rule, the current aggregate -- and not from
  * anything remembered at enqueue time. The aggregate is computed exactly as verdicts.ts computes
  * it, excluding the candidate's own observation.
  *
@@ -20,31 +20,31 @@
  * latest Discord answer (status.ts), and a cancel is not an answer.
  */
 
-import { CANDIDATE_PREDICATE, freshnessCutoff } from "./enqueue";
+import {
+  CANDIDATE_FROM,
+  CANDIDATE_PREDICATE,
+  freshnessCutoff,
+  REFERENCE_COUNT_SQL,
+  REFERENCE_TOTAL_SQL,
+} from "./enqueue";
 import type { NotifySelection } from "./selection";
 
+/**
+ * The claimed user's rule and area travel in the SAME read (`u`), so the message states the rule
+ * the listing just passed and the user's own radius -- never another user's, and never the retired
+ * `watch_market` singleton. ?1 now (unused by the predicate), ?2/?3 selection, ?4 freshness cutoff,
+ * ?5 source, ?6 listing_id, ?7 the user's area market key, ?8 user_id.
+ */
 export const RECHECK = `SELECT l.model_key, l.title, l.price_cents, l.location_text, l.last_seen_at,
-       sr.mode, sr.minimum_discount_percent, sr.maximum_price_cents,
-       wm.radius_km,
-       CASE WHEN p.listing_id IS NULL THEN s.count
-            ELSE s.count - 1 END                               AS reference_count,
-       CASE WHEN p.listing_id IS NULL THEN s.total_price_cents
-            ELSE s.total_price_cents - p.price_cents END        AS reference_total_cents
-  FROM listings l
-  JOIN evaluation_tasks t ON t.source = l.source AND t.listing_id = l.listing_id
-  JOIN search_settings ss ON ss.id = 1
-  JOIN search_revisions sr ON sr.revision = ss.current_revision
-  LEFT JOIN watch_market wm ON wm.id = 1
-  LEFT JOIN price_observations p
-         ON p.source = l.source AND p.listing_id = l.listing_id
-  LEFT JOIN model_stats s
-         ON s.market_key  = COALESCE(p.market_key,  l.market_key)
-        AND s.model_key   = COALESCE(p.model_key,   l.model_key)
-        AND s.variant_key = COALESCE(p.variant_key, l.variant_key)
- WHERE l.source = ?5 AND l.listing_id = ?6
+       u.mode, u.minimum_discount_bp, u.maximum_price_cents, u.radius_km,
+       ${REFERENCE_COUNT_SQL}                                   AS reference_count,
+       ${REFERENCE_TOTAL_SQL}                                   AS reference_total_cents
+  ${CANDIDATE_FROM}
+ WHERE u.user_id = ?8 AND l.source = ?5 AND l.listing_id = ?6
    AND ${CANDIDATE_PREDICATE}`;
 
-export const CANCEL = `UPDATE notifications
+/** Fenced on rowid and token, exactly as before; the rowid is a user_notifications rowid. */
+export const CANCEL = `UPDATE user_notifications
    SET status = 'CANCELLED', lease_token = NULL, lease_expires_at = NULL, updated_at = ?1
  WHERE rowid = ?2 AND status = 'SENDING' AND lease_token = ?3`;
 
@@ -69,7 +69,7 @@ interface RecheckRow {
   location_text: string | null;
   last_seen_at: number;
   mode: "DISCOUNT" | "MAXIMUM_PRICE" | "BOTH";
-  minimum_discount_percent: number | null;
+  minimum_discount_bp: number | null;
   maximum_price_cents: number | null;
   radius_km: number | null;
   reference_count: number | null;
@@ -83,6 +83,7 @@ export const recheck = async (
     now: number;
     selection: NotifySelection;
     marketKey: string | null;
+    userId: number;
     source: string;
     listingId: string;
   },
@@ -96,9 +97,10 @@ export const recheck = async (
       freshnessCutoff(input.now),
       input.source,
       input.listingId,
-      // ?7, which CANDIDATE_PREDICATE names: the saved market key. NULL matches nothing, so a
-      // claimed row with no market to check against is cancelled.
+      // ?7, which CANDIDATE_PREDICATE names: the user's area key. NULL matches nothing, so a
+      // claimed row with no area to check against is cancelled.
       input.marketKey,
+      input.userId,
     )
     .all<RecheckRow>();
   const row = read.results[0];
@@ -110,7 +112,8 @@ export const recheck = async (
     locationText: row.location_text,
     lastSeenAt: row.last_seen_at,
     mode: row.mode,
-    minimumDiscountPercent: row.minimum_discount_percent,
+    // Exact for every legal value (worker/api/settings.ts wireRule).
+    minimumDiscountPercent: row.minimum_discount_bp === null ? null : row.minimum_discount_bp / 100,
     maximumPriceCents: row.maximum_price_cents,
     radiusKm: row.radius_km,
     referenceCount: row.reference_count,

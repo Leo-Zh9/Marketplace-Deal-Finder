@@ -16,7 +16,8 @@
 /** The SENDING lease. Far under the 30-minute cron period, far over one 10 s fetch. */
 export const NOTIFY_LEASE_SECONDS = 600;
 
-export const SWEEP_EXPIRED = `UPDATE notifications
+/** Every user's rows: an expired lease is an unknown delivery whoever it was for. */
+export const SWEEP_EXPIRED = `UPDATE user_notifications
    SET status = 'DELIVERY_UNKNOWN', lease_token = NULL, lease_expires_at = NULL, updated_at = ?1
  WHERE status = 'SENDING' AND lease_expires_at < ?1`;
 

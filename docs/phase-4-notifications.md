@@ -1,5 +1,12 @@
 # Phase 4: Discord deal notifications (backend)
 
+> **Multi-user (migrations/0009, `docs/multi-user.md`).** Rows now live in `user_notifications`
+> (`PRIMARY KEY (user_id, source, listing_id)`, the same state machine). A candidate is a deal under
+> **the user's own rule** applied to the live aggregate (`RULE_PREDICATE`), seen in **the user's
+> area** (`listing_markets`), judged and not re-queued, and judged in the last day **or** re-opened
+> by the user's last save. The PR2 step sends for user 1 only, to `DISCORD_WEBHOOK_URL`.
+> `/api/status` counts the caller's own rows.
+
 This phase adds a `notify` step to the monitor Workflow. It runs after the drain steps and posts each
 qualifying DEAL to a Discord incoming webhook, at most once per listing. It also adds a
 `notifications` field to `GET /api/status`, which is additive.

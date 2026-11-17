@@ -18,6 +18,8 @@ export interface MonitorEnvironment {
   DISCORD_WEBHOOK_URL?: string;
   NOTIFICATIONS?: string;
   APP_ENV: string;
+  /** A secret. Decides which users are ACTIVE (worker/users/users.ts). */
+  APPROVED_EMAILS?: string;
 }
 
 export class MonitorWorkflow extends WorkflowEntrypoint<MonitorEnvironment, MonitorParams> {
@@ -35,6 +37,7 @@ export class MonitorWorkflow extends WorkflowEntrypoint<MonitorEnvironment, Moni
       DISCORD_WEBHOOK_URL: this.env.DISCORD_WEBHOOK_URL,
       NOTIFICATIONS: this.env.NOTIFICATIONS,
       APP_ENV: this.env.APP_ENV,
+      APPROVED_EMAILS: this.env.APPROVED_EMAILS,
     });
   }
 }

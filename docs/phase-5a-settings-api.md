@@ -1,5 +1,13 @@
 # Phase 5A — `GET` and `PUT /api/settings`
 
+> **Superseded in part by `docs/multi-user.md` (migrations/0009).** `GET`/`PUT /api/settings` now
+> read and write the **caller's own rule** on their `users` row (`minimum_discount_bp`,
+> `maximum_price_cents`); the body is unchanged except that `searchRevision` is no longer returned.
+> The API no longer writes `search_settings` / `search_revisions`: they are the frozen DISCOUNT
+> evidence rule the drain evaluates under. A real rule change stamps `users.alerts_reopened_at`
+> instead of bumping a revision. The boundary rules below (media type, size, refused fields) are
+> unchanged.
+
 This is the first HTTP surface over `worker/search/settings.ts`. Before it, `loadCurrentSettings`
 and `updateSearchSettings` were merged, tested and had **no production caller**: the only
 documented way to create a revision was a hand-written `wrangler d1 execute`

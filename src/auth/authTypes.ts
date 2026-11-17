@@ -19,18 +19,22 @@ export class ApiRequestError extends Error {
   readonly status: number | null;
   /** The server's `error.code`, or null. Consumed by AuthGate's service-error branch. */
   readonly code: string | null;
+  /** The error body's other fields (e.g. WATCH_BUDGET_FULL's `used`/`maximum`/`yours`). */
+  readonly details: Record<string, unknown>;
 
   constructor(
     message: string,
     kind: ApiErrorKind,
     status: number | null = null,
     code: string | null = null,
+    details: Record<string, unknown> = {},
   ) {
     super(message);
     this.name = "ApiRequestError";
     this.kind = kind;
     this.status = status;
     this.code = code;
+    this.details = details;
   }
 }
 

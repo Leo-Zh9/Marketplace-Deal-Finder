@@ -1,19 +1,28 @@
 /**
- * The two settings handlers. They return a RESULT, never a Response: worker/index.ts owns
- * securityHeaders, the CORS header and the error body, so a handler cannot ship a reply that
- * forgot one. That is structural, not a convention.
+ * The two settings handlers: ONE USER'S DEAL RULE (migrations/0009). They return a RESULT, never a
+ * Response: worker/index.ts owns securityHeaders, the CORS header and the error body, so a handler
+ * cannot ship a reply that forgot one. That is structural, not a convention.
+ *
+ * THIS FILE NO LONGER WRITES search_settings OR search_revisions. Those are the frozen internal
+ * DISCOUNT evidence rule the drain evaluates under; a user's rule lives on their `users` row and is
+ * applied at read and notify time (worker/evaluation/rulePredicate.ts). A rule change therefore
+ * re-opens no task -- it stamps `users.alerts_reopened_at`, which is what lets the deals the new rule
+ * qualifies alert (worker/notify/enqueue.ts).
  */
 
 import { validateSettings } from "../evaluation/dealRules";
-import type { DealMode, EvaluationSettings } from "../evaluation/types";
-import {
-  loadCurrentSettings,
-  updateSearchSettings,
-  type SearchSettingsInput,
-} from "../search/settings";
+import type { DealMode } from "../evaluation/types";
+import type { User, UserRule } from "../users/users";
+
+/** The wire shape is unchanged from the single-user API, minus the evidence rule's revision. */
+export interface WireRule {
+  mode: DealMode;
+  minimumDiscountPercent: number | null;
+  maximumPriceCents: number | null;
+}
 
 export interface SettingsReadBody {
-  settings: EvaluationSettings | null;
+  settings: WireRule | null;
 }
 export interface SettingsWriteBody extends SettingsReadBody {
   changed: boolean;
@@ -38,7 +47,7 @@ export type SettingsResult =
  */
 export const MAX_SETTINGS_BODY_BYTES = 4096;
 
-/** EXACTLY the three columns search_revisions has. Anything else is refused, never dropped. */
+/** EXACTLY the three fields a rule has. Anything else is refused, never dropped. */
 const ACCEPTED_FIELDS = new Set(["mode", "minimumDiscountPercent", "maximumPriceCents"]);
 
 const MODES: readonly DealMode[] = ["DISCOUNT", "MAXIMUM_PRICE", "BOTH"];
@@ -54,18 +63,47 @@ const readOptionalNumber = (
   return { ok: false };
 };
 
-export const handleGetSettings = async (db: D1Database): Promise<SettingsResult> => {
-  try {
-    const current = await loadCurrentSettings(db);
-    return { ok: true, status: 200, body: { settings: current.settings } };
-  } catch {
-    return fail(503, "SETTINGS_STORAGE_FAILED");
-  }
-};
+/**
+ * basis points / 100 is EXACT for all 10,001 legal values (search/settings.ts measured it through a
+ * REAL column), so the percent on the wire is the one that was applied.
+ */
+export const wireRule = (rule: UserRule | null): WireRule | null =>
+  rule === null
+    ? null
+    : {
+        mode: rule.mode,
+        minimumDiscountPercent: rule.minimumDiscountBp === null ? null : rule.minimumDiscountBp / 100,
+        maximumPriceCents: rule.maximumPriceCents,
+      };
+
+/** The caller's row was read by provisioning in this request, so GET costs no further read. */
+export const handleGetSettings = (user: User): SettingsResult => ({
+  ok: true,
+  status: 200,
+  body: { settings: wireRule(user.rule) },
+});
+
+/**
+ * One statement, scoped to the caller, returning what IS STORED. `alerts_reopened_at` moves only on
+ * a REAL change -- the single-user API bumped the revision (and so re-judged every task) only then.
+ * ?1 mode, ?2 bp, ?3 max, ?4 now, ?5 user_id, ?6 1 when the rule changed.
+ */
+const UPDATE_RULE = `UPDATE users
+   SET mode = ?1, minimum_discount_bp = ?2, maximum_price_cents = ?3,
+       alerts_reopened_at = CASE WHEN ?6 = 1 THEN ?4 ELSE alerts_reopened_at END
+ WHERE user_id = ?5
+RETURNING mode, minimum_discount_bp, maximum_price_cents`;
+
+interface RuleRow {
+  mode: DealMode;
+  minimum_discount_bp: number | null;
+  maximum_price_cents: number | null;
+}
 
 export const handlePutSettings = async (
   request: Request,
   db: D1Database,
+  user: User,
   now: number,
 ): Promise<SettingsResult> => {
   const mediaType = (request.headers.get("Content-Type") ?? "").split(";")[0].trim().toLowerCase();
@@ -131,56 +169,49 @@ export const handlePutSettings = async (
   const cents = readOptionalNumber(body.maximumPriceCents);
   if (!percent.ok || !cents.ok) return fail(400, "INVALID_SETTINGS");
 
-  const input: SearchSettingsInput = {
-    mode,
-    minimumDiscountPercent: percent.value,
-    maximumPriceCents: cents.value,
-  };
-
-  // The merged validator, run here ONLY to classify: past this point a throw out of
-  // updateSearchSettings is an infrastructure failure, not bad input, so the two cannot be
-  // reported alike. revision 0 is a placeholder -- every other check is revision-independent,
-  // and updateSearchSettings still runs its own validation before any write.
+  // The merged validator, and the PROJECTION it applies is what is stored: 4.35 and
+  // 4.350000000000001 are the same 435 basis points, and the field a mode ignores is dropped.
+  // revision 0 is a placeholder -- every check is revision-independent.
+  let next;
   try {
-    validateSettings({ ...input, searchRevision: 0 });
+    next = validateSettings({
+      mode,
+      minimumDiscountPercent: percent.value,
+      maximumPriceCents: cents.value,
+      searchRevision: 0,
+    });
   } catch {
     return fail(400, "INVALID_SETTINGS");
   }
+  const live = user.rule;
+  const changed =
+    live === null ||
+    live.mode !== next.mode ||
+    live.minimumDiscountBp !== next.basisPoints ||
+    live.maximumPriceCents !== next.maximumPriceCents;
 
-  // SETTINGS_STORAGE_FAILED BELOW HAS THREE OCCUPANTS. Only the first is what the message says.
-  //
-  // (1) A real storage outage -- D1 unreachable, the batch rejected. Transient, retry helps.
-  //
-  // (2) A CORRUPT LIVE ROW, which is PERMANENT and which this API can never repair. MEASURED:
-  //     `INSERT INTO search_revisions VALUES (0,'MAXIMUM_PRICE',NULL,60000.5,1)` -- the
-  //     runbook's own hand-written bootstrap -- passes `CHECK (maximum_price_cents >= 0)`,
-  //     because SQLite INTEGER is AFFINITY, not a type. updateSearchSettings validates the LIVE
-  //     ROW before comparing, so the jam fires exactly when the stored value fails
-  //     `Number.isSafeInteger` -- not merely when it is fractional. MEASURED, both halves:
-  //     60000.5 stores as typeof 'real' and jams; 9007199254740993.0 stores as typeof
-  //     'integer', is SILENTLY ROUNDED to 9007199254740992, and jams too; 'abc' stores as
-  //     typeof 'text' (the column's only CHECK is a lower bound and SQLite orders text above
-  //     every number) and jams while GET hands the caller a STRING; 60000.0 stores as
-  //     typeof 'integer' and does NOT jam. Once jammed, every subsequent PUT lands here, in
-  //     EVERY mode -- a mode change does not escape it -- while GET happily returns 200 with
-  //     the corrupt value. No new error code for it: the state is unreachable through this API
-  //     and a status 5D must handle for it would be a contract for a case 5D cannot cause. The
-  //     repair is one statement and is in docs/phase-5a-settings-api.md.
-  //
-  // (3) A CONCURRENT PUT, which is transient and cured by a retry. MEASURED: two parallel PUTs
-  //     answer one 200 and one 503, with exactly one row written, the pointer on it and no
-  //     corruption; the same PUT twice -- a double-clicked save button -- does the same. The
-  //     race is inside merged updateSearchSettings (read revision -> compute next -> INSERT on
-  //     that PK) and its batch rolls back cleanly, so nothing here can fix it and nothing here
-  //     needs to. 5D: debounce the save, and treat a 503 on PUT as safe to retry.
+  // SETTINGS_STORAGE_FAILED is a storage outage. The 0009 CHECKs mirror validateSettings, so a
+  // validated projection cannot fail them; the single-user API's "corrupt live row jams every PUT"
+  // occupant (docs/phase-5a-settings-api.md) is gone with the read-before-write it came from.
   try {
-    const applied = await updateSearchSettings(db, { ...input, now });
-    // Re-read rather than echo the input: the response then reports what IS STORED, including
-    // the fields the mode made inert and dropped. The cost is named: if this re-read throws
-    // after the write committed, the caller gets 503 while the row IS written. The retry is
-    // idempotent and answers changed:false, so it self-heals -- but that one response lies.
-    const current = await loadCurrentSettings(db);
-    return { ok: true, status: 200, body: { settings: current.settings, changed: applied.changed } };
+    const written = await db
+      .prepare(UPDATE_RULE)
+      .bind(next.mode, next.basisPoints, next.maximumPriceCents, now, user.userId, changed ? 1 : 0)
+      .all<RuleRow>();
+    const row = written.results[0];
+    if (row === undefined) return fail(503, "SETTINGS_STORAGE_FAILED");
+    return {
+      ok: true,
+      status: 200,
+      body: {
+        settings: wireRule({
+          mode: row.mode,
+          minimumDiscountBp: row.minimum_discount_bp,
+          maximumPriceCents: row.maximum_price_cents,
+        }),
+        changed,
+      },
+    };
   } catch {
     return fail(503, "SETTINGS_STORAGE_FAILED");
   }
