@@ -195,7 +195,7 @@ export const componentCatalog: ComponentDefinition[] = [
     id: "storage",
     label: "Storage",
     description: "SSDs and hard drives",
-    searchTerm: "ssd",
+    searchTerm: "internal ssd",
     models: [
       "Samsung 9100 Pro 4TB",
       "Samsung 9100 Pro 2TB",
