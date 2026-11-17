@@ -4,9 +4,15 @@
  * THE PARITY PROPERTY between RULE_PREDICATE (SQL) and `decide` (JS), over the plan's cross product:
  *
  *   validity {VALID, INVALID_REFERENCE, NEEDS_REVIEW, '', 'valid'}
- *   P {NULL, 0, 1, rand, 1e8, 1e8+1, 12.5}
- *   C {NULL, -1, 0, 4, 5, rand, 1e5, 1e5+1, 6.5}
- *   T {NULL, -1, 0, P*C-1, P*C, P*C+1, rand, 1.5, near MAX_SAFE_INTEGER}
+ *   P {NULL, 0, 1, rand, 1e8, 1e8+1, 12.5, MAX_SAFE/5}
+ *   C {NULL, -1, 0, 4, 5, rand, 1e5, 1e5+1, 6.5, 90071992}
+ *   T {NULL, -1, 0, P*C-1, P*C, P*C+1, rand, 1.5, MAX_SAFE-1, 2^53}
+ *
+ * THE THREE VALUES PAST THE PLAN'S LIST ARE THE OVERFLOW PROBES that make the bounds killable:
+ * P = MAX_SAFE/5 with C = 5, and P = 1e8 with C = 90071992, put P*C*10000 at ~9.007e19 -- past
+ * 2^63, where SQLite falls back to a double whose spacing (16384) exceeds the 10000 that separates
+ * T = P*C-1 from a deal. Without the price or the count bound, those rows read DEAL in SQL and
+ * NOT_DEAL in `decide`. 2^53 is a total `decide` calls corrupt.
  *   every mode x bp {0, 1, 435, 4999, 10000} x max {0, P-1, P, P+1}; unused rule fields NULL.
  *
  * Asserted:
@@ -64,8 +70,8 @@ interface Case {
 
 const buildCases = (): Case[] => {
   const validities = ["VALID", "INVALID_REFERENCE", "NEEDS_REVIEW", "", "valid"];
-  const prices: (number | null)[] = [null, 0, 1, 1 + random(400_000), 1e8, 1e8 + 1, 12.5];
-  const counts: (number | null)[] = [null, -1, 0, 4, 5, 6 + random(500), 1e5, 1e5 + 1, 6.5];
+  const prices: (number | null)[] = [null, 0, 1, 1 + random(400_000), 1e8, 1e8 + 1, 12.5, 1801439850948198];
+  const counts: (number | null)[] = [null, -1, 0, 4, 5, 6 + random(500), 1e5, 1e5 + 1, 6.5, 90071992];
   const bps = [0, 1, 435, 4999, 10000];
   const cases: Case[] = [];
   for (const validity of validities) {
@@ -81,6 +87,7 @@ const buildCases = (): Case[] => {
           1 + random(50_000_000),
           1.5,
           Number.MAX_SAFE_INTEGER - 1,
+          2 ** 53,
           ...(product === null ? [] : [product - 1, product, product + 1]),
         ];
         for (const total of totals) {

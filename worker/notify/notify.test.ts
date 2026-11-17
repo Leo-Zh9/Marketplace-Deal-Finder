@@ -16,6 +16,7 @@ import type { NotifyEnvironment } from "./config";
 import { NOTIFY_FRESH_SECONDS } from "./enqueue";
 import { runNotify, WRITE_RESULT, type NotifyCounts } from "./runNotify";
 import { readNotificationsStatus } from "./status";
+import { readSelection } from "./selection";
 import { NOTIFY_LEASE_SECONDS } from "./sweep";
 
 const T = 1_700_000_000;
@@ -1316,5 +1317,55 @@ describe("per user", () => {
     expect(fake.calls).toHaveLength(0);
     expect(prepared).toHaveLength(1);
     expect(prepared[0]).toMatch(/FROM users WHERE user_id = \?1/);
+  });
+
+  /**
+   * N-scope. THE SELECTION AND THE STATUS ARE THE CALLER'S OWN. A second user's cpu search never
+   * widens the owner's selection, and their SENT / FAILED / rejected rows never reach the owner's
+   * counts. Kills: dropping `user_id = ?1` from SELECT_WATCH_TARGETS, or `user_id = ?2` from any
+   * SELECT_NOTIFY_STATUS subquery.
+   */
+  it("N-scope: another user's searches and rows reach neither the owner's selection nor status", async () => {
+    await world();
+    await second();
+    await db
+      .prepare(
+        "INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (2, 'c', 'cpu', 'cpu')",
+      )
+      .run();
+    expect(await readSelection(db, 1)).toEqual({ all: ["gpu"], pairs: [] });
+    expect(await readSelection(db, 2)).toEqual({ all: ["cpu", "gpu"], pairs: [] });
+
+    for (const [id, status, error] of [
+      ["2001", "PENDING", null],
+      ["2002", "SENT", null],
+      ["2003", "DELIVERY_UNKNOWN", null],
+      ["2004", "FAILED", "webhook-rejected:404"],
+    ] as const) {
+      await db
+        .prepare(
+          `INSERT INTO user_notifications (user_id, source, listing_id, model_key, status, created_at,
+             updated_at, sent_at, last_attempt_at, last_error)
+           VALUES (2, ?1, ?2, ?3, ?4, 1, 1, ?5, ?5, ?6)`,
+        )
+        .bind(SOURCE, id, MODEL, status, T - 10, error)
+        .run();
+    }
+    expect(await readNotificationsStatus(db, ON, T, 1)).toEqual({
+      state: "on",
+      pending: 0,
+      sent24h: 0,
+      deliveryUnknown: 0,
+      failed: 0,
+      lastSentAt: null,
+    });
+    expect(await readNotificationsStatus(db, ON, T, 2)).toEqual({
+      state: "webhook-rejected",
+      pending: 1,
+      sent24h: 1,
+      deliveryUnknown: 1,
+      failed: 1,
+      lastSentAt: T - 10,
+    });
   });
 });

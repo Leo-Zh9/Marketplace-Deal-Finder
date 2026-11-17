@@ -8,11 +8,11 @@
  * is no fetch for a cancelled row.
  *
  * NEVER HOLD. A held row would need its own wake-up rule; a cancelled row already has one:
- * enqueue re-arms CANCELLED the next time the listing is again COMPLETE + DEAL + current
- * revision + fresh + selected, and it then sends at the price the drain just judged.
+ * enqueue re-arms CANCELLED the next time the listing again passes CANDIDATE_PREDICATE for that
+ * user (judged, a deal under their rule, fresh, selected, in their area) inside the window.
  *
  * The same read carries the message's inputs, so the alert is built from the state that passed
- * the check -- current price, the current revision's rule, the current aggregate -- and not from
+ * the check -- current price, the user's current rule, the current aggregate -- and not from
  * anything remembered at enqueue time. The aggregate is computed exactly as verdicts.ts computes
  * it, excluding the candidate's own observation.
  *
