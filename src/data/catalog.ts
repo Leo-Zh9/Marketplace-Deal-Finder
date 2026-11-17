@@ -319,7 +319,7 @@ export const componentCatalog: ComponentDefinition[] = [
     id: "psu",
     label: "PSU",
     description: "Power supplies",
-    searchTerm: "atx power supply",
+    searchTerm: "power supply",
     models: [
       "Corsair AX1600i",
       "Corsair HX1500i",
