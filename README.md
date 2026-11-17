@@ -125,6 +125,10 @@ reachable from a deployed instance.
 `.dev.vars` holds local-only values and is gitignored. See `.dev.vars.example` — it is
 deliberately empty, because local development needs no secrets.
 
+To test the whole product as its users do -- the real dashboard in a browser, several local users
+(`?as=alice`), the real collector and a fake Discord -- use `./scripts/ui-stack.sh`; see
+`docs/local-ui-testing.md`.
+
 ---
 
 ## Deploying
