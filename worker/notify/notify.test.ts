@@ -1368,4 +1368,45 @@ describe("per user", () => {
       lastSentAt: T - 10,
     });
   });
+
+  /**
+   * N-recheck-user. THE RE-CHECK APPLIES THE CLAIMED ROW'S USER'S RULE, NOBODY ELSE'S. The owner's
+   * PENDING row is for a listing that is not a deal under the owner's DISCOUNT 20% (59,000 against
+   * a 48,000 threshold) but IS under the second user's MAXIMUM_PRICE 1,000,000. It is cancelled,
+   * never sent. Kills: dropping `u.user_id = ?8` from RECHECK (the second user's row passes).
+   */
+  it("N-recheck-user: the owner's claimed row is re-checked under the owner's rule only", async () => {
+    await world();
+    await second();
+    await deal("1401", { price: 59_000 });
+    await notification("1401", "PENDING");
+    const fake = discord();
+
+    const counts = await notify(fake);
+
+    expect(counts).toMatchObject({ enqueued: 0, cancelled: 1, sent: 0 });
+    expect(fake.calls).toHaveLength(0);
+    expect(await statusOf("1401")).toBe("CANCELLED");
+  });
+
+  /**
+   * N-not-exists-user. ANOTHER USER'S ROW NEVER BLOCKS THE OWNER'S. The second user was already
+   * SENT this listing; the owner still gets their own alert. Kills: dropping
+   * `n.user_id = u.user_id` from the NOT EXISTS.
+   */
+  it("N-not-exists-user: a second user's SENT row does not block the owner's enqueue", async () => {
+    await world();
+    await second();
+    await deal("1501");
+    await db
+      .prepare(
+        `INSERT INTO user_notifications (user_id, source, listing_id, model_key, status, created_at, updated_at, sent_at)
+         VALUES (2, ?1, '1501', ?2, 'SENT', 1, 1, 1)`,
+      )
+      .bind(SOURCE, MODEL)
+      .run();
+
+    expect((await notify(discord(), T, { maxSends: 0 })).enqueued).toBe(1);
+    expect(await statusOf("1501")).toBe("PENDING");
+  });
 });
