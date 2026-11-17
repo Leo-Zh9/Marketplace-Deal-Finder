@@ -1668,6 +1668,27 @@ describe("runMonitor -- the Stop flag", () => {
   });
 
   /**
+   * R-owner. AN UNCLAIMED OR MIS-CLAIMED OWNER DEGRADES THE RUN -- never STOPPED, which does not
+   * warn. It finalizes, releases, drains nothing and names why. Kills: dropping the check.
+   */
+  it("R-owner: user 1 with no approved email is DEGRADED, not STOPPED", async () => {
+    await maximumPriceSettings();
+    await seed("alpha", 2);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await db.prepare("UPDATE users SET email = NULL WHERE user_id = 1").run();
+    const unclaimed = await runMonitor(db, recording().stepper, { now: T }, "run-unclaimed");
+    await db.prepare("UPDATE users SET email = 'typo@example.com' WHERE user_id = 1").run();
+    const typo = await runMonitor(db, recording().stepper, { now: T }, "run-typo");
+    for (const run of [unclaimed, typo]) {
+      expect(run.status).toBe("DEGRADED");
+      expect(run.errors[0]).toMatch(/OWNER_UNCLAIMED/);
+    }
+    expect(await taskStatuses()).toEqual([{ status: "PENDING", n: 2 }]);
+    expect(await lockRow()).toEqual({ run_id: "", acquired_at: T, expires_at: 0 });
+    warn.mockRestore();
+  });
+
+  /**
    * R-other. STOPPED ONLY WHEN NOBODY IS ACTIVE. The owner Stopped, a second allowlisted user still
    * Started: the run drains (OK), and the PR2 notify step -- the owner's -- sends nothing.
    */

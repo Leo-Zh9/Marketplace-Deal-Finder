@@ -17,6 +17,8 @@ import { CATALOG_COMPONENT_ID } from "../normalize/catalogIndex";
 import {
   areaMarketKey,
   isActive,
+  isApproved,
+  OWNER_USER_ID,
   readAllowlist,
   userColumns,
   userFromRow,
@@ -77,7 +79,7 @@ const SELECT_ENABLED_TARGETS = `SELECT ${userColumns("u")},
        t.target_id, t.component_type, t.query
   FROM users u
   LEFT JOIN user_watch_targets t ON t.user_id = u.user_id
- WHERE u.monitoring_enabled = 1
+ WHERE u.monitoring_enabled = 1 OR u.user_id = ${OWNER_USER_ID}
  ORDER BY u.user_id, t.target_id`;
 
 interface Row extends UserRow {
@@ -119,6 +121,14 @@ export const handleGetWatchTargets = async (
     // answering `{market, targets: []}` instead would make a storage outage read to the
     // collector as "there is nothing to hunt" -- a silent stop, not a loud one. W-3 pins it.
     return { ok: false, status: 503, code: "WATCH_TARGETS_STORAGE_FAILED" };
+  }
+
+  // AN UNCLAIMED OR MIS-CLAIMED OWNER IS A LOUD FAILURE, NEVER "STOPPED". User 1 with no email, or
+  // with an email the allowlist does not approve (a typo in the operator's claim), would otherwise
+  // read as "nobody is active" -- the collector exits 0 every run and collection stops silently.
+  const owner = rows.find((row) => row.user_id === OWNER_USER_ID);
+  if (owner === undefined || !isApproved(owner.email, allowlist)) {
+    return { ok: false, status: 503, code: "OWNER_UNCLAIMED" };
   }
 
   let anyActive = false;

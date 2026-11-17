@@ -555,13 +555,17 @@ export const runMonitor = async (
     escalate("DEGRADED");
     return finalize();
   }
-  const loaded: Awaited<ReturnType<typeof loadCurrentSettings>> & { stopped?: boolean } =
+  const loaded: Awaited<ReturnType<typeof loadCurrentSettings>> & {
+    stopped?: boolean;
+    ownerClaimed?: boolean;
+  } =
     await runStep("load-settings", async () => {
       const current = await loadCurrentSettings(db);
       const active = await loadActiveUsers(db, allowlist);
       return {
         settings: current.settings,
         stopped: active.users.length === 0,
+        ownerClaimed: active.ownerClaimed,
         usage: {
           rowsRead: current.usage.rowsRead + active.usage.rowsRead,
           rowsWritten: current.usage.rowsWritten + active.usage.rowsWritten,
@@ -569,6 +573,14 @@ export const runMonitor = async (
       };
     });
   spend(loaded.usage);
+  // AN UNCLAIMED OR MIS-CLAIMED OWNER DEGRADES THE RUN. Read as "nobody is active" it would record
+  // STOPPED -- which does not warn -- while the operator's install collects nothing. Missing on a
+  // result memoized by an older Worker, which reads as claimed: the state it was recorded in.
+  if (loaded.ownerClaimed === false) {
+    recordError("load-settings: OWNER_UNCLAIMED: user 1 has no email the allowlist approves");
+    escalate("DEGRADED");
+    return finalize();
+  }
   if (loaded.stopped === true) {
     escalate("STOPPED");
     return finalize();

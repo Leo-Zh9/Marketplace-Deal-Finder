@@ -215,16 +215,23 @@ export const isApproved = (email: string | null, allowlist: Allowlist): boolean 
 export const isActive = (user: User, allowlist: Allowlist): boolean =>
   user.monitoringEnabled && isApproved(user.email, allowlist);
 
-const SELECT_ENABLED = `SELECT ${USER_COLUMNS} FROM users WHERE monitoring_enabled = 1 ORDER BY user_id`;
+const SELECT_ENABLED = `SELECT ${USER_COLUMNS} FROM users
+ WHERE monitoring_enabled = 1 OR user_id = ${OWNER_USER_ID} ORDER BY user_id`;
 
-/** Every ACTIVE user, ordered by user_id, with the read's cost. */
+/**
+ * Every ACTIVE user, ordered by user_id, with the read's cost -- and whether the OWNER is claimed by
+ * an approved email. The same read carries user 1 whether or not it is Started, so the check is free.
+ */
 export const loadActiveUsers = async (
   db: D1Database,
   allowlist: Allowlist,
-): Promise<{ users: User[]; usage: D1Usage }> => {
+): Promise<{ users: User[]; ownerClaimed: boolean; usage: D1Usage }> => {
   const read = await db.prepare(SELECT_ENABLED).all<UserRow>();
+  const all = read.results.map(userFromRow);
+  const owner = all.find((user) => user.userId === OWNER_USER_ID);
   return {
-    users: read.results.map(userFromRow).filter((user) => isActive(user, allowlist)),
+    users: all.filter((user) => isActive(user, allowlist)),
+    ownerClaimed: owner !== undefined && isApproved(owner.email, allowlist),
     usage: { rowsRead: read.meta.rows_read, rowsWritten: read.meta.rows_written },
   };
 };

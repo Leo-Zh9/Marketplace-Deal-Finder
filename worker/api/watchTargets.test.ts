@@ -212,18 +212,38 @@ describe("GET /api/watch-targets", () => {
   });
 
   /**
-   * W-allow: ACTIVE MEANS ALLOWLISTED TOO. A Started user who was removed from APPROVED_EMAILS
-   * collects nothing; with nobody left the answer is "stopped".
+   * W-allow: ACTIVE MEANS ALLOWLISTED TOO. A Started second user who was removed from
+   * APPROVED_EMAILS collects nothing; with nobody else active the answer is "stopped".
    */
   it("W-allow: a Started user missing from the allowlist contributes nothing", async () => {
-    await seedMarket();
-    await seedTarget("gpu-toronto", "gpu", "graphics card");
-    const removed = { APP_ENV: "production", APPROVED_EMAILS: JSON.stringify(["someone@example.com"]) };
-    await expect(read(database.db, removed)).resolves.toEqual({
+    await setMonitoring(database.db, false, 1);
+    await addUser(database.db, 2, "removed@example.com", true);
+    await seedMarket(TORONTO, 2);
+    await seedTarget("gpu-toronto", "gpu", "graphics card", 2);
+    await expect(read()).resolves.toEqual({
       ok: true,
       status: 200,
       body: { market: null, targets: [], monitoring: "stopped" },
     });
+  });
+
+  /**
+   * W-owner: AN UNCLAIMED OR MIS-CLAIMED OWNER IS 503 OWNER_UNCLAIMED, NEVER "STOPPED". Read as
+   * "nobody is active" it would make the collector exit 0 every run and collect nothing, silently --
+   * an operator typo in the claim would look like a quiet week. Kills: dropping the owner check.
+   */
+  it("W-owner: user 1 unclaimed, absent from the allowlist, or missing is 503 OWNER_UNCLAIMED", async () => {
+    await seedMarket();
+    await seedTarget("gpu-toronto", "gpu", "graphics card");
+    const refused = { ok: false, status: 503, code: "OWNER_UNCLAIMED" };
+    const typo = { APP_ENV: "production", APPROVED_EMAILS: JSON.stringify(["0wner@example.com"]) };
+    await expect(read(database.db, typo)).resolves.toEqual(refused);
+    await database.db.prepare("UPDATE users SET email = NULL WHERE user_id = 1").run();
+    await expect(read()).resolves.toEqual(refused);
+    // A Stopped but claimed owner is fine: that is an ordinary Stop.
+    await database.db.prepare("UPDATE users SET email = 'owner@example.com' WHERE user_id = 1").run();
+    await setMonitoring(database.db, false, 1);
+    await expect(read()).resolves.toMatchObject({ ok: true, body: { monitoring: "stopped" } });
   });
 
   /**
@@ -252,10 +272,10 @@ describe("GET /api/watch-targets", () => {
     await expect(read(database.db, { APP_ENV: "local" })).resolves.toMatchObject({
       body: { monitoring: "running", targets: [{ targetId: "gpu-graphics-card@toronto-25" }] },
     });
-    // ...and a production Worker never treats @localhost as approved.
+    // ...and a production Worker never treats @localhost as approved: the owner reads as unclaimed.
     await expect(
       read(database.db, { APP_ENV: "production", APPROVED_EMAILS: TEST_ALLOWLIST }),
-    ).resolves.toMatchObject({ body: { monitoring: "stopped" } });
+    ).resolves.toMatchObject({ status: 503, code: "OWNER_UNCLAIMED" });
   });
 
   /**
