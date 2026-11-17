@@ -98,13 +98,22 @@ export type StatusWithMonitoring = Omit<CollectorStatusBody, "status"> & {
  * design and its last run's causes describe a run the operator has since paused; showing
  * "Degraded" or "No recent run" beside a Stop they pressed would train them to ignore the badge.
  * `reportedAt`, `ageMinutes` and `collector` stay, so the page still says when the last run was.
+ *
+ * `status-unreadable` SURVIVES THE STOP. It is not a fault of the paused run but a fact about this
+ * read: the health row could not be seen. Clearing it would leave `collector: null` and no cause,
+ * which the panel reads as "No collector run has reported yet" -- false. M-9.
  */
 export const applyMonitoring = (
   health: CollectorStatusBody,
   monitoring: MonitoringState | null,
 ): StatusWithMonitoring =>
   monitoring?.state === "stopped"
-    ? { ...health, status: "stopped", causes: [], monitoring }
+    ? {
+        ...health,
+        status: "stopped",
+        causes: health.causes.filter((cause) => cause === "status-unreadable"),
+        monitoring,
+      }
     : { ...health, monitoring };
 
 const write = async (db: D1Database, enabled: 0 | 1, now: number): Promise<MonitoringResult> => {

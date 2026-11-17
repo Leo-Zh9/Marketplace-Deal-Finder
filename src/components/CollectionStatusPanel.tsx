@@ -56,13 +56,20 @@ const CANARY_TARGETS = 2;
  * WHAT EACH EXIT CODE MEANS, in the words of `collector/run.ts`'s table, so the panel says who must
  * act rather than a bare number. An unlisted code falls back to "The last run exited N.", because
  * a newer collector may exit with a code this page has never heard of. P-7.
+ *
+ * THE CODE IS THE RUN'S WORST ACROSS ALL TARGETS (`worstExitCode`, collector/runTargets.ts), so
+ * every sentence must stay true in a MIXED run: one search's 4 does not mean nothing was saved.
+ * 5 and 6 can also come from the collector's own watch-list read, before any search ran, so they
+ * name "a call to the server" / "a request", not only a search or an upload. A missing env
+ * variable never reaches here -- it exits before any health report -- so 2 is a bad setting or
+ * search entry inside the run.
  */
 const EXIT_WORDS: Record<string, string> = {
-  "2": "The collector is missing a required setting, so nothing was searched.",
+  "2": "A search could not be run because of a bad setting or search entry. Someone needs to look.",
   "3": "A search came back empty.",
-  "4": "Facebook’s page changed shape, so nothing was saved. Someone needs to look.",
-  "5": "Facebook could not be reached, or the upload failed. The next run will retry.",
-  "6": "The server refused the upload or could not save some listings. Someone needs to look.",
+  "4": "A search’s page changed shape, so that search saved nothing. Someone needs to look.",
+  "5": "A search, or a call to the server, failed. The next run will retry; if this keeps showing, the server may be down.",
+  "6": "The server refused a request from the collector, or could not save some listings. Someone needs to look.",
 };
 
 /**

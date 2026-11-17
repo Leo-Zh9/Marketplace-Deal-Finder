@@ -201,6 +201,31 @@ describe("applyMonitoring", () => {
     });
   });
 
+  /**
+   * M-9. STOPPED KEEPS `status-unreadable`, AND ONLY THAT. Kills: clearing every cause, under which
+   * a stopped collector whose health read failed reads "Stopped" beside the false "No collector
+   * run has reported yet". `exit-code:1` rides along to prove the other causes still clear.
+   */
+  it("M-9: stopped keeps status-unreadable and clears every other cause", () => {
+    const monitoring = { state: "stopped", changedAt: 1_799_995_000 } as const;
+    const unreadable: CollectorStatusBody = {
+      status: "unknown",
+      causes: ["status-unreadable", "exit-code:1"],
+      reportedAt: 0,
+      ageMinutes: 0,
+      collector: null,
+    };
+
+    expect(applyMonitoring(unreadable, monitoring)).toEqual({
+      status: "stopped",
+      causes: ["status-unreadable"],
+      reportedAt: 0,
+      ageMinutes: 0,
+      collector: null,
+      monitoring,
+    });
+  });
+
   /** M-8. Running and unknown (null) override nothing; they only add the field. */
   it("M-8: running and a failed read leave the health body as it was", () => {
     const running = { state: "running", changedAt: 0 } as const;

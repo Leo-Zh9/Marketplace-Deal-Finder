@@ -146,14 +146,15 @@ describe("the collection status panel", () => {
    * produces: every run punctual, every run exiting 6, NOTHING stored. Each sentence is
    * `collector/run.ts`'s table in words, so the page says who must act instead of a bare number
    * (a login wall exits 5 and used to read "The last run exited 5."). A code the table does not
-   * list keeps the number, because a newer collector may add one.
+   * list keeps the number, because a newer collector may add one. The code is the run's WORST
+   * across targets, so no sentence may claim the whole run saved nothing.
    */
   it.each<[number, string]>([
-    [2, "The collector is missing a required setting, so nothing was searched."],
+    [2, "A search could not be run because of a bad setting or search entry. Someone needs to look."],
     [3, "A search came back empty."],
-    [4, "Facebook’s page changed shape, so nothing was saved. Someone needs to look."],
-    [5, "Facebook could not be reached, or the upload failed. The next run will retry."],
-    [6, "The server refused the upload or could not save some listings. Someone needs to look."],
+    [4, "A search’s page changed shape, so that search saved nothing. Someone needs to look."],
+    [5, "A search, or a call to the server, failed. The next run will retry; if this keeps showing, the server may be down."],
+    [6, "The server refused a request from the collector, or could not save some listings. Someone needs to look."],
     [7, "The last run exited 7."],
   ])("P-7: exit code %i is named in words", (exitCode, sentence) => {
     render(
@@ -273,6 +274,31 @@ describe("the collection status panel", () => {
   });
 
   /**
+   * P-13b: STOPPED AND UNREADABLE IS STILL UNREADABLE. The body `/api/status` sends when the
+   * operator has stopped the collector and the health read failed (M-9 keeps the cause): the
+   * badge says Stopped, and the panel must not add that no run has ever reported.
+   */
+  it("P-13b: stopped with status-unreadable says unreadable, not never reported", () => {
+    render(
+      <CollectionStatusPanel
+        status={status({
+          status: "stopped",
+          causes: ["status-unreadable"],
+          reportedAt: 0,
+          ageMinutes: 0,
+          collector: null,
+          monitoring: { state: "stopped", changedAt: reportedAt },
+        })}
+        pending={false}
+      />,
+    );
+
+    expect(screen.getByText("Stopped")).toBeInTheDocument();
+    expect(screen.getByText("The collector’s status could not be read.")).toBeInTheDocument();
+    expect(screen.queryByText("No collector run has reported yet.")).not.toBeInTheDocument();
+  });
+
+  /**
    * P-9: A READ THAT FAILED SAYS SO, AND SAYS THE SEARCHES ARE UNAFFECTED.
    *
    * The second half matters because of what the page's OTHER failed read means: a failed
@@ -334,7 +360,7 @@ describe("the collection status panel", () => {
     ["canary-expired", /searched everything once to re-measure/, null],
     ["guard-blind", /could not save its own guard state/, null],
     ["alarms-unreadable", /stored alarm list could not be read/, null],
-    ["exit-code:4", /Facebook’s page changed shape/, null],
+    ["exit-code:4", /search’s page changed shape/, null],
     ["status-unreadable", /status could not be read/, null],
     ["source-empty:mobo-toronto", /no results several runs in a row/, "mobo-toronto"],
     ["transient:gpu-rtx", /has failed several runs in a row/, "gpu-rtx"],
