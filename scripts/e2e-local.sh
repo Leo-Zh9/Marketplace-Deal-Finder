@@ -1423,6 +1423,8 @@ has "  ...as WATCH_BUDGET_FULL"                '"code":"WATCH_BUDGET_FULL"' "$(b
 has "  ...with the shared count and his share" '"used":9,"maximum":9,"yours":1' "$(body)"
 is "  ...and bob's list is untouched"          1 "$(val "SELECT COUNT(*) FROM user_watch_targets WHERE user_id = $(uid bob)")"
 is "a search alice already runs is shared"     200 "$(aput bob /api/watch '{"components":["gpu","cpu"],"models":{"gpu":{"mode":"all","values":[],"query":"graphics card"},"cpu":{"mode":"all","values":[],"query":"cpu"}},"location":{"slug":"toronto","latitude":43.6532,"longitude":-79.3832},"radiusKm":25,"preservedTargetIds":[]}')"
+is "alice reads the shared budget"            200 "$(as alice "$BASE/api/watch")"
+has "  ...nine in use, eight of them hers"     '"budget":{"used":9,"maximum":9,"yours":8}' "$(body)"
 is "  ...so the budget reads nine"             9 "$(val "SELECT COUNT(*) FROM (SELECT DISTINCT t.component_type, t.query, u.latitude, u.longitude, u.radius_km FROM user_watch_targets t JOIN users u ON u.user_id = t.user_id)")"
 
 # Leave the two identities stopped and empty, so a later run of this gate starts as the top expects.
