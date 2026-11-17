@@ -1176,6 +1176,13 @@ describe("PUT /api/watch -- per user, and the shared budget", () => {
     expect(await put(saveBodyFrom(moved, { location: WATERLOO, radiusKm: 10 }))).toMatchObject({ ok: true });
     expect(await stamp(1)).toBe(NOW);
 
+    // The radius alone is a different area (another market key).
+    await clear();
+    const wider = await get();
+    expect(await put(saveBodyFrom(wider, { location: WATERLOO, radiusKm: 25 }))).toMatchObject({ ok: true });
+    expect(await stamp(1)).toBe(NOW);
+    await put(saveBodyFrom(await get(), { location: WATERLOO, radiusKm: 10 }));
+
     await clear();
     const fewer = await get();
     expect(
