@@ -32,6 +32,9 @@ const ON: NotifyEnvironment & { APPROVED_EMAILS: string } = {
   APPROVED_EMAILS: TEST_ALLOWLIST,
 };
 
+/** The owner as the status route sees it: no webhook of their own, so the secret is theirs. */
+const OWNER_ROW = { userId: 1, webhookUrl: null };
+
 let database!: TestDatabase;
 let db!: D1Database;
 
@@ -293,7 +296,11 @@ const discord = (script: Answer[] = []) => {
 const notify = (
   fake: ReturnType<typeof discord>,
   now: number = T,
-  extra: Partial<{ environment: NotifyEnvironment; maxSends: number; database: D1Database }> = {},
+  extra: Partial<{
+    environment: NotifyEnvironment & { APPROVED_EMAILS?: string };
+    maxSends: number;
+    database: D1Database;
+  }> = {},
 ): Promise<NotifyCounts> =>
   runNotify(extra.database ?? db, {
     environment: extra.environment ?? ON,
@@ -908,7 +915,7 @@ describe("/api/status notifications", () => {
       lastError: "rate-limited",
     });
 
-    const status = await readNotificationsStatus(db, ON, T, 1);
+    const status = await readNotificationsStatus(db, ON, T, OWNER_ROW);
 
     expect(status).toEqual({
       state: "webhook-rejected",
@@ -924,13 +931,13 @@ describe("/api/status notifications", () => {
     await world();
     await deal("1311");
     await notify(discord([404]));
-    expect(await readNotificationsStatus(db, ON, T, 1)).toMatchObject({ state: "webhook-rejected" });
+    expect(await readNotificationsStatus(db, ON, T, OWNER_ROW)).toMatchObject({ state: "webhook-rejected" });
 
     await db.prepare("UPDATE listings SET price_cents = 59000 WHERE listing_id = '1311'").run();
     await notify(discord(), T + 1_800);
     expect(await statusOf("1311")).toBe("CANCELLED");
 
-    expect(await readNotificationsStatus(db, ON, T + 1_800, 1)).toMatchObject({
+    expect(await readNotificationsStatus(db, ON, T + 1_800, OWNER_ROW)).toMatchObject({
       state: "webhook-rejected",
       pending: 0,
     });
@@ -945,7 +952,7 @@ describe("/api/status notifications", () => {
     await deal("1321");
     await deal("1322", { evaluatedAt: T - 2_000 });
     await notify(discord([404]));
-    expect(await readNotificationsStatus(db, ON, T, 1)).toMatchObject({ state: "webhook-rejected" });
+    expect(await readNotificationsStatus(db, ON, T, OWNER_ROW)).toMatchObject({ state: "webhook-rejected" });
 
     await db.prepare("UPDATE listings SET price_cents = 59000 WHERE listing_id = '1321'").run();
     const counts = await notify(discord([200]), T + 1_800);
@@ -955,7 +962,7 @@ describe("/api/status notifications", () => {
       { listing_id: "1322", status: "SENT" },
     ]);
 
-    expect(await readNotificationsStatus(db, ON, T + 1_800, 1)).toEqual({
+    expect(await readNotificationsStatus(db, ON, T + 1_800, OWNER_ROW)).toEqual({
       state: "on",
       pending: 0,
       sent24h: 1,
@@ -974,7 +981,7 @@ describe("/api/status notifications", () => {
     await deal("1331");
     await deal("1332", { evaluatedAt: T - 2_000 });
     await notify(discord([200, 404]));
-    expect(await readNotificationsStatus(db, ON, T, 1)).toMatchObject({ state: "webhook-rejected", sent24h: 1 });
+    expect(await readNotificationsStatus(db, ON, T, OWNER_ROW)).toMatchObject({ state: "webhook-rejected", sent24h: 1 });
   });
 
   /** N13e. The counts. Kills: counting SENDING out of `pending`, or a sent24h window not bounded. */
@@ -992,7 +999,7 @@ describe("/api/status notifications", () => {
       .bind(SOURCE, MODEL, T - 86_400, T - 86_401)
       .run();
 
-    expect(await readNotificationsStatus(db, ON, T, 1)).toEqual({
+    expect(await readNotificationsStatus(db, ON, T, OWNER_ROW)).toEqual({
       state: "on",
       pending: 2,
       sent24h: 1,
@@ -1067,20 +1074,20 @@ describe("inert states", () => {
   };
 
   /**
-   * N16. INERT MEANS ZERO D1 QUERIES, in the step and in /api/status. Kills: running the sweep
-   * (or any query) before the state check; querying the table for the status in an inert state.
+   * N16. THE MASTER SWITCH OFF MEANS ZERO D1 QUERIES, in the step and in /api/status. Kills:
+   * running any query before the switch check; querying the table for the status when off.
    */
   it.each<[string, NotifyEnvironment]>([
-    ["unconfigured", { APP_ENV: "production", NOTIFICATIONS: "on" }],
-    ["invalid-url", { APP_ENV: "production", NOTIFICATIONS: "on", DISCORD_WEBHOOK_URL: "http://discord.com/api/webhooks/1/x" }],
+    ["unconfigured", { APP_ENV: "production" }],
+    ["invalid-url", { APP_ENV: "production", DISCORD_WEBHOOK_URL: "http://discord.com/api/webhooks/1/x" }],
     ["off", { APP_ENV: "production", DISCORD_WEBHOOK_URL: WEBHOOK }],
     ["off", { APP_ENV: "production", DISCORD_WEBHOOK_URL: WEBHOOK, NOTIFICATIONS: "ON" }],
-  ])("N16: %s makes no D1 query and no fetch", async (state, environment) => {
+  ])("N16: switch off (%s) makes no D1 query and no fetch", async (state, environment) => {
     const { stub, touched } = instrumented();
     const fake = discord();
 
     const counts = await notify(fake, T, { environment, database: stub });
-    const status = await readNotificationsStatus(stub, environment, T, 1);
+    const status = await readNotificationsStatus(stub, environment, T, OWNER_ROW);
 
     expect(counts).toEqual({
       state,
@@ -1097,6 +1104,34 @@ describe("inert states", () => {
     expect(status).toEqual({ state });
     expect(touched).toEqual([]);
     expect(fake.calls).toEqual([]);
+  });
+
+  /**
+   * N16c. SWITCH ON, BUT NOBODY HAS A DESTINATION (the owner's secret missing or malformed, nobody
+   * with a webhook of their own): the step reads the users once and stops -- no sweep, no enqueue,
+   * no fetch -- and the owner's status names their destination's state without a query.
+   */
+  it.each<[string, NotifyEnvironment]>([
+    ["unconfigured", { APP_ENV: "production", NOTIFICATIONS: "on" }],
+    ["invalid-url", { APP_ENV: "production", NOTIFICATIONS: "on", DISCORD_WEBHOOK_URL: "http://discord.com/api/webhooks/1/x" }],
+  ])("N16c: switch on with the owner %s costs one users read and sends nothing", async (state, environment) => {
+    await world();
+    await deal("1650");
+    const prepared: string[] = [];
+    const spy = {
+      prepare: (sql: string) => {
+        prepared.push(sql);
+        return db.prepare(sql);
+      },
+    } as unknown as D1Database;
+    const fake = discord();
+
+    const counts = await notify(fake, T, { environment: { ...environment, APPROVED_EMAILS: TEST_ALLOWLIST }, database: spy });
+    expect(counts).toMatchObject({ state: "on", enqueued: 0, sent: 0, swept: 0 });
+    expect(prepared).toHaveLength(1);
+    expect(fake.calls).toEqual([]);
+    expect(await readNotificationsStatus(spy, environment, T, OWNER_ROW)).toEqual({ state });
+    expect(prepared).toHaveLength(1);
   });
 
   /**
@@ -1316,7 +1351,7 @@ describe("per user", () => {
     expect(counts).toMatchObject({ state: "on", enqueued: 0, sent: 0, swept: 0 });
     expect(fake.calls).toHaveLength(0);
     expect(prepared).toHaveLength(1);
-    expect(prepared[0]).toMatch(/FROM users WHERE user_id = \?1/);
+    expect(prepared[0]).toMatch(/FROM users/);
   });
 
   /**
@@ -1351,7 +1386,7 @@ describe("per user", () => {
         .bind(SOURCE, id, MODEL, status, T - 10, error)
         .run();
     }
-    expect(await readNotificationsStatus(db, ON, T, 1)).toEqual({
+    expect(await readNotificationsStatus(db, ON, T, OWNER_ROW)).toEqual({
       state: "on",
       pending: 0,
       sent24h: 0,
@@ -1359,7 +1394,7 @@ describe("per user", () => {
       failed: 0,
       lastSentAt: null,
     });
-    expect(await readNotificationsStatus(db, ON, T, 2)).toEqual({
+    expect(await readNotificationsStatus(db, ON, T, { userId: 2, webhookUrl: WEBHOOK })).toEqual({
       state: "webhook-rejected",
       pending: 1,
       sent24h: 1,
@@ -1446,3 +1481,188 @@ describe("per user", () => {
     ]);
   });
 });
+
+/**
+ * EVERY ACTIVE USER, ROUND-ROBIN (multi-user PR3). Each user's alerts go to their own destination;
+ * user 1 falls back to the DISCORD_WEBHOOK_URL secret.
+ */
+describe("per-user alerts", () => {
+  const SECOND_HOOK = "https://discord.com/api/webhooks/222222222/second-user_tok";
+  const WATERLOO = "43.4643,-80.5204|25km";
+  /** The second user: Waterloo, MAXIMUM_PRICE 1,000,000, gpu watched, their own webhook. */
+  const second = async (webhook: string | null = SECOND_HOOK) => {
+    await db
+      .prepare(
+        `INSERT INTO users (user_id, email, location, latitude, longitude, radius_km, mode,
+                            maximum_price_cents, monitoring_enabled, monitoring_changed_at, created_at,
+                            webhook_url)
+         VALUES (2, 'second@example.com', 'waterloo', 43.4643, -80.5204, 25, 'MAXIMUM_PRICE',
+                 1000000, 1, 0, 0, ?1)`,
+      )
+      .bind(webhook)
+      .run();
+    await db
+      .prepare(
+        "INSERT INTO user_watch_targets (user_id, target_id, component_type, query) VALUES (2, 'g', 'gpu', 'graphics card')",
+      )
+      .run();
+  };
+  /** A fake Discord that answers PER DESTINATION, and records which destination got what. */
+  const byDestination = (answers: Record<string, number[]> = {}) => {
+    const calls: { url: string; listing: string }[] = [];
+    const queues = Object.fromEntries(Object.entries(answers).map(([url, list]) => [url, [...list]]));
+    const fetch = async (url: string, init: RequestInit): Promise<Response> => {
+      const base = url.replace(/\?wait=true$/, "");
+      const content = (JSON.parse(String(init.body)) as { content: string }).content;
+      calls.push({ url: base, listing: content.split("\n").at(-1)!.split("/").at(-1)! });
+      const status = queues[base]?.shift() ?? 200;
+      return new Response(JSON.stringify(status === 200 ? { id: "1" } : { message: "x", code: 0 }), {
+        status,
+        headers: { "Content-Type": "application/json" },
+      });
+    };
+    return { calls, fetch: fetch as unknown as ReturnType<typeof discord>["fetch"] };
+  };
+  const run = (fake: { fetch: ReturnType<typeof discord>["fetch"] }, now = T) =>
+    runNotify(db, { environment: ON, now, fetch: fake.fetch, leaseTokenPrefix: "pu" });
+
+  /**
+   * PU-1. ONE USER'S BROKEN WEBHOOK DOES NOT BLOCK ANOTHER'S. The owner's destination answers 404
+   * (a `stop`); the owner leaves the rotation and the second user's two deals still go out, to the
+   * second user's own webhook and nowhere else. Kills: `stop` breaking the whole loop.
+   */
+  it("PU-1: a 404 on one user's webhook stops only that user", async () => {
+    await world();
+    await second();
+    await deal("2101");
+    await deal("2102");
+    await deal("2201", { market: WATERLOO, price: 300_000 });
+    await deal("2202", { market: WATERLOO, price: 310_000 });
+    const fake = byDestination({ [WEBHOOK]: [404] });
+
+    const counts = await run(fake);
+
+    expect(fake.calls.filter((call) => call.url === WEBHOOK)).toHaveLength(1);
+    expect(fake.calls.filter((call) => call.url === SECOND_HOOK).map((call) => call.listing).sort()).toEqual([
+      "2201",
+      "2202",
+    ]);
+    expect(counts).toMatchObject({ rejected: 1, sent: 2 });
+  });
+
+  /**
+   * PU-2. A BIG BACKLOG FOR ONE USER DOES NOT STARVE ANOTHER. Ten owner deals, two for the second
+   * user, five claims in the step: one claim per user per pass gives the second user both of theirs.
+   * Kills: draining one user before the next (the second user gets nothing this step).
+   */
+  it("PU-2: round-robin gives the second user their sends beside a ten-deal backlog", async () => {
+    await world();
+    await second();
+    for (let index = 0; index < 10; index += 1) await deal(`23${String(index).padStart(2, "0")}`);
+    await deal("2401", { market: WATERLOO, price: 300_000 });
+    await deal("2402", { market: WATERLOO, price: 300_000 });
+    const fake = byDestination();
+
+    const counts = await run(fake);
+
+    expect(counts.sent).toBe(5);
+    expect(fake.calls.filter((call) => call.url === SECOND_HOOK)).toHaveLength(2);
+    expect(fake.calls.filter((call) => call.url === WEBHOOK)).toHaveLength(3);
+  });
+
+  /**
+   * PU-3. ONE LISTING, TWO USERS, ONE ALERT EACH, EACH TO THEIR OWN WEBHOOK -- and never again.
+   * The listing is a member of both areas and a deal under both rules.
+   */
+  it("PU-3: a listing both users see alerts each of them exactly once", async () => {
+    await world();
+    await second();
+    await deal("2501");
+    await addMember(db, WATERLOO, "2501", SOURCE);
+    const fake = byDestination();
+
+    await run(fake);
+    await run(fake, T + 1_800);
+
+    expect(fake.calls.map((call) => `${call.url === WEBHOOK ? "owner" : "second"}:${call.listing}`).sort()).toEqual([
+      "owner:2501",
+      "second:2501",
+    ]);
+    const rows = await db
+      .prepare("SELECT user_id, status FROM user_notifications WHERE listing_id = '2501' ORDER BY user_id")
+      .all();
+    expect(rows.results).toEqual([
+      { user_id: 1, status: "SENT" },
+      { user_id: 2, status: "SENT" },
+    ]);
+  });
+
+  /**
+   * PU-4. NO DESTINATION, NO ROWS. The second user is active with no webhook (and is not user 1, so
+   * no fallback): nothing is enqueued for them and nothing is sent; the owner is unaffected. Kills:
+   * the user-1-only fallback widened to everyone (the second user's deal goes to the owner's secret).
+   */
+  it("PU-4: a user with no destination is skipped and gets no rows; the owner still sends", async () => {
+    await world();
+    await second(null);
+    await deal("2601");
+    await deal("2602", { market: WATERLOO, price: 300_000 });
+    const fake = byDestination();
+
+    await run(fake);
+
+    expect(fake.calls).toEqual([{ url: WEBHOOK, listing: "2601" }]);
+    const rows = await db.prepare("SELECT user_id FROM user_notifications ORDER BY user_id").all();
+    expect(rows.results).toEqual([{ user_id: 1 }]);
+  });
+
+  /**
+   * PU-5. THE OWNER'S OWN WEBHOOK WINS OVER THE SECRET, and no URL ever reaches a log line.
+   */
+  it("PU-5: user 1's own webhook replaces the secret, and no URL is logged", async () => {
+    const OWN = "https://discord.com/api/webhooks/333333333/owner-own_tok";
+    await world();
+    await db.prepare("UPDATE users SET webhook_url = ?1 WHERE user_id = 1").bind(OWN).run();
+    await deal("2701");
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const fake = byDestination({ [OWN]: [500] });
+
+    await run(fake);
+    await run(fake, T + 3_600);
+
+    expect(fake.calls.map((call) => call.url)).toEqual([OWN]);
+    const logged = [...log.mock.calls, ...warn.mock.calls].flat().map(String).join("\n");
+    expect(logged).not.toMatch(/discord\.com|webhooks|tok/);
+  });
+
+  /**
+   * PU-6. /api/status IS PER USER, DESTINATION FIRST. The owner (no webhook of their own) reads the
+   * secret; a second user with no webhook is `unconfigured` even though the secret is set (it is the
+   * owner's fallback, not theirs); with a malformed stored value, `invalid-url`; with their own, their
+   * own rows decide `on` / `webhook-rejected`. Kills: the user-1-only fallback widened to everyone,
+   * and status reading the secret instead of the caller's destination.
+   */
+  it("PU-6: each user's status follows their own destination and their own rows", async () => {
+    await world();
+    await second();
+    await deal("2801", { market: WATERLOO, price: 300_000 });
+    await run(byDestination({ [SECOND_HOOK]: [404] }));
+
+    expect(await readNotificationsStatus(db, ON, T, OWNER_ROW)).toMatchObject({ state: "on" });
+    expect(await readNotificationsStatus(db, ON, T, { userId: 2, webhookUrl: null })).toEqual({
+      state: "unconfigured",
+    });
+    expect(
+      await readNotificationsStatus(db, ON, T, { userId: 2, webhookUrl: "http://discord.com/api/webhooks/1/x" }),
+    ).toEqual({ state: "invalid-url" });
+    expect(await readNotificationsStatus(db, ON, T, { userId: 2, webhookUrl: SECOND_HOOK })).toMatchObject({
+      state: "webhook-rejected",
+      pending: 1,
+    });
+    expect(await readNotificationsStatus(db, { ...ON, NOTIFICATIONS: "off" }, T, { userId: 2, webhookUrl: SECOND_HOOK })).toEqual({
+      state: "off",
+    });
+  });
+});
+

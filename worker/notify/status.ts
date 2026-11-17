@@ -1,8 +1,10 @@
 /**
  * THE `notifications` FIELD OF `/api/status`. Additive: nothing else in that body changes.
  *
- * In `unconfigured`, `invalid-url` and `off` the body is `{state}` alone and THE TABLE IS NOT
- * QUERIED -- so a deploy that lands ahead of migration 0007 still answers 200.
+ * PER USER (multi-user PR3). `unconfigured` and `invalid-url` describe THE CALLER'S destination
+ * (`destinationFor`: their own webhook, else for user 1 the DISCORD_WEBHOOK_URL secret), and `off`
+ * the global NOTIFICATIONS switch, in that precedence. In those three the body is `{state}` alone
+ * and THE TABLE IS NOT QUERIED -- the destination comes from the caller's row, already loaded.
  *
  * In `on` it carries the counts, and `state` becomes `webhook-rejected` IF AND ONLY IF the row
  * with the latest `last_attempt_at` (any status) has `last_error LIKE 'webhook-rejected%'`. That
@@ -19,7 +21,13 @@
  * A read failure answers `{state: "on"}` without counts rather than failing the route.
  */
 
-import { resolveNotifyConfig, type NotifyEnvironment, type NotifyState } from "./config";
+import {
+  destinationFor,
+  notificationsOn,
+  resolveNotifyConfig,
+  type NotifyEnvironment,
+  type NotifyState,
+} from "./config";
 
 export const SENT_WINDOW_SECONDS = 86_400;
 
@@ -69,11 +77,18 @@ export const readNotificationsStatus = async (
   db: D1Database | undefined,
   environment: NotifyEnvironment,
   now: number,
-  userId: number | null,
+  user: { userId: number; webhookUrl: string | null } | null,
 ): Promise<NotificationsStatus> => {
-  const config = resolveNotifyConfig(environment);
-  if (config.state !== "on") return { state: config.state };
-  if (db === undefined || userId === null) return { state: "on" };
+  // NO CALLER ROW (no binding, or a failed read): the single-user reading of the environment.
+  if (user === null) {
+    const config = resolveNotifyConfig(environment);
+    return config.state === "on" ? { state: "on" } : { state: config.state };
+  }
+  const destination = destinationFor(user, environment);
+  if (destination.state !== "ok") return { state: destination.state };
+  if (!notificationsOn(environment)) return { state: "off" };
+  if (db === undefined) return { state: "on" };
+  const userId = user.userId;
 
   let row: StatusRow | undefined;
   try {

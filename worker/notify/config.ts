@@ -97,3 +97,38 @@ export const resolveNotifyConfig = (environment: NotifyEnvironment): NotifyConfi
   if (environment.NOTIFICATIONS !== "on") return { state: "off" };
   return { state: "on", url: sendableUrl(raw) };
 };
+
+/**
+ * THE MASTER SWITCH (multi-user, PR3). `NOTIFICATIONS=on` enables the notify step for EVERY user;
+ * anything else makes the step and `/api/status` inert, with no D1 query. The DISCORD_WEBHOOK_URL
+ * secret is no longer the step's on/off: it is only the owner's fallback destination.
+ */
+export const notificationsOn = (environment: NotifyEnvironment): boolean =>
+  environment.NOTIFICATIONS === "on";
+
+export type Destination =
+  | { state: "unconfigured" | "invalid-url" }
+  | { state: "ok"; url: string };
+
+/**
+ * WHERE ONE USER'S ALERTS GO: their own `webhook_url` (migrations/0010); else, FOR USER 1 ONLY, the
+ * DISCORD_WEBHOOK_URL secret, which keeps the owner's install exactly as it was. Re-validated here,
+ * at use, and sent by the rebuilt URL -- a stored value that a deploy's APP_ENV no longer accepts
+ * (a local stub URL in production) is `invalid-url`, never fetched. The URL is returned to the
+ * sender and nowhere else.
+ */
+export const destinationFor = (
+  user: { userId: number; webhookUrl: string | null },
+  environment: NotifyEnvironment,
+): Destination => {
+  const own = user.webhookUrl?.trim();
+  const raw =
+    own !== undefined && own !== ""
+      ? own
+      : user.userId === 1
+        ? environment.DISCORD_WEBHOOK_URL?.trim()
+        : undefined;
+  if (raw === undefined || raw === "") return { state: "unconfigured" };
+  if (!isValidWebhookUrl(raw, environment.APP_ENV)) return { state: "invalid-url" };
+  return { state: "ok", url: sendableUrl(raw) };
+};
