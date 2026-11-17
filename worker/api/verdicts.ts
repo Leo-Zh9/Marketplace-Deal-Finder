@@ -14,12 +14,22 @@
  * make. Do not restore the stronger wording without that column.
  */
 
-import { referenceAverageCents } from "../evaluation/dealRules";
+import { decide, referenceAverageCents, type ValidatedSettings } from "../evaluation/dealRules";
+import {
+  REFERENCE_COUNT_SQL,
+  REFERENCE_TOTAL_SQL,
+  STATS_JOIN_KEYS,
+} from "../evaluation/evaluateBatch";
+import {
+  areaMembership,
+  NOT_DEAL_PREDICATE,
+  RULE_PREDICATE,
+} from "../evaluation/rulePredicate";
 import { MINIMUM_REFERENCE_COUNT } from "../evaluation/types";
 import { CATALOG_COMPONENT_ID, STORAGE_COMPONENT_ID } from "../normalize/catalogIndex";
 import { componentById } from "../../src/data/catalog";
 import type { ComponentType } from "../../src/types";
-import { marketKey } from "../storage/marketKey";
+import { areaMarketKey, ruleSettings, type User } from "../users/users";
 
 export const VERDICT_PAGE_SIZE = 50;
 
@@ -144,21 +154,18 @@ export type VerdictsResult =
  * becomes a plain `SCAN l`.
  */
 const SELECT_VERDICTS_BODY = `SELECT l.source, l.listing_id, l.component_type, l.model_key,
-       l.variant_key, l.title, l.price_cents, l.location_text, l.url, l.last_seen_at,
+       l.variant_key, l.title, l.price_cents, l.location_text, l.url, l.last_seen_at, l.validity,
        t.verdict AS verdict,
-       CASE WHEN p.listing_id IS NULL THEN s.count
-            ELSE s.count - 1 END                               AS reference_count,
-       CASE WHEN p.listing_id IS NULL THEN s.total_price_cents
-            ELSE s.total_price_cents - p.price_cents END        AS reference_total_cents
-  FROM listings l
+       ${REFERENCE_COUNT_SQL}                                   AS reference_count,
+       ${REFERENCE_TOTAL_SQL}                                   AS reference_total_cents
+  FROM users u
+ CROSS JOIN listings l
   LEFT JOIN evaluation_tasks t
          ON t.source = l.source AND t.listing_id = l.listing_id
   LEFT JOIN price_observations p
          ON p.source = l.source AND p.listing_id = l.listing_id
   LEFT JOIN model_stats s
-         ON s.market_key  = COALESCE(p.market_key,  l.market_key)
-        AND s.model_key   = COALESCE(p.model_key,   l.model_key)
-        AND s.variant_key = COALESCE(p.variant_key, l.variant_key)
+         ON ${STATS_JOIN_KEYS}
 `;
 
 /**
@@ -188,56 +195,38 @@ export const SELECTION_PREDICATE = `l.component_type IN (SELECT value FROM json_
     OR (l.component_type || '/' || COALESCE(l.model_key, '')) IN (SELECT value FROM json_each(?3))`;
 
 /**
- * THE SAVED MARKET, AND WHY THE READ NEEDS IT. Nothing deletes from `listings` (the read-cost
- * note above measures it), so after a SAVED location or radius change the rows collected in the
- * old market stay in the table forever -- and without this term they stay on the page, DEALs
- * first. Every listing
- * carries the `market_key` the collector ran in, built by `marketKey()` from the lat/lon/radius it
- * echoed from `watch_market`; so `marketKey(watch_market row)` computed HERE, IN JS, is the exact
+ * THE USER'S AREA, AND WHY THE READ NEEDS IT. Nothing deletes from `listings` (the read-cost note
+ * above measures it), so after an area change the rows seen only in the old area stay in the table
+ * forever -- and without this term they stay on the page, DEALs first. A listing does NOT carry the
+ * market it was collected in any more: `listings.market_key` is the evidence pool (migrations/0009,
+ * EVIDENCE_POOL_KEY). Which areas saw it is `listing_markets`, written by recordSightings with
+ * `marketKey(envelope.market)`; so `areaMarketKey(user.area)` computed HERE, IN JS, is the exact
  * string those rows carry.
  *
  * NEVER BUILD THE KEY IN SQL. `printf('%.4f')` rounds differently from `Math.round(x * 1e4)` and
  * keeps a negative zero that `marketKey()` collapses (marketKey.ts:16-31), so an SQL-built key
  * would silently disagree with the stored one on exactly the edge values.
  *
- * EXPORTED FOR THE NOTIFY STEP: worker/notify/runNotify.ts reads the same key and binds it into
- * the same term, so an alert is never sent for a listing this page would not show.
- */
-export const SELECT_MARKET = "SELECT latitude, longitude, radius_km FROM watch_market WHERE id = 1";
-
-interface MarketRow {
-  latitude: number;
-  longitude: number;
-  radius_km: number;
-}
-
-/**
- * The saved market's key, or null when there is no market row. NULL FAILS CLOSED in both
- * callers: this read serves the empty page without running the main statement, and a NULL bound
- * into `l.market_key = ?` matches nothing, so the notify step enqueues nothing and cancels a
- * claimed row. A `marketKey()` throw propagates; the 0005 CHECKs on `watch_market` make it
- * unreachable for a stored row.
- */
-export const readSavedMarketKey = async (db: D1Database): Promise<string | null> => {
-  const read = await db.prepare(SELECT_MARKET).all<MarketRow>();
-  const row = read.results[0];
-  if (row === undefined) return null;
-  return marketKey({ latitude: row.latitude, longitude: row.longitude, radiusKm: row.radius_km });
-};
-
-/**
  * EXPORTED FOR ONE OTHER CALLER: worker/notify/enqueue.ts binds the SAME predicate (same `?2` /
  * `?3`, same storage ids) so an alert is never sent for a listing the dashboard would not show.
  * Both this statement and the notify statements AND it with the same market term, and both wrap
  * it in parentheses: the predicate has a top-level OR, so without them the market term would bind
  * only to its first half and the paired rows of every market would come back.
  */
-const WHERE_MARKET = ` WHERE l.market_key = ?2`;
-const WHERE_MARKET_AND_SELECTION = ` WHERE l.market_key = ?4 AND (${SELECTION_PREDICATE})`;
+const WHERE_MARKET = ` WHERE u.user_id = ?3 AND ${areaMembership("?2")}`;
+const WHERE_MARKET_AND_SELECTION = ` WHERE u.user_id = ?5 AND ${areaMembership("?4")}
+   AND (${SELECTION_PREDICATE})`;
 
-const ORDER_AND_BOUND = ` ORDER BY CASE WHEN t.verdict IS NULL      THEN 2
-               WHEN t.verdict = 'DEAL'     THEN 0
-               WHEN t.verdict = 'NOT_DEAL' THEN 3
+/**
+ * FOUR BUCKETS, THE USER'S RULE DECIDING THE FIRST AND THE LAST. 0 = a deal under RULE_PREDICATE,
+ * 1 = everything else, 2 = PENDING (never judged -- it stays PENDING whatever the rule says, and so
+ * does every row of a user with no rule), 3 = NOT_DEAL under NOT_DEAL_PREDICATE, last. The bucket
+ * is SQL because the LIMIT is; the LABEL is `decide` in JS (labelFor), which agrees with both
+ * predicates inside their bounds (rulePredicate.test.ts).
+ */
+const ORDER_AND_BOUND = ` ORDER BY CASE WHEN t.verdict IS NULL OR u.mode IS NULL THEN 2
+               WHEN ${RULE_PREDICATE}     THEN 0
+               WHEN ${NOT_DEAL_PREDICATE} THEN 3
                ELSE 1 END,
           l.last_seen_at DESC, l.listing_id
  LIMIT ?1`;
@@ -269,19 +258,31 @@ interface VerdictRow {
   location_text: string | null;
   url: string;
   last_seen_at: number;
+  validity: string;
   verdict: string | null;
   reference_count: number | null;
   reference_total_cents: number | null;
 }
 
-export const statusFor = (verdict: string | null): WireStatus =>
-  verdict === null
+/**
+ * THE LABEL IS THE USER'S RULE APPLIED BY `decide` ITSELF, to the same live reference the row
+ * carries -- never the stored `t.verdict`, which is the frozen evidence rule's answer
+ * (migrations/0009). The stored verdict decides ONE thing here: NULL means the drain has never
+ * judged this listing, and that stays PENDING whatever the rule says. A user with no saved rule sees
+ * every row PENDING: nothing has been judged against a rule they have not chosen.
+ */
+export const labelFor = (row: VerdictRow, settings: ValidatedSettings | null): WireStatus =>
+  row.verdict === null || settings === null
     ? "PENDING"
-    : verdict === "DEAL"
-      ? "DEAL"
-      : verdict === "NOT_DEAL"
-        ? "NOT_DEAL"
-        : "NEEDS_REVIEW";
+    : decide(
+        {
+          candidatePriceCents: row.price_cents,
+          validity: row.validity,
+          referenceCount: row.reference_count,
+          referenceTotalCents: row.reference_total_cents,
+        },
+        settings,
+      ).verdict;
 
 export const discountPercentFrom = (
   priceCents: number | null,
@@ -325,7 +326,10 @@ const catalogComponent = (value: string): ComponentType | null =>
     ? CATALOG_COMPONENT_ID[value as keyof typeof CATALOG_COMPONENT_ID]
     : null;
 
-export const toWireListing = (row: VerdictRow): WireListing | null => {
+export const toWireListing = (
+  row: VerdictRow,
+  settings: ValidatedSettings | null,
+): WireListing | null => {
   const componentType = catalogComponent(row.component_type);
   if (componentType === null) {
     console.warn(`verdicts: unknown component_type ${JSON.stringify(row.component_type)}`);
@@ -357,7 +361,7 @@ export const toWireListing = (row: VerdictRow): WireListing | null => {
     url: row.url,
     observedAt: new Date(row.last_seen_at * 1000).toISOString(),
     evaluation: {
-      status: statusFor(row.verdict),
+      status: labelFor(row, settings),
       ...(averageCents === null ? {} : { averagePriceCents: averageCents }),
       ...(discountPercent === null ? {} : { discountPercent }),
     },
@@ -445,13 +449,13 @@ export const parseVerdictsQuery = (
 export const handleGetVerdicts = async (
   db: D1Database,
   params: URLSearchParams,
+  user: User,
 ): Promise<VerdictsResult> => {
-  // THE try COVERS THE DATABASE CALLS AND NOTHING ELSE -- the saved-market read and the verdict
-  // read. With the mapping inside it, a mapper throw was reported as a storage failure -- the
-  // wrong subsystem, and the reason the RangeError above was a 503 rather than one missing card.
-  // It also covers `marketKey()` inside `readSavedMarketKey`, whose throw the 0005 CHECKs on
-  // `watch_market` make unreachable for a stored row; were it reached, a market row the key
-  // cannot be built from IS a storage fault, so the storage code is the right one.
+  // THE try COVERS THE DATABASE CALLS AND NOTHING ELSE. With the mapping inside it, a mapper throw
+  // was reported as a storage failure -- the wrong subsystem, and the reason the RangeError above
+  // was a 503 rather than one missing card. It also covers `marketKey()` inside `areaMarketKey`,
+  // whose throw the 0009 area CHECKs make unreachable for a stored row; were it reached, an area the
+  // key cannot be built from IS a storage fault, so the storage code is the right one.
   // THE QUERY IS VALIDATED BEFORE THE READ, so a bad parameter costs no `rows_read` and cannot be
   // reported as a storage failure.
   const query = parseVerdictsQuery(params);
@@ -467,13 +471,16 @@ export const handleGetVerdicts = async (
 
   let rows: VerdictRow[];
   try {
-    // NO SAVED MARKET IS AN EMPTY PAGE, AND THE MAIN READ IS NOT RUN: there is no market whose
-    // listings this page could honestly claim to show.
-    const key = await readSavedMarketKey(db);
+    // NO AREA IS AN EMPTY PAGE, AND THE MAIN READ IS NOT RUN: there is no area whose listings this
+    // page could honestly claim to show.
+    const key = areaMarketKey(user.area);
     if (key === null) return { ok: true, status: 200, body: { listings: [], truncated: false } };
     const read =
       selection === null
-        ? await db.prepare(SELECT_VERDICTS).bind(VERDICT_PAGE_SIZE + 1, key).all<VerdictRow>()
+        ? await db
+            .prepare(SELECT_VERDICTS)
+            .bind(VERDICT_PAGE_SIZE + 1, key, user.userId)
+            .all<VerdictRow>()
         : await db
             .prepare(SELECT_VERDICTS_FILTERED)
             .bind(
@@ -481,6 +488,7 @@ export const handleGetVerdicts = async (
               JSON.stringify(selection.all),
               JSON.stringify(selection.pairs),
               key,
+              user.userId,
             )
             .all<VerdictRow>();
     rows = read.results;
@@ -500,10 +508,11 @@ export const handleGetVerdicts = async (
   // listing). A line no mutation can kill is the dead code worker/storage/marketKey.ts:25-29
   // removed for the same reason. The shape is `evaluateBatch`'s per-task try: "a `decide` that
   // throws for one candidate must not abort the other fourteen".
+  const settings = user.rule === null ? null : ruleSettings(user.rule);
   const served: WireListing[] = [];
   for (const row of rows) {
     try {
-      const listing = toWireListing(row);
+      const listing = toWireListing(row, settings);
       if (listing !== null) served.push(listing);
     } catch (error) {
       console.warn(`verdicts: listing ${row.listing_id} could not be served: ${String(error)}`);
