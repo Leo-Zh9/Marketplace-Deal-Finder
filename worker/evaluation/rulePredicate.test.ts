@@ -4,21 +4,25 @@
  * THE PARITY PROPERTY between RULE_PREDICATE (SQL) and `decide` (JS), over the plan's cross product:
  *
  *   validity {VALID, INVALID_REFERENCE, NEEDS_REVIEW, '', 'valid'}
- *   P {NULL, 0, 1, rand, 1e8, 1e8+1, 12.5, MAX_SAFE/5}
- *   C {NULL, -1, 0, 4, 5, rand, 1e5, 1e5+1, 6.5, 90071992}
+ *   P {NULL, 0, 1, rand, 1e8, 1e8+1, 12.5, ~MAX_SAFE/5, 99,999,800}
+ *   C {NULL, -1, 0, 4, 5, rand, 1e5, 1e5+1, 6.5, 90,072,172}
  *   T {NULL, -1, 0, P*C-1, P*C, P*C+1, rand, 1.5, MAX_SAFE-1, 2^53}
  *
  * THE THREE VALUES PAST THE PLAN'S LIST ARE THE OVERFLOW PROBES that make the bounds killable:
- * P = MAX_SAFE/5 with C = 5, and P = 1e8 with C = 90071992, put P*C*10000 at ~9.007e19 -- past
- * 2^63, where SQLite falls back to a double whose spacing (16384) exceeds the 10000 that separates
- * T = P*C-1 from a deal. Without the price or the count bound, those rows read DEAL in SQL and
- * NOT_DEAL in `decide`. 2^53 is a total `decide` calls corrupt.
+ * P = 1801439850948192 with C = 5, and P = 99,999,800 with C = 90,072,172, put P*C*10000 at
+ * ~9.007e19 -- past 2^63, where SQLite falls back to a double whose spacing (16384) exceeds the
+ * 10000 that separates T = P*C-1 from a deal. MEASURED with sqlite: without the price bound
+ * (first pair) or the count bound (second pair) those rows read DEAL in SQL and NOT_DEAL in
+ * `decide`. Most neighbouring values round the other way, which is why these exact ones are
+ * pinned. 2^53 is a total `decide` calls corrupt.
  *   every mode x bp {0, 1, 435, 4999, 10000} x max {0, P-1, P, P+1}; unused rule fields NULL.
  *
  * Asserted:
  *   1. RULE_PREDICATE true  =>  decide(...).verdict === "DEAL"      (never a false DEAL), everywhere.
  *   2. Inside the bounds (P <= 1e8, and C <= 1e5 when the discount leg runs) the two are EQUAL.
- *   3. NOT_DEAL_PREDICATE true  <=>  decide(...).verdict === "NOT_DEAL", everywhere on the grid.
+ *   3. NOT_DEAL_PREDICATE true  <=>  decide(...).verdict === "NOT_DEAL", inside the same bounds. It
+ *      only sorts, and past them the overflow probes below flip it (measured), which is why its
+ *      own comment claims the bounds and no more.
  *
  * The values go through a REAL D1 column with the INTEGER affinity the live columns have, and
  * `decide` is fed what D1 READS BACK -- so 12.5 and 6.5 stay REAL on both sides, as in production.
@@ -63,15 +67,15 @@ interface Case {
   price: number | null;
   count: number | null;
   total: number | null;
-  mode: DealMode;
+  mode: DealMode | null;
   bp: number | null;
   max: number | null;
 }
 
 const buildCases = (): Case[] => {
   const validities = ["VALID", "INVALID_REFERENCE", "NEEDS_REVIEW", "", "valid"];
-  const prices: (number | null)[] = [null, 0, 1, 1 + random(400_000), 1e8, 1e8 + 1, 12.5, 1801439850948198];
-  const counts: (number | null)[] = [null, -1, 0, 4, 5, 6 + random(500), 1e5, 1e5 + 1, 6.5, 90071992];
+  const prices: (number | null)[] = [null, 0, 1, 1 + random(400_000), 1e8, 1e8 + 1, 12.5, 1801439850948192, 99_999_800];
+  const counts: (number | null)[] = [null, -1, 0, 4, 5, 6 + random(500), 1e5, 1e5 + 1, 6.5, 90_072_172];
   const bps = [0, 1, 435, 4999, 10000];
   const cases: Case[] = [];
   for (const validity of validities) {
@@ -92,6 +96,8 @@ const buildCases = (): Case[] => {
         ];
         for (const total of totals) {
           for (const bp of bps) cases.push({ validity, price, count, total, mode: "DISCOUNT", bp, max: null });
+          // NO RULE, with stale fields a hand-written UPDATE could leave behind: never a deal.
+          cases.push({ validity, price, count, total, mode: null, bp: 0, max: 1e12 });
           for (const max of maxes) {
             cases.push({ validity, price, count, total, mode: "MAXIMUM_PRICE", bp: null, max });
             for (const bp of bps) cases.push({ validity, price, count, total, mode: "BOTH", bp, max });
@@ -107,7 +113,7 @@ interface Row {
   id: number;
   validity: string;
   price_cents: number | null;
-  mode: DealMode;
+  mode: DealMode | null;
   minimum_discount_bp: number | null;
   maximum_price_cents: number | null;
   count: number | null;
@@ -117,7 +123,7 @@ interface Row {
 }
 
 describe("RULE_PREDICATE parity with decide", () => {
-  it("never a false DEAL; equal inside the bounds; NOT_DEAL_PREDICATE equal everywhere", async () => {
+  it("never a false DEAL; equal inside the bounds; NOT_DEAL_PREDICATE equal inside them too", async () => {
     const db = database.db;
     // INTEGER affinity on the numeric columns, exactly as listings / users / model_stats declare.
     await db
@@ -161,6 +167,10 @@ describe("RULE_PREDICATE parity with decide", () => {
     let deals = 0;
     let equalChecked = 0;
     for (const row of read.results) {
+      if (row.mode === null) {
+        if (row.deal === 1 || row.not_deal === 1) failures.push(`a rule-less row judged ${JSON.stringify(row)}`);
+        continue;
+      }
       const settings: ValidatedSettings = {
         mode: row.mode,
         basisPoints: row.minimum_discount_bp,
@@ -188,9 +198,9 @@ describe("RULE_PREDICATE parity with decide", () => {
       if (inBounds) {
         equalChecked += 1;
         if (verdict === "DEAL" && !sqlDeal) failures.push(`missed DEAL ${label}`);
-      }
-      if (sqlNotDeal !== (verdict === "NOT_DEAL")) {
-        failures.push(`NOT_DEAL mismatch ${label} decide=${verdict} sql=${String(row.not_deal)}`);
+        if (sqlNotDeal !== (verdict === "NOT_DEAL")) {
+          failures.push(`NOT_DEAL mismatch ${label} decide=${verdict} sql=${String(row.not_deal)}`);
+        }
       }
     }
     expect(failures.slice(0, 10)).toEqual([]);
