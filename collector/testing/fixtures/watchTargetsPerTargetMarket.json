@@ -1,0 +1,24 @@
+{
+  "market": null,
+  "monitoring": "running",
+  "targets": [
+    {
+      "targetId": "cpu-cpu@toronto-25",
+      "componentType": "cpu",
+      "query": "cpu",
+      "market": { "location": "toronto", "latitude": 43.6532, "longitude": -79.3832, "radiusKm": 25 }
+    },
+    {
+      "targetId": "gpu-graphics-card@hamilton-20",
+      "componentType": "gpu",
+      "query": "graphics card",
+      "market": { "location": "hamilton", "latitude": 43.2557, "longitude": -79.8711, "radiusKm": 20 }
+    },
+    {
+      "targetId": "gpu-graphics-card@toronto-25",
+      "componentType": "gpu",
+      "query": "graphics card",
+      "market": { "location": "toronto", "latitude": 43.6532, "longitude": -79.3832, "radiusKm": 25 }
+    }
+  ]
+}

@@ -30,10 +30,13 @@ import {
   type TargetRun,
 } from "./runState.ts";
 import {
+  hasOwnMarket,
   parseMarket,
   parseTarget,
+  resolveTargetMarket,
   type FetchWatchTargetsInput,
   type FetchWatchTargetsResult,
+  type WatchMarket,
 } from "./watchTargets.ts";
 
 /** Everything in a `CollectorConfig` that is NOT per-target and NOT per-market. */
@@ -539,14 +542,32 @@ export const runAllTargets = async (
     );
   }
 
-  const market = parseMarket(fetched.market);
-  if (!market.ok) {
-    // NO DEFAULT MARKET IS EVER INVENTED. A wrong market collects into the wrong `market_key`
-    // silently, and `targets` still reports the returned count so the operator is not told they
-    // have zero targets when they have two.
-    return await emit(
-      wholeRunFailure(config, returned, EXIT_CONFIG, `the watch market is unusable: ${market.reason}`),
-    );
+  /**
+   * THE SHARED MARKET IS CHECKED EXACTLY AS BEFORE, WITH ONE RELAXATION: a null top-level market
+   * is accepted when EVERY row carries its own. A Worker that sends no per-target markets (every
+   * Worker before them) therefore takes this branch on every input exactly as it always did. A
+   * non-null top-level market is always validated, whether or not any row falls back to it.
+   */
+  const lacking = fetched.targets.filter((raw) => !hasOwnMarket(raw)).length;
+  let shared: WatchMarket | null = null;
+  if (fetched.market !== null || lacking > 0) {
+    const market = parseMarket(fetched.market);
+    if (!market.ok) {
+      // NO DEFAULT MARKET IS EVER INVENTED. A wrong market collects into the wrong `market_key`
+      // silently, and `targets` still reports the returned count so the operator is not told
+      // they have zero targets when they have two.
+      const mixed =
+        lacking < returned ? ` (${lacking} of ${returned} targets carry no market of their own)` : "";
+      return await emit(
+        wholeRunFailure(
+          config,
+          returned,
+          EXIT_CONFIG,
+          `the watch market is unusable: ${market.reason}${mixed}`,
+        ),
+      );
+    }
+    shared = market.value;
   }
 
   /**
@@ -594,9 +615,28 @@ export const runAllTargets = async (
     }
 
     const target = parsed.value;
+
+    // A ROW WHOSE OWN MARKET IS MALFORMED IS THAT TARGET'S EXIT 2, NEVER A FALLBACK TO THE
+    // SHARED MARKET (that would search one person's query in another person's area) and never a
+    // whole-run failure (one bad area must not stop every other search). Same validation, same
+    // exit code as the top-level market.
+    const targetMarket = resolveTargetMarket(raw, shared);
+    if (!targetMarket.ok) {
+      const failed: TargetOutcome = {
+        target: target.targetId,
+        componentType: target.componentType,
+        exitCode: EXIT_CONFIG,
+        error: targetMarket.reason,
+        query: target.query,
+      };
+      outcomes.push(failed);
+      emitTarget(failed);
+      continue;
+    }
+
     const perTargetConfig: CollectorConfig = {
       ...config.process,
-      ...market.value,
+      ...targetMarket.value,
       ...target,
     };
 

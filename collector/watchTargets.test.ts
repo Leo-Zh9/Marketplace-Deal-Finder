@@ -6,6 +6,7 @@ import {
   fetchWatchTargets,
   parseMarket,
   parseTarget,
+  resolveTargetMarket,
   type FetchWatchTargetsResult,
 } from "./watchTargets.ts";
 
@@ -433,5 +434,79 @@ describe("the seed migration 0005 ships", () => {
       expect(seen.has(targetId)).toBe(false);
       seen.add(targetId);
     }
+  });
+});
+
+/**
+ * PER-TARGET MARKETS. `GET /api/watch-targets` carries `targets[i].market` for each target, and
+ * the top-level `market` only when every target shares one (else null). The fixture is that
+ * wire: three targets, two areas, a null top-level market.
+ */
+describe("a market per watch target", () => {
+  const wire = JSON.parse(
+    readFileSync(
+      new URL("./testing/fixtures/watchTargetsPerTargetMarket.json", import.meta.url),
+      "utf8",
+    ),
+  ) as { market: null; monitoring: "running"; targets: Record<string, unknown>[] };
+
+  const toronto = body.market;
+  const hamilton = { location: "hamilton", latitude: 43.2557, longitude: -79.8711, radiusKm: 20 };
+
+  /** C-t1: the fetcher passes per-target markets through RAW. Kills: a fetcher that strips them. */
+  it("C-t1: the per-target wire fixture is a 200 whose rows keep their markets", async () => {
+    const fake = (async () => jsonResponse(200, wire)) as unknown as typeof fetch;
+
+    await expect(fetchWatchTargets({ apiBase, token }, fake)).resolves.toEqual({
+      ok: true,
+      market: null,
+      targets: wire.targets,
+      monitoring: "running",
+    });
+  });
+
+  it("C-t2: every row in the fixture resolves to its own market, with no shared market", () => {
+    expect(wire.targets.map((row) => resolveTargetMarket(row, null))).toEqual([
+      { ok: true, value: toronto },
+      { ok: true, value: hamilton },
+      { ok: true, value: toronto },
+    ]);
+  });
+
+  /** C-t3: the row's own market wins. Kills: preferring the shared market when both exist. */
+  it("C-t3: a row's own market wins over the shared one", () => {
+    expect(resolveTargetMarket({ ...body.targets[0], market: hamilton }, toronto)).toEqual({
+      ok: true,
+      value: hamilton,
+    });
+  });
+
+  /** C-t4: a row with no `market` key falls back. Kills: refusing the fallback. */
+  it("C-t4: a row with no market key gets the shared market", () => {
+    expect(resolveTargetMarket(body.targets[0], toronto)).toEqual({ ok: true, value: toronto });
+  });
+
+  /**
+   * C-t5: A MALFORMED OWN MARKET IS REFUSED, NEVER REPLACED BY THE SHARED ONE. `null` is in the
+   * table on purpose: presence, not truthiness, decides "has its own". Kills: falling back on a
+   * bad own market, and `raw.market != null` in place of `"market" in raw`.
+   */
+  it.each<[string, unknown]>([
+    ["null", null],
+    ["a location with a slash", market({ location: "toronto/search" })],
+    ["a fractional radius", market({ radiusKm: 12.5 })],
+    ["a radius past the ceiling", market({ radiusKm: 26 })],
+    ["a string latitude", market({ latitude: "43.6" })],
+  ])("C-t5: an own market of %s is refused even with a shared market", (_label, own) => {
+    const result = resolveTargetMarket({ ...body.targets[0], market: own }, toronto);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toMatch(/^the target's market is unusable: /);
+  });
+
+  it("C-t6: no own market and no shared market is refused, never defaulted", () => {
+    expect(resolveTargetMarket(body.targets[0], null)).toEqual({
+      ok: false,
+      reason: "the target has no market and there is no shared market",
+    });
   });
 });

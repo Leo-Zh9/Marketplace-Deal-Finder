@@ -857,6 +857,22 @@ X-Collector-Token: <the collector secret>
 it), reported explicitly and never defaulted, because a default market would collect into the
 wrong `market_key` silently.
 
+**A target may carry its own market** (`targets[i].market`, same four fields), for the
+multi-user Worker where each person searches their own area. The top-level `market` is then
+present only when every target shares one, and `null` otherwise. The collector searches each
+target in its own market and falls back to the top-level one only for a row with **no `market`
+key at all** — which is every row today's Worker sends, so against it nothing changes:
+
+- an own market is validated exactly like the top-level one; a malformed one (including
+  `market: null` on the row) is **that target's exit 2**, never searched in the shared market
+  and never a whole-run failure;
+- a non-null top-level market is always validated; a `null` one is accepted only when every row
+  carries its own, and otherwise is the same whole-run exit 2 as before (the error names how many
+  targets lack a market when some do carry one);
+- the cap, the refusal guard and its state file, the overlap check and the health post are
+  unchanged. `collector/testing/fixtures/watchTargetsPerTargetMarket.json` is the wire, and
+  `collector/runTargets.test.ts` M-1 runs it through the real fetcher and loop with no Worker.
+
 It lives in `watch_market` and `watch_targets` (migration `0005`) and **deliberately not in
 `search_revisions`.** That table is the append-only revision log and its revision number is
 `evaluateBatch`'s staleness key: a bump re-opens **every** evaluation task in the corpus. Adding
@@ -971,7 +987,7 @@ filtered out.
 | exit | meaning |
 |---|---|
 | **0** | listings parsed, the POST returned 200, **and the Worker reported zero FAILED** |
-| 2 | a configuration error. Nothing self-heals: a required variable is missing, the watch list is empty or over the cap, the market is absent or unusable, a target row is unusable, or a negative/fractional target delay |
+| 2 | a configuration error. Nothing self-heals: a required variable is missing, the watch list is empty or over the cap, the market is absent or unusable, a target row or its own market is unusable, or a negative/fractional target delay |
 | 3 | `SOURCE_EMPTY` — nothing posted. Normal on a quiet day; **three in a row at one target latches an alarm** — see "The alarm" below |
 | 4 | `PROVIDER_FAILURE` — the page changed shape. **A human must look.** Nothing posted |
 | 5 | transient: the source was unavailable or rate-limited, the watch-list `GET` failed with 5xx/transport/timeout, or the POST failed with 5xx or a network error. The next run is the retry |
