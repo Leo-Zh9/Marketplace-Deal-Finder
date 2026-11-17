@@ -145,6 +145,11 @@ export interface WatchWire {
   };
   storedTargets: StoredTarget[];
   keptSearches: StoredTarget[];
+  /**
+   * THE SHARED 9-SEARCH BUDGET (migrations/0009): distinct searches over every user's lists, and how
+   * many are this user's. Optional so a Worker older than the field still loads the form.
+   */
+  budget?: { used: number; maximum: number; yours: number };
 }
 
 export interface MarketplaceClient {

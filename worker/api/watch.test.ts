@@ -815,7 +815,7 @@ describe("the watch list the BROWSER reads and writes", () => {
         if (!sql.includes("SET location = ?1")) return statement;
         return {
           bind: (...args: unknown[]) =>
-            statement.bind(args[0], args[1], args[2], 99, args[4], args[5]),
+            statement.bind(args[0], args[1], args[2], 99, args[4], args[5], args[6]),
         };
       },
       batch: (statements: unknown[]) =>
@@ -1123,16 +1123,80 @@ describe("PUT /api/watch -- per user, and the shared budget", () => {
     expect(theirs.selection.location).toEqual(WATERLOO);
   });
 
-  /** W-reopen: EVERY successful save stamps the caller's `alerts_reopened_at`, and only theirs. */
-  it("W-reopen: a save stamps alerts_reopened_at on the caller's row only", async () => {
+  /**
+   * W-reopen: A SAVE THAT CHANGES WHAT IS WATCHED STAMPS THE CALLER'S `alerts_reopened_at`; ONE THAT
+   * CHANGES NOTHING DOES NOT. The dashboard sends this PUT on every Save, so an unconditional stamp
+   * re-opened the user's whole alert backlog on an untouched Save. Kills: the CASE replaced by a
+   * plain `= ?5` (the untouched save stamps), and `reopensAlerts` ignoring added searches or the area.
+   */
+  it("W-reopen: only an area change or a new search stamps alerts_reopened_at, and only the caller's", async () => {
+    const stamp = async (userId: number) =>
+      (
+        await database.db
+          .prepare("SELECT alerts_reopened_at AS at FROM users WHERE user_id = ?1")
+          .bind(userId)
+          .first<{ at: number | null }>()
+      )?.at;
+    const clear = () => database.db.prepare("UPDATE users SET alerts_reopened_at = NULL").run();
+
     await put(gpuOnly("graphics card"), database.db, SECOND);
-    const stamps = await database.db
-      .prepare("SELECT user_id, alerts_reopened_at FROM users ORDER BY user_id")
-      .all();
-    expect(stamps.results).toEqual([
-      { user_id: 1, alerts_reopened_at: null },
-      { user_id: SECOND, alerts_reopened_at: NOW },
-    ]);
+    expect(await stamp(SECOND)).toBe(NOW);
+    expect(await stamp(1)).toBeNull();
+
+    await clear();
+    expect(await put(gpuOnly("graphics card"), database.db, SECOND)).toMatchObject({ ok: true });
+    expect(await stamp(SECOND)).toBeNull();
+
+    // The untouched GET->PUT round trip of a legacy-id list, the form's own Save: no stamp either,
+    // although every save re-derives the rows' ids.
+    await seedLive();
+    await addUser(database.db, SECOND, "second@example.com");
+    const live = await get();
+    expect(await put(saveBodyFrom(live))).toMatchObject({ ok: true });
+    expect(await stamp(1)).toBeNull();
+
+    // A new search stamps; so does an area change; dropping a kept search does not.
+    const added = await get();
+    expect(
+      await put(
+        saveBodyFrom(added, {
+          components: [...added.selection.components, "cpu_cooler"],
+          models: {
+            ...Object.fromEntries(added.selection.components.map((c) => [c, added.selection.models[c]])),
+            cpu_cooler: { mode: "all", values: [], query: "cpu cooler" },
+          },
+          preservedTargetIds: added.keptSearches.slice(1).map((row) => row.targetId),
+        }),
+      ),
+    ).toMatchObject({ ok: true });
+    expect(await stamp(1)).toBe(NOW);
+
+    await clear();
+    const moved = await get();
+    expect(await put(saveBodyFrom(moved, { location: WATERLOO, radiusKm: 10 }))).toMatchObject({ ok: true });
+    expect(await stamp(1)).toBe(NOW);
+
+    await clear();
+    const fewer = await get();
+    expect(
+      await put(
+        saveBodyFrom(fewer, {
+          location: WATERLOO,
+          radiusKm: 10,
+          preservedTargetIds: fewer.keptSearches.slice(1).map((r) => r.targetId),
+        }),
+      ),
+    ).toMatchObject({ ok: true });
+    expect(await stamp(1)).toBeNull();
+  });
+
+  /** W-budget: GET reports the SHARED budget and the caller's share, as the 409 does. */
+  it("W-budget: GET /api/watch carries the shared use and the caller's share", async () => {
+    await put(many(3), database.db, 1);
+    await put(gpuOnly("graphics card"), database.db, SECOND);
+    await put(gpuOnly("rtx", WATERLOO, 25), database.db, SECOND);
+    expect((await get(database.db, 1)).budget).toEqual({ used: 4, maximum: MAX_WATCH_TARGETS, yours: 3 });
+    expect((await get(database.db, SECOND)).budget).toEqual({ used: 4, maximum: MAX_WATCH_TARGETS, yours: 1 });
   });
 
   /**

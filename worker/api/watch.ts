@@ -89,6 +89,12 @@ export interface WatchBody {
   };
   storedTargets: StoredTarget[];
   keptSearches: StoredTarget[];
+  /**
+   * THE SHARED BUDGET AS IT STANDS (migrations/0009): distinct searches over EVERY user's stored
+   * targets, and how many of them are the caller's. The form's own count is per user; the cap the
+   * 409 enforces is this one, so the page shows both.
+   */
+  budget: { used: number; maximum: number; yours: number };
 }
 
 export type WatchResult =
@@ -439,14 +445,40 @@ const DELETE_SCOPED = `DELETE FROM user_watch_targets
 const INSERT_TARGET = `INSERT INTO user_watch_targets (user_id, target_id, component_type, query)
   VALUES (?1, ?2, ?3, ?4)`;
 /**
- * THE AREA, AND THE ALERT RE-OPENING, IN THE SAME STATEMENT. Every save stamps
- * `alerts_reopened_at`: the drain no longer re-judges anything on a rule, search or area change, so
- * this stamp is what lets the deals a save newly qualifies alert (worker/notify/enqueue.ts).
- * ?1 location, ?2 latitude, ?3 longitude, ?4 radius_km, ?5 now, ?6 user_id.
+ * THE AREA, AND THE ALERT RE-OPENING, IN THE SAME STATEMENT. A save that CHANGES WHAT IS WATCHED --
+ * a different area, or a search the user did not have before -- stamps `alerts_reopened_at`: the
+ * drain no longer re-judges anything on such a change, so this stamp is what lets the deals it
+ * newly qualifies alert (worker/notify/enqueue.ts). A save that changes neither does NOT stamp, and
+ * that is load-bearing: the dashboard sends this PUT on every Save, and an unconditional stamp let
+ * an untouched Save re-open the user's whole backlog (a DEAL judged three days earlier, measured).
+ * ?1 location, ?2 latitude, ?3 longitude, ?4 radius_km, ?5 now, ?6 user_id, ?7 1 when it changed.
  */
 const UPDATE_AREA = `UPDATE users
-   SET location = ?1, latitude = ?2, longitude = ?3, radius_km = ?4, alerts_reopened_at = ?5
+   SET location = ?1, latitude = ?2, longitude = ?3, radius_km = ?4,
+       alerts_reopened_at = CASE WHEN ?7 = 1 THEN ?5 ELSE alerts_reopened_at END
  WHERE user_id = ?6`;
+
+/**
+ * Whether a save changes what is watched: the area moved, or the final list holds a SEARCH (type +
+ * query, never the id -- every save re-derives its rows' ids) the stored list did not. Removing a
+ * search cannot newly qualify a deal, so it does not count.
+ */
+export const reopensAlerts = (
+  user: User,
+  selection: WatchSelection,
+  stored: readonly StoredTarget[],
+  final: readonly StoredTarget[],
+): boolean => {
+  const area = user.area;
+  const moved =
+    area === null ||
+    area.location !== selection.location.slug ||
+    area.latitude !== selection.location.latitude ||
+    area.longitude !== selection.location.longitude ||
+    area.radiusKm !== selection.radiusKm;
+  const had = new Set(stored.map(searchKey));
+  return moved || final.some((row) => !had.has(searchKey(row)));
+};
 
 /**
  * THE SHARED SEARCH CAP, ENFORCED ATOMICALLY. The LAST statement of the save batch -- after the
@@ -506,6 +538,8 @@ const readStoredTargets = async (db: D1Database, userId: number): Promise<Stored
 const readState = async (db: D1Database, userId: number): Promise<WatchBody> => {
   const area = await db.prepare(SELECT_AREA).bind(userId).all<AreaRow>();
   const stored = await readStoredTargets(db, userId);
+  const budget = (await db.prepare(SELECT_BUDGET).bind(userId).all<{ used: number; yours: number }>())
+    .results[0];
   const inverted = invert(stored);
   const row = area.results[0];
   const located = row !== undefined && row.location !== null;
@@ -525,6 +559,11 @@ const readState = async (db: D1Database, userId: number): Promise<WatchBody> => 
     storedTargets: stored,
     // The rows the inversion could not place -- the residue the form shows as kept searches.
     keptSearches: inverted.residue,
+    budget: {
+      used: budget?.used ?? 0,
+      maximum: MAX_WATCH_TARGETS,
+      yours: budget?.yours ?? 0,
+    },
   };
 };
 
@@ -648,7 +687,7 @@ export const applyWatchSelection = async (
   }
 
   // ONE BATCH, so a failing statement rolls the DELETE back and a half-written watch list is
-  // unreachable. Bounds: <= 12 statements, <= 6 bound parameters each, against the MEASURED D1
+  // unreachable. Bounds: <= 12 statements, <= 7 bound parameters each, against the MEASURED D1
   // ceiling of 100 parameters. The cap guard is LAST so it counts what the save would leave.
   const keptFinalIds = final.filter((row) => keptIds.has(row.targetId)).map((row) => row.targetId);
   const toInsert = final.filter((row) => !keptIds.has(row.targetId));
@@ -667,6 +706,7 @@ export const applyWatchSelection = async (
           selection.radiusKm,
           now,
           user.userId,
+          reopensAlerts(user, selection, stored, final) ? 1 : 0,
         ),
       db.prepare(CAP_GUARD).bind(MAX_WATCH_TARGETS),
     ]);

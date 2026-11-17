@@ -614,6 +614,35 @@ describe("the control panel", () => {
   });
 
   /**
+   * A-shared-line: THE SHARED BUDGET IS ON SCREEN BEFORE ANY 409, from GET /api/watch, beside the
+   * form's own count -- the live test's alice read "1 of 9 searches used" while 3 of 9 shared were
+   * in use. After a save the line is re-read from the PUT's answer.
+   */
+  it("A-shared-line: the page shows the shared use and the user's share from the Worker", async () => {
+    const user = userEvent.setup();
+    stubWire({
+      watch: { ...LIVE_WATCH, budget: { used: 9, maximum: 9, yours: 9 } },
+      watchAfter: { ...LIVE_WATCH, budget: { used: 9, maximum: 9, yours: 8 } },
+      settings: { mode: "DISCOUNT", minimumDiscountPercent: 10, maximumPriceCents: null },
+    });
+    render(<App getToken={noToken} />);
+    await waitForLoad("9 of 9 searches used");
+    expect(screen.getByTestId("shared-budget")).toHaveTextContent("9 of 9 shared searches used (9 yours)");
+
+    await user.click(screen.getByRole("button", { name: "Save searches" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("shared-budget")).toHaveTextContent("9 of 9 shared searches used (8 yours)"),
+    );
+  });
+
+  it("A-shared-line: an older Worker with no budget field shows no shared line", async () => {
+    stubWire({ watch: LIVE_WATCH, settings: null });
+    render(<App getToken={noToken} />);
+    await waitForLoad("9 of 9 searches used");
+    expect(screen.queryByTestId("shared-budget")).toBeNull();
+  });
+
+  /**
    * A-shared-budget: THE 409 IS SAID IN THE PAGE'S WORDS, with the numbers the Worker sent, and the
    * deal rule is NOT saved after a refused watch save (nothing was written).
    */

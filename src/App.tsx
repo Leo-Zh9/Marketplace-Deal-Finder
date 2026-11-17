@@ -12,7 +12,11 @@ import { ApiRequestError, type AuthenticatedIdentity } from "./auth/authTypes";
 import { componentById, mockLocations } from "./data/catalog";
 import { requestErrorMessage } from "./services/apiClient";
 import { budgetFullMessage } from "./utils/budget";
-import { marketplaceClient, settingsToDealRule } from "./services/marketplaceClient";
+import {
+  marketplaceClient,
+  settingsToDealRule,
+  type WatchWire,
+} from "./services/marketplaceClient";
 import {
   preservableTargets,
   queryFor,
@@ -137,6 +141,8 @@ const newerReading =
 function App({ identity, onSignOut, getToken }: AppProps) {
   const [settings, setSettings] = useState<SearchSettings>(initialSettings);
   const [storedTargets, setStoredTargets] = useState<StoredTarget[]>([]);
+  /** The SHARED budget as the Worker last reported it; null until a read carries one. */
+  const [sharedBudget, setSharedBudget] = useState<WatchWire["budget"] | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [radiusMode, setRadiusMode] = useState<"2" | "5" | "10" | "25" | "custom">("25");
   const [errors, setErrors] = useState<ValidationErrors>({});
@@ -210,6 +216,7 @@ function App({ identity, onSignOut, getToken }: AppProps) {
             : (String(radiusKm) as typeof radiusMode),
         );
         setStoredTargets(watch.storedTargets);
+        setSharedBudget(watch.budget ?? null);
         setLoaded(true);
       } catch (error: unknown) {
         if (cancelled) return;
@@ -583,6 +590,7 @@ function App({ identity, onSignOut, getToken }: AppProps) {
       // that was preserved for a type the form deselected comes back as a SELECTED TYPE, because
       // that row is still being collected -- showing it unticked would be the lie.
       setStoredTargets(written.storedTargets);
+      setSharedBudget(written.budget ?? null);
       setSettings((current) => ({
         ...current,
         components: written.selection.components,
@@ -728,6 +736,17 @@ function App({ identity, onSignOut, getToken }: AppProps) {
             <p className="budget-line" data-testid="budget">
               {targetCount} of {MAX_WATCH_TARGETS} searches used
             </p>
+            {/*
+             * THE CAP THE 409 ENFORCES IS SHARED (migrations/0009), so the line above -- this form's
+             * own list -- is not the whole story: another user's searches spend the same nine.
+             * As stored at the last load or save, which is what the Worker will count.
+             */}
+            {sharedBudget && (
+              <p className="muted-copy" data-testid="shared-budget">
+                {sharedBudget.used} of {sharedBudget.maximum} shared searches used ({sharedBudget.yours}{" "}
+                yours)
+              </p>
+            )}
             {errors.targets && (
               <p className="field-error" role="alert">
                 {errors.targets}
