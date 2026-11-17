@@ -11,7 +11,7 @@ import {
   applyMonitoring,
   handleStartMonitoring,
   handleStopMonitoring,
-  readMonitoring,
+  monitoringOf,
 } from "./api/monitoring";
 import { handleGetSettings, handlePutSettings } from "./api/settings";
 import { handleGetVerdicts } from "./api/verdicts";
@@ -20,6 +20,7 @@ import { handleGetWatchTargets } from "./api/watchTargets";
 import type { NotifyEnvironment } from "./notify/config";
 import { readNotificationsStatus } from "./notify/status";
 import { handleScheduled, type ScheduledEnvironment } from "./scheduling/scheduled";
+import { resolveUser, type User } from "./users/users";
 
 /**
  * Widened by exactly one member, and that member is OPTIONAL. `Environment` is the request
@@ -155,6 +156,15 @@ const errorMessages: Record<string, string> = {
   MONITORING_NOT_READY: "Save a deal rule before starting monitoring.",
   // Distinct from every other *_STORAGE_FAILED code, by the rule those codes already state.
   MONITORING_STORAGE_FAILED: "The monitoring state could not be read or written.",
+  // migrations/0009. A 503, not a 403: the deployment is mid-setup, not refusing this person. The
+  // operator claims user 1 (`UPDATE users SET email = ... WHERE user_id = 1`) and it clears.
+  OWNER_UNCLAIMED: "The owner account has not been claimed yet.",
+  USER_LIMIT_REACHED: "This deployment already has the maximum number of users.",
+  // Distinct from every other *_STORAGE_FAILED code, by the rule those codes already state.
+  USER_STORAGE_FAILED: "The user account could not be read or created.",
+  // A 409: the request is valid and within the caller's own cap; the budget SHARED by every user is
+  // full. `used`, `maximum` and `yours` say how much of it the caller can free.
+  WATCH_BUDGET_FULL: "Every shared search is in use.",
 };
 
 type ExtraHeaders = Record<string, string>;
@@ -352,7 +362,7 @@ export const handleRequest = async (
     const db = environment.DB;
     if (db === undefined) return errorResponse("DATABASE_UNAVAILABLE", 503, { Vary: "Origin" });
 
-    const result = await handleGetWatchTargets(db);
+    const result = await handleGetWatchTargets(db, environment);
 
     // `{ Vary: "Origin" }`, NEVER `cors`: `authorizeCollector` refuses a request bearing ANY
     // Origin, so no watch-list response can ever carry Access-Control-Allow-Origin. X-e pins it
@@ -411,6 +421,28 @@ export const handleRequest = async (
     return json({ identity: authentication.identity }, 200, cors);
   }
 
+  const now = dependencies?.now() ?? Math.floor(Date.now() / 1000);
+
+  /**
+   * THE CALLER'S `users` ROW, created on their first request (worker/users/users.ts). Every route
+   * below that reads or writes per-user state takes the user from HERE and nowhere else, and scopes
+   * every statement by its `userId` -- there is no request field that names a user, so one user
+   * cannot address another's data. OWNER_UNCLAIMED and USER_LIMIT_REACHED are refusals of the
+   * deployment's state, answered as such; a throw is a storage failure.
+   */
+  const userFor = async (
+    db: D1Database,
+  ): Promise<{ ok: true; user: User } | { ok: false; response: Response }> => {
+    try {
+      const resolved = await resolveUser(db, authentication.identity.email, now);
+      return resolved.ok
+        ? resolved
+        : { ok: false, response: errorResponse(resolved.code, resolved.status, cors) };
+    } catch {
+      return { ok: false, response: errorResponse("USER_STORAGE_FAILED", 503, cors) };
+    }
+  };
+
   /**
    * `/api/status` TELLS THE TRUTH ABOUT COLLECTION, AND WHAT IT USED TO DO IS WHY THIS SLICE
    * TOUCHES IT. It was `{status: "ok", phase: 2, authentication}` -- three values, two of them
@@ -427,13 +459,30 @@ export const handleRequest = async (
    * H-8 is the guard.
    */
   if (request.method === "GET" && url.pathname === "/api/status") {
-    const statusNow = dependencies?.now() ?? Math.floor(Date.now() / 1000);
+    const statusNow = now;
+    // THE CALLER'S ROW, AND IT CANNOT 503 FOR A READ FAILURE: a missing binding or a throwing read
+    // is `monitoring: null` and the health words stand. The two DEPLOYMENT refusals are still
+    // answered -- a page that read "collecting" for an unclaimed owner would hide the fix.
+    let user: User | null = null;
+    if (environment.DB !== undefined) {
+      try {
+        const resolved = await resolveUser(environment.DB, authentication.identity.email, now);
+        if (!resolved.ok) return errorResponse(resolved.code, resolved.status, cors);
+        user = resolved.user;
+      } catch {
+        user = null;
+      }
+    }
     const health = await readCollectorHealth(environment.DB, statusNow);
     // ADDITIVE. In the inert notification states this reads nothing from D1 (worker/notify/status.ts).
-    const notifications = await readNotificationsStatus(environment.DB, environment, statusNow);
-    // ADDITIVE, AND IT CANNOT 503 EITHER: a missing binding or a failed read is `monitoring: null`
-    // and the health words stand. Stopped overrides them (worker/api/monitoring.ts says why).
-    const monitoring = await readMonitoring(environment.DB);
+    const notifications = await readNotificationsStatus(
+      environment.DB,
+      environment,
+      statusNow,
+      user === null ? null : user.userId,
+    );
+    // The caller's own Start/Stop. Stopped overrides the health words (worker/api/monitoring.ts).
+    const monitoring = user === null ? null : monitoringOf(user);
 
     return json(
       {
@@ -452,15 +501,13 @@ export const handleRequest = async (
   ) {
     const db = environment.DB;
     if (db === undefined) return errorResponse("DATABASE_UNAVAILABLE", 503, cors);
+    const caller = await userFor(db);
+    if (!caller.ok) return caller.response;
 
     const result =
       request.method === "GET"
-        ? await handleGetSettings(db)
-        : await handlePutSettings(
-            request,
-            db,
-            dependencies?.now() ?? Math.floor(Date.now() / 1000),
-          );
+        ? handleGetSettings(caller.user)
+        : await handlePutSettings(request, db, caller.user, now);
 
     return result.ok
       ? json(result.body, result.status, cors)
@@ -470,8 +517,10 @@ export const handleRequest = async (
   if (request.method === "GET" && url.pathname === "/api/verdicts") {
     const db = environment.DB;
     if (db === undefined) return errorResponse("DATABASE_UNAVAILABLE", 503, cors);
+    const caller = await userFor(db);
+    if (!caller.ok) return caller.response;
 
-    const result = await handleGetVerdicts(db, url.searchParams);
+    const result = await handleGetVerdicts(db, url.searchParams, caller.user);
 
     return result.ok
       ? json(result.body, result.status, cors)
@@ -489,12 +538,13 @@ export const handleRequest = async (
   ) {
     const db = environment.DB;
     if (db === undefined) return errorResponse("DATABASE_UNAVAILABLE", 503, cors);
+    const caller = await userFor(db);
+    if (!caller.ok) return caller.response;
 
-    const monitoringNow = dependencies?.now() ?? Math.floor(Date.now() / 1000);
     const result =
       url.pathname === "/api/monitoring/start"
-        ? await handleStartMonitoring(db, monitoringNow)
-        : await handleStopMonitoring(db, monitoringNow);
+        ? await handleStartMonitoring(db, caller.user, now)
+        : await handleStopMonitoring(db, caller.user, now);
 
     return result.ok
       ? json(result.body, result.status, cors)
@@ -515,9 +565,13 @@ export const handleRequest = async (
   if (url.pathname === "/api/watch" && (request.method === "GET" || request.method === "PUT")) {
     const db = environment.DB;
     if (db === undefined) return errorResponse("DATABASE_UNAVAILABLE", 503, cors);
+    const caller = await userFor(db);
+    if (!caller.ok) return caller.response;
 
     const result =
-      request.method === "GET" ? await handleGetWatch(db) : await handlePutWatch(request, db);
+      request.method === "GET"
+        ? await handleGetWatch(db, caller.user)
+        : await handlePutWatch(request, db, caller.user, now);
 
     return result.ok
       ? json(result.body, result.status, cors)
